@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="#1a1a2e"
+    android:padding="20dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="PROXY AGENT"
+        android:textColor="#e94560"
+        android:textSize="24sp"
+        android:textStyle="bold"
+        android:layout_gravity="center_horizontal"
+        android:layout_marginBottom="8dp" />
+
+    <TextView
+        android:id="@+id/tvStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="DISCONNECTED"
+        android:textColor="#FF4444"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:layout_gravity="center_horizontal"
+        android:layout_marginBottom="16dp" />
+
+    <EditText
+        android:id="@+id/etHost"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:hint="Host"
+        android:textColor="#ffffff"
+        android:textColorHint="#666666"
+        android:background="#16213e"
+        android:padding="10dp"
+        android:textSize="14sp"
+        android:inputType="text"
+        android:layout_marginBottom="6dp" />
+
+    <EditText
+        android:id="@+id/etPort"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:hint="Port"
+        android:textColor="#ffffff"
+        android:textColorHint="#666666"
+        android:background="#16213e"
+        android:padding="10dp"
+        android:textSize="14sp"
+        android:inputType="number"
+        android:layout_marginBottom="6dp" />
+
+    <EditText
+        android:id="@+id/etKey"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:hint="Agent Key"
+        android:textColor="#ffffff"
+        android:textColorHint="#666666"
+        android:background="#16213e"
+        android:padding="10dp"
+        android:textSize="14sp"
+        android:inputType="text"
+        android:layout_marginBottom="10dp" />
+
+    <Button
+        android:id="@+id/btnToggle"
+        android:layout_width="match_parent"
+        android:layout_height="50dp"
+        android:text="START"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:backgroundTint="#e94560"
+        android:layout_marginBottom="10dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="LOGS"
+        android:textColor="#e94560"
+        android:textSize="12sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="4dp" />
+
+    <ScrollView
+        android:id="@+id/svLogs"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:background="#0f0f23"
+        android:padding="8dp">
+
+        <TextView
+            android:id="@+id/tvLogs"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="#00ff41"
+            android:textSize="11sp"
+            android:fontFamily="monospace"
+            android:text="Press START to connect." />
+
+    </ScrollView>
+
+</LinearLayout>
