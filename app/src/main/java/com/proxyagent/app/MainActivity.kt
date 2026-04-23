@@ -135,31 +135,37 @@ class MainActivity : AppCompatActivity() {
         tvStatus.setTextColor(0xFFFFAA00.toInt())
     }
 
+    private fun humanRate(bps: Long): String = when {
+        bps < 0 -> "—"
+        bps < 1024 -> "${bps}B/s"
+        bps < 1024 * 1024 -> "${bps / 1024}KB/s"
+        bps < 1024L * 1024 * 1024 -> "%.1fMB/s".format(bps / 1024.0 / 1024.0)
+        else -> "%.1fGB/s".format(bps / 1024.0 / 1024.0 / 1024.0)
+    }
+
     private fun refresh() {
-        when (readFile("proxy_state")) {
-            "running" -> {
-                tvStatus.text = "RUNNING"
-                tvStatus.setTextColor(0xFF00CC00.toInt())
-                btnStart.text = "STOP"
-                etHost.isEnabled = false; etPort.isEnabled = false; etKey.isEnabled = false
-            }
-            "starting" -> {
-                tvStatus.text = "STARTING..."
-                tvStatus.setTextColor(0xFFFFAA00.toInt())
-            }
-            "error" -> {
-                tvStatus.text = "ERROR"
-                tvStatus.setTextColor(0xFFFF4444.toInt())
-                btnStart.text = "START"
-                etHost.isEnabled = true; etPort.isEnabled = true; etKey.isEnabled = true
-            }
-            else -> {
-                tvStatus.text = "DISCONNECTED"
-                tvStatus.setTextColor(0xFFFF4444.toInt())
-                btnStart.text = "START"
-                etHost.isEnabled = true; etPort.isEnabled = true; etKey.isEnabled = true
-            }
+        val proxyState = readFile("proxy_state")
+        val connInfo = readFile("conn_info").split("|")
+        val connStatus = connInfo.getOrNull(0) ?: ""
+        val rxRate = connInfo.getOrNull(1)?.toLongOrNull() ?: -1L
+        val txRate = connInfo.getOrNull(2)?.toLongOrNull() ?: -1L
+
+        val running = proxyState == "running" || proxyState == "starting"
+        btnStart.text = if (running) "STOP" else "START"
+        etHost.isEnabled = !running; etPort.isEnabled = !running; etKey.isEnabled = !running
+
+        val (label, color) = when {
+            proxyState == "error" -> "ERROR" to 0xFFFF4444.toInt()
+            connStatus == "CONNECTED" ->
+                "CONNECTED · ↓${humanRate(rxRate)} ↑${humanRate(txRate)}" to 0xFF00CC00.toInt()
+            connStatus == "CONNECTING" -> "CONNECTING…" to 0xFFFFAA00.toInt()
+            connStatus == "RECONNECTING" -> "RECONNECTING…" to 0xFFFFAA00.toInt()
+            connStatus == "STARTING" || proxyState == "starting" -> "STARTING…" to 0xFFFFAA00.toInt()
+            running -> "RUNNING" to 0xFF00CC00.toInt()
+            else -> "DISCONNECTED" to 0xFFFF4444.toInt()
         }
+        tvStatus.text = label
+        tvStatus.setTextColor(color)
 
         val logFile = File(filesDir, "agent.log")
         if (logFile.exists()) {
