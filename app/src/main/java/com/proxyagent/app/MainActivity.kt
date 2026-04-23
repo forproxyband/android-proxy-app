@@ -11,9 +11,12 @@ import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
@@ -26,6 +29,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etKey: EditText
     private lateinit var btnStart: Button
     private lateinit var btnBattery: Button
+    private lateinit var spBatteryThreshold: Spinner
     private lateinit var tvStatus: TextView
     private lateinit var tvLogs: TextView
     private lateinit var svLogs: ScrollView
@@ -47,6 +51,7 @@ class MainActivity : AppCompatActivity() {
         etKey = findViewById(R.id.etKey)
         btnStart = findViewById(R.id.btnToggle)
         btnBattery = findViewById(R.id.btnBattery)
+        spBatteryThreshold = findViewById(R.id.spBatteryThreshold)
         tvStatus = findViewById(R.id.tvStatus)
         tvLogs = findViewById(R.id.tvLogs)
         svLogs = findViewById(R.id.svLogs)
@@ -56,6 +61,7 @@ class MainActivity : AppCompatActivity() {
         etPort.setText(p.getString("p", "1005"))
         etKey.setText(p.getString("k", "ebf7ece7fd38ad9ce7d550d0934ca60b9979396e2663127de4642f4633823f04"))
 
+        setupBatteryThresholdSpinner(p)
         btnStart.setOnClickListener { toggle() }
         btnBattery.setOnClickListener { requestBatteryWhitelist() }
 
@@ -82,6 +88,27 @@ class MainActivity : AppCompatActivity() {
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         btnBattery.visibility =
             if (pm.isIgnoringBatteryOptimizations(packageName)) View.GONE else View.VISIBLE
+    }
+
+    private val batteryThresholds = intArrayOf(0, 5, 10, 15, 20, 30)
+    private val batteryLabels = arrayOf("Off", "5%", "10%", "15%", "20%", "30%")
+
+    private fun setupBatteryThresholdSpinner(prefs: android.content.SharedPreferences) {
+        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, batteryLabels)
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        spBatteryThreshold.adapter = adapter
+        val saved = prefs.getInt("bat_threshold", 0)
+        val pos = batteryThresholds.indexOf(saved).coerceAtLeast(0)
+        spBatteryThreshold.setSelection(pos)
+        spBatteryThreshold.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(p: AdapterView<*>?, v: View?, position: Int, id: Long) {
+                val value = batteryThresholds[position]
+                prefs.edit().putInt("bat_threshold", value).apply()
+                try { File(filesDir, "battery_threshold").writeText(value.toString()) }
+                catch (_: Throwable) {}
+            }
+            override fun onNothingSelected(p: AdapterView<*>?) {}
+        }
     }
 
     @Suppress("BatteryLife")
@@ -156,6 +183,7 @@ class MainActivity : AppCompatActivity() {
 
         val (label, color) = when {
             proxyState == "error" -> "ERROR" to 0xFFFF4444.toInt()
+            proxyState == "auto_stopped" -> "AUTO-STOPPED (LOW BATTERY)" to 0xFFFFAA00.toInt()
             connStatus == "CONNECTED" ->
                 "CONNECTED · ↓${humanRate(rxRate)} ↑${humanRate(txRate)}" to 0xFF00CC00.toInt()
             connStatus == "CONNECTING" -> "CONNECTING…" to 0xFFFFAA00.toInt()

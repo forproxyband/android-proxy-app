@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.net.TrafficStats
+import android.os.BatteryManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -52,6 +53,10 @@ class ProxyService : Service() {
             File(filesDir, "conn_info").writeText("${connStatus.name}|$rxRate|$txRate")
         } catch (_: Exception) {}
     }
+
+    private fun readBatteryThreshold(): Int = try {
+        File(filesDir, "battery_threshold").readText().trim().toIntOrNull() ?: 0
+    } catch (_: Throwable) { 0 }
 
     private fun mask(s: String): String {
         if (s.isEmpty()) return "<empty>"
@@ -155,14 +160,26 @@ class ProxyService : Service() {
             wakeLock?.acquire()
         } catch (_: Exception) {}
 
-        // Status + speed updater: polls TrafficStats once per second and refreshes notification + conn_info file.
+        // Status + speed updater: polls TrafficStats and battery once per second,
+        // refreshes notification + conn_info file, and enforces battery auto-stop.
         Thread {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val bm = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
             while (!stopRequested) {
                 try {
                     refreshTrafficStats()
                     nm.notify(1, buildNotification(statusText()))
                     writeConnInfo()
+
+                    val threshold = readBatteryThreshold()
+                    if (threshold > 0) {
+                        val level = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                        if (level in 0..threshold) {
+                            log("Auto-stop: battery $level% <= threshold $threshold%")
+                            doStop("Battery $level% ≤ $threshold% — auto-stopped")
+                            break
+                        }
+                    }
                 } catch (_: Throwable) {}
                 try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
             }
@@ -228,7 +245,7 @@ class ProxyService : Service() {
         return START_REDELIVER_INTENT
     }
 
-    private fun doStop() {
+    private fun doStop(autoStopReason: String = "") {
         if (stopRequested) return
         stopRequested = true
         try {
@@ -245,12 +262,28 @@ class ProxyService : Service() {
         } catch (t: Throwable) { log("Stop error: ${t.message}") }
         agentProcess = null
         connStatus = ConnStatus.STOPPED
-        state("stopped"); writeConnInfo()
+        state(if (autoStopReason.isNotEmpty()) "auto_stopped" else "stopped")
+        writeConnInfo()
         wakeLock?.let { if (it.isHeld) it.release() }
         if (Build.VERSION.SDK_INT >= 24) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
             @Suppress("DEPRECATION") stopForeground(true)
+        }
+        if (autoStopReason.isNotEmpty()) {
+            try {
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                val n = NotificationCompat.Builder(this, "proxy")
+                    .setContentTitle("Proxy Agent stopped")
+                    .setContentText(autoStopReason)
+                    .setSmallIcon(android.R.drawable.ic_menu_share)
+                    .setAutoCancel(true)
+                    .setOngoing(false)
+                    .setContentIntent(PendingIntent.getActivity(this, 0,
+                        Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
+                    .build()
+                nm.notify(2, n)
+            } catch (_: Throwable) {}
         }
         stopSelf()
     }
