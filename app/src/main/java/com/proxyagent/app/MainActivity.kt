@@ -56,6 +56,9 @@ class MainActivity : AppCompatActivity() {
         tvLogs = findViewById(R.id.tvLogs)
         svLogs = findViewById(R.id.svLogs)
 
+        findViewById<TextView>(R.id.tvVersion).text =
+            "v${BuildConfig.VERSION_NAME}  build ${BuildConfig.VERSION_CODE}"
+
         val p = getSharedPreferences("cfg", 0)
         etHost.setText(p.getString("h", "77.42.29.86"))
         etPort.setText(p.getString("p", "1005"))

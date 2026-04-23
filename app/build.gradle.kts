@@ -3,6 +3,10 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val buildNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0
+val appVersionName = if (buildNumber > 0) "1.0.$buildNumber" else "1.0.0-dev"
+val appVersionCode = if (buildNumber > 0) buildNumber else 1
+
 android {
     namespace = "com.proxyagent.app"
     compileSdk = 35
@@ -11,8 +15,12 @@ android {
         applicationId = "com.proxyagent.app"
         minSdk = 21
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = appVersionCode
+        versionName = appVersionName
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     buildTypes {
@@ -37,6 +45,13 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
+        }
+    }
+
+    applicationVariants.all {
+        outputs.all {
+            (this as com.android.build.gradle.internal.api.BaseVariantOutputImpl)
+                .outputFileName = "proxy-agent-v$appVersionName-${buildType.name}.apk"
         }
     }
 }
