@@ -37,9 +37,42 @@ class ProxyService : Service() {
         try { File(filesDir, "proxy_state").writeText(s) } catch (_: Exception) {}
     }
 
-    // Redirect native stdout/stderr (fd 1 and 2) to agent.log.
-    // The Go SDK logs to os.Stdout, which is /dev/null on Android by default —
-    // without this, all connection diagnostics from the Go side are lost.
+    private fun diag(tag: String) {
+        try {
+            val n = File("/proc/self/task").list()?.size ?: -1
+            log("[diag $tag] threads=$n")
+        } catch (e: Throwable) { log("[diag $tag] threads err: ${e.message}") }
+        try {
+            val loaded = File("/proc/self/maps").readText().contains("libgojni.so")
+            log("[diag $tag] libgojni.so loaded=$loaded")
+        } catch (e: Throwable) { log("[diag $tag] maps err: ${e.message}") }
+    }
+
+    private fun dumpTcp(host: String, portStr: String) {
+        try {
+            val parts = host.split(".").map { it.toInt() }
+            if (parts.size != 4) { log("[diag tcp] host not IPv4: $host"); return }
+            val ipHex = "%02X%02X%02X%02X".format(parts[3], parts[2], parts[1], parts[0])
+            val portHex = "%04X".format(portStr.toInt())
+            val needle = "$ipHex:$portHex"
+            val text = File("/proc/self/net/tcp").readText()
+            val lines = text.lines()
+            var hits = 0
+            for (line in lines) {
+                if (line.contains(needle, ignoreCase = true)) {
+                    log("[diag tcp] $line"); hits++
+                }
+            }
+            log("[diag tcp] scanned=${lines.size} target=$needle matches=$hits")
+        } catch (e: Throwable) {
+            log("[diag tcp] error: ${e.message}")
+        }
+    }
+
+    // Capture Go-side logs via two complementary mechanisms.
+    // A) Pipe+dup2 over fd 1/2 — catches raw writes to stdout/stderr.
+    // B) logcat tail — gomobile Android bindings typically redirect Go's
+    //    stdout/stderr to Android log with tag "GoLog", bypassing fd 1.
     private fun captureNativeOutput() {
         try {
             val fds = Os.pipe()
@@ -57,8 +90,33 @@ class ProxyService : Service() {
                     }
                 } catch (_: Throwable) {}
             }.apply { name = "NativeStdoutReader"; isDaemon = true; start() }
+
+            // Diagnostic: write directly to fd 1 to verify the pipe works.
+            try {
+                val t = "pipe-self-test OK\n".toByteArray()
+                Os.write(java.io.FileDescriptor.out, t, 0, t.size)
+            } catch (_: Throwable) {}
         } catch (e: Throwable) {
             log("stdout capture failed: ${e.message}")
+        }
+
+        try {
+            val proc = ProcessBuilder(
+                "logcat", "-T", "1", "-v", "time",
+                "GoLog:V", "Go:V", "ProxyAgent:V", "*:S"
+            ).redirectErrorStream(true).start()
+            Thread {
+                try {
+                    val reader = proc.inputStream.bufferedReader()
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        if (line.contains("ProxyAgent")) continue
+                        log("[logcat] $line")
+                    }
+                } catch (_: Throwable) {}
+            }.apply { name = "LogcatTailer"; isDaemon = true; start() }
+        } catch (e: Throwable) {
+            log("logcat tail failed: ${e.message}")
         }
     }
 
@@ -112,13 +170,28 @@ class ProxyService : Service() {
                 Os.setenv("fallback_file_url",
                     "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json", true)
 
+                diag("pre-load")
                 log("Loading Go runtime (first ref to go.Seq)...")
                 go.Seq.setContext(applicationContext)
                 log("Go runtime loaded")
+                diag("post-load")
 
-                log("Calling Agent.startAgent() — async, see [go] lines below for real status")
+                log("Calling Agent.startAgent() — async, see [go]/[logcat] lines below")
                 proxyagent.sdk.agent.Agent.startAgent()
                 state("running")
+                diag("post-start")
+
+                // Give supervisor a few seconds to start its connect loop,
+                // then dump tcp state — if Go is alive and trying, we'll see
+                // an outbound socket to the balancer (SYN_SENT / ESTABLISHED / TIME_WAIT).
+                Thread {
+                    try { Thread.sleep(3000) } catch (_: InterruptedException) {}
+                    diag("+3s")
+                    dumpTcp(host, port)
+                    try { Thread.sleep(5000) } catch (_: InterruptedException) {}
+                    diag("+8s")
+                    dumpTcp(host, port)
+                }.apply { name = "DiagProbe"; isDaemon = true; start() }
 
                 val n = NotificationCompat.Builder(this@ProxyService, "proxy")
                     .setContentTitle("Proxy Agent")
