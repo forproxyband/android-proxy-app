@@ -41,7 +41,7 @@ jobs:
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
 
-      - name: Build release APK (unsigned)
+      - name: Build release APK
         run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
 
       - name: Upload debug APK
@@ -51,7 +51,7 @@ jobs:
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 
-      - name: Upload release APK (unsigned)
+      - name: Upload release APK
         uses: actions/upload-artifact@v4
         with:
           name: proxy-agent-release-build-${{ github.run_number }}
