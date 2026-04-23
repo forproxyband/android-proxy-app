@@ -106,7 +106,7 @@ class MainActivity : AppCompatActivity() {
     private fun refresh() {
         when (readFile("proxy_state")) {
             "running" -> {
-                tvStatus.text = "CONNECTED"
+                tvStatus.text = "RUNNING"
                 tvStatus.setTextColor(0xFF00CC00.toInt())
                 btnStart.text = "STOP"
                 etHost.isEnabled = false; etPort.isEnabled = false; etKey.isEnabled = false

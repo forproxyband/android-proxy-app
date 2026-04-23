@@ -10,7 +10,10 @@ import android.os.PowerManager
 import android.system.Os
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import java.io.BufferedReader
 import java.io.File
+import java.io.FileInputStream
+import java.io.InputStreamReader
 import java.io.PrintWriter
 import java.io.StringWriter
 import java.text.SimpleDateFormat
@@ -20,6 +23,7 @@ import java.util.Locale
 class ProxyService : Service() {
 
     private var wakeLock: PowerManager.WakeLock? = null
+    @Volatile private var stopRequested = false
 
     private fun log(msg: String) {
         try {
@@ -31,6 +35,31 @@ class ProxyService : Service() {
 
     private fun state(s: String) {
         try { File(filesDir, "proxy_state").writeText(s) } catch (_: Exception) {}
+    }
+
+    // Redirect native stdout/stderr (fd 1 and 2) to agent.log.
+    // The Go SDK logs to os.Stdout, which is /dev/null on Android by default —
+    // without this, all connection diagnostics from the Go side are lost.
+    private fun captureNativeOutput() {
+        try {
+            val fds = Os.pipe()
+            val readFd = fds[0]
+            val writeFd = fds[1]
+            Os.dup2(writeFd, 1)
+            Os.dup2(writeFd, 2)
+            Os.close(writeFd)
+            Thread {
+                try {
+                    val reader = BufferedReader(InputStreamReader(FileInputStream(readFd)))
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        log("[go] $line")
+                    }
+                } catch (_: Throwable) {}
+            }.apply { name = "NativeStdoutReader"; isDaemon = true; start() }
+        } catch (e: Throwable) {
+            log("stdout capture failed: ${e.message}")
+        }
     }
 
     override fun onCreate() {
@@ -72,30 +101,28 @@ class ProxyService : Service() {
 
         Thread {
             try {
-                log("Setting environment...")
+                log("Capturing native stdout/stderr...")
+                captureNativeOutput()
+
+                log("Setting environment: host=$host port=$port key=${mask(key)}")
                 Os.setenv("balancer_host", host, true)
                 Os.setenv("balancer_port", port, true)
                 Os.setenv("agent_key", key, true)
                 Os.setenv("enable_netagent", "true", true)
-                Os.setenv("log_level", "TRACE", true)
                 Os.setenv("fallback_file_url",
                     "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json", true)
-                log("Environment OK")
 
-                log("Initializing Go runtime...")
+                log("Loading Go runtime (first ref to go.Seq)...")
                 go.Seq.setContext(applicationContext)
-                log("Go runtime OK")
+                log("Go runtime loaded")
 
-                log("Starting agent...")
+                log("Calling Agent.startAgent() — async, see [go] lines below for real status")
                 proxyagent.sdk.agent.Agent.startAgent()
-                log("CONNECTED to $host:$port")
-
                 state("running")
 
-                // Update notification
                 val n = NotificationCompat.Builder(this@ProxyService, "proxy")
                     .setContentTitle("Proxy Agent")
-                    .setContentText("Connected to pool")
+                    .setContentText("Running — see logs")
                     .setSmallIcon(android.R.drawable.ic_menu_share)
                     .setContentIntent(PendingIntent.getActivity(this@ProxyService, 0,
                         Intent(this@ProxyService, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
@@ -115,12 +142,27 @@ class ProxyService : Service() {
         return START_NOT_STICKY
     }
 
+    private fun mask(s: String): String {
+        if (s.isEmpty()) return "<empty>"
+        if (s.length <= 6) return "****"
+        return s.substring(0, 3) + "****" + s.substring(s.length - 3)
+    }
+
     private fun doStop() {
+        if (stopRequested) return
+        stopRequested = true
         try { proxyagent.sdk.agent.Agent.stopAgent(); log("Stopped") }
         catch (_: Throwable) {}
         state("stopped")
         wakeLock?.let { if (it.isHeld) it.release() }
         stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
+        // Kill :proxy process so that next Start reloads the Go library
+        // with a fresh env snapshot (libc setenv does not update Go's
+        // cached syscall.envs after runtime init).
+        Thread {
+            try { Thread.sleep(400) } catch (_: InterruptedException) {}
+            android.os.Process.killProcess(android.os.Process.myPid())
+        }.apply { isDaemon = true; start() }
     }
 
     override fun onDestroy() { doStop(); super.onDestroy() }
