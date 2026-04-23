@@ -9,7 +9,7 @@ android {
 
     defaultConfig {
         applicationId = "com.proxyagent.app"
-        minSdk = 29
+        minSdk = 21
         targetSdk = 35
         versionCode = 1
         versionName = "1.0"

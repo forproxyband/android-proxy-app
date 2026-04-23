@@ -4,7 +4,9 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
@@ -42,8 +44,11 @@ class ProxyService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        val ch = NotificationChannel("proxy", "Proxy Agent", NotificationManager.IMPORTANCE_LOW)
-        getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
+        if (Build.VERSION.SDK_INT >= 26) {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val ch = NotificationChannel("proxy", "Proxy Agent", NotificationManager.IMPORTANCE_LOW)
+            nm.createNotificationChannel(ch)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -78,65 +83,70 @@ class ProxyService : Service() {
         } catch (_: Exception) {}
 
         Thread {
-            try {
-                val binary = File(applicationInfo.nativeLibraryDir, "libproxyagent.so")
-                log("Binary path: ${binary.absolutePath}")
-                log("Binary exists=${binary.exists()} executable=${binary.canExecute()} size=${if (binary.exists()) binary.length() else -1}")
-
-                if (!binary.exists()) {
-                    log("ERROR: libproxyagent.so missing — check that arm64-v8a lib is bundled and android:extractNativeLibs=true")
-                    state("error")
-                    return@Thread
-                }
-
-                try { binary.setExecutable(true, false) } catch (_: Throwable) {}
-
-                log("Launching subprocess: host=$host port=$port key=${mask(key)}")
-                val pb = ProcessBuilder(binary.absolutePath)
-                    .redirectErrorStream(true)
-                pb.environment().apply {
-                    put("balancer_host", host)
-                    put("balancer_port", port)
-                    put("agent_key", key)
-                    put("enable_netagent", "true")
-                    put("fallback_file_url",
-                        "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json")
-                    put("HOME", filesDir.absolutePath)
-                    put("TMPDIR", cacheDir.absolutePath)
-                }
-                val proc = pb.start()
-                agentProcess = proc
-                state("running")
-                log("Subprocess started")
-
-                val n = NotificationCompat.Builder(this@ProxyService, "proxy")
-                    .setContentTitle("Proxy Agent")
-                    .setContentText("Running — see logs")
-                    .setSmallIcon(android.R.drawable.ic_menu_share)
-                    .setContentIntent(PendingIntent.getActivity(this@ProxyService, 0,
-                        Intent(this@ProxyService, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
-                    .addAction(0, "Stop", PendingIntent.getService(this@ProxyService, 0,
-                        Intent(this@ProxyService, ProxyService::class.java).apply { action = "STOP" },
-                        PendingIntent.FLAG_IMMUTABLE))
-                    .setOngoing(true).build()
-                getSystemService(NotificationManager::class.java).notify(1, n)
-
-                val reader = proc.inputStream.bufferedReader()
-                while (true) {
-                    val line = reader.readLine() ?: break
-                    log("[agent] $line")
-                }
-                val code = proc.waitFor()
-                log("Subprocess exited code=$code")
-                if (!stopRequested) state("error")
-            } catch (e: Throwable) {
-                val sw = StringWriter(); e.printStackTrace(PrintWriter(sw))
-                log("ERROR: $sw")
+            val binary = File(applicationInfo.nativeLibraryDir, "libproxyagent.so")
+            if (!binary.exists()) {
+                log("ERROR: libproxyagent.so missing at ${binary.absolutePath}")
                 state("error")
+                return@Thread
             }
+            try { binary.setExecutable(true, false) } catch (_: Throwable) {}
+            log("Binary: ${binary.absolutePath} size=${binary.length()}")
+
+            val n = NotificationCompat.Builder(this@ProxyService, "proxy")
+                .setContentTitle("Proxy Agent")
+                .setContentText("Running — see logs")
+                .setSmallIcon(android.R.drawable.ic_menu_share)
+                .setContentIntent(PendingIntent.getActivity(this@ProxyService, 0,
+                    Intent(this@ProxyService, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
+                .addAction(0, "Stop", PendingIntent.getService(this@ProxyService, 0,
+                    Intent(this@ProxyService, ProxyService::class.java).apply { action = "STOP" },
+                    PendingIntent.FLAG_IMMUTABLE))
+                .setOngoing(true).build()
+            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(1, n)
+
+            var backoffMs = 1000L
+            while (!stopRequested) {
+                try {
+                    log("Launching subprocess: host=$host port=$port key=${mask(key)}")
+                    val pb = ProcessBuilder(binary.absolutePath).redirectErrorStream(true)
+                    pb.environment().apply {
+                        put("balancer_host", host)
+                        put("balancer_port", port)
+                        put("agent_key", key)
+                        put("enable_netagent", "true")
+                        put("fallback_file_url",
+                            "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json")
+                        put("HOME", filesDir.absolutePath)
+                        put("TMPDIR", cacheDir.absolutePath)
+                    }
+                    val proc = pb.start()
+                    agentProcess = proc
+                    state("running")
+                    log("Subprocess started")
+
+                    val reader = proc.inputStream.bufferedReader()
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        log("[agent] $line")
+                    }
+                    val code = proc.waitFor()
+                    agentProcess = null
+                    log("Subprocess exited code=$code")
+                    if (stopRequested) break
+                    backoffMs = 1000L
+                } catch (e: Throwable) {
+                    val sw = StringWriter(); e.printStackTrace(PrintWriter(sw))
+                    log("Subprocess error: $sw")
+                    if (stopRequested) break
+                }
+                log("Restarting in ${backoffMs}ms")
+                try { Thread.sleep(backoffMs) } catch (_: InterruptedException) { break }
+                backoffMs = (backoffMs * 2).coerceAtMost(30_000L)
+            }
+            log("Runner loop exited")
         }.apply { name = "AgentRunner"; isDaemon = true; start() }
 
-        return START_NOT_STICKY
+        return START_REDELIVER_INTENT
     }
 
     private fun doStop() {
@@ -157,7 +167,12 @@ class ProxyService : Service() {
         agentProcess = null
         state("stopped")
         wakeLock?.let { if (it.isHeld) it.release() }
-        stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
+        if (Build.VERSION.SDK_INT >= 24) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION") stopForeground(true)
+        }
+        stopSelf()
     }
 
     override fun onDestroy() { doStop(); super.onDestroy() }
