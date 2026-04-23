@@ -107,7 +107,7 @@ class ProxyService : Service() {
                 val proc = pb.start()
                 agentProcess = proc
                 state("running")
-                log("Subprocess started pid=${try { proc.pid() } catch (_: Throwable) { -1 }}")
+                log("Subprocess started")
 
                 val n = NotificationCompat.Builder(this@ProxyService, "proxy")
                     .setContentTitle("Proxy Agent")
