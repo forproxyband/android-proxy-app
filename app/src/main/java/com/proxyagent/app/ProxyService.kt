@@ -41,6 +41,7 @@ class ProxyService : Service() {
     @Volatile private var currentRegistrator = ""
     @Volatile private var activeTunnels = 0
     @Volatile private var connectedSinceMs = 0L
+    @Volatile private var publicIp = ""
     private var lastRx = 0L
     private var lastTx = 0L
     private var lastStatsAt = 0L
@@ -97,9 +98,40 @@ class ProxyService : Service() {
     private fun writeConnInfo() {
         try {
             File(filesDir, "conn_info").writeText(
-                "${connStatus.name}|$rxRate|$txRate|$currentRegistrator|$activeTunnels|$connectedSinceMs"
+                "${connStatus.name}|$rxRate|$txRate|$currentRegistrator|$activeTunnels|$connectedSinceMs|$publicIp"
             )
         } catch (_: Exception) {}
+    }
+
+    // Fetches the public IP asynchronously (HTTP GET to api.ipify.org with icanhazip fallback).
+    // Writes result to `publicIp` field and updates conn_info for the UI to see.
+    private fun refreshPublicIp() {
+        Thread {
+            // Let the new network settle for a moment after onAvailable fires.
+            try { Thread.sleep(1500) } catch (_: InterruptedException) { return@Thread }
+            val services = listOf("https://api.ipify.org", "https://icanhazip.com")
+            for (url in services) {
+                try {
+                    val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+                        connectTimeout = 5000
+                        readTimeout = 5000
+                        requestMethod = "GET"
+                        setRequestProperty("User-Agent", "ProxyAgent-Android")
+                    }
+                    val ip = conn.inputStream.bufferedReader().use { it.readText().trim() }
+                    conn.disconnect()
+                    if (ip.isNotEmpty() && ip.length < 40 &&
+                        (ip.matches(Regex("""\d{1,3}(\.\d{1,3}){3}""")) || ip.contains(":"))) {
+                        publicIp = ip
+                        writeConnInfo()
+                        log("Public IP: $ip (via ${java.net.URL(url).host})")
+                        return@Thread
+                    }
+                } catch (e: Throwable) {
+                    log("Public IP fetch via $url failed: ${e.message}")
+                }
+            }
+        }.apply { isDaemon = true; name = "PublicIpFetch"; start() }
     }
 
     private fun readBatteryThreshold(): Int = try {
@@ -341,15 +373,22 @@ class ProxyService : Service() {
                 override fun onAvailable(network: Network) {
                     val prev = lastNet
                     lastNet = network
+                    publicIp = ""              // invalidate stale IP while we refetch
+                    writeConnInfo()
                     if (prev != null && prev != network) {
                         forceReconnect("network changed: $prev → $network")
                     } else {
                         log("Network available: $network")
                     }
+                    refreshPublicIp()
                 }
                 override fun onLost(network: Network) {
                     log("Network lost: $network")
-                    if (lastNet == network) lastNet = null
+                    if (lastNet == network) {
+                        lastNet = null
+                        publicIp = ""
+                        writeConnInfo()
+                    }
                 }
                 override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
                     // Fires on every small change; we rely on onAvailable for actual switches.
@@ -408,6 +447,7 @@ class ProxyService : Service() {
         currentRegistrator = ""
         activeTunnels = 0
         connectedSinceMs = 0L
+        publicIp = ""
         state(if (autoStopReason.isNotEmpty()) "auto_stopped" else "stopped")
         writeConnInfo()
         wakeLock?.let { if (it.isHeld) it.release() }

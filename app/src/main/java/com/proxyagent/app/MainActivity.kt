@@ -38,6 +38,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnBattery: Button
     private lateinit var spBatteryThreshold: Spinner
     private lateinit var tvStatus: TextView
+    private lateinit var tvNetwork: TextView
     private lateinit var tvRegistrator: TextView
     private lateinit var tvUptime: TextView
     private lateinit var tvActivity: TextView
@@ -69,6 +70,7 @@ class MainActivity : AppCompatActivity() {
         btnBattery = findViewById(R.id.btnBattery)
         spBatteryThreshold = findViewById(R.id.spBatteryThreshold)
         tvStatus = findViewById(R.id.tvStatus)
+        tvNetwork = findViewById(R.id.tvNetwork)
         tvRegistrator = findViewById(R.id.tvRegistrator)
         tvUptime = findViewById(R.id.tvUptime)
         tvActivity = findViewById(R.id.tvActivity)
@@ -266,6 +268,36 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun currentLocalIps(): List<String> {
+        return try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val net = cm.activeNetwork ?: return emptyList()
+            val link = cm.getLinkProperties(net) ?: return emptyList()
+            link.linkAddresses.mapNotNull { la ->
+                la.address.hostAddress?.takeIf { !la.address.isLoopbackAddress }
+            }
+        } catch (_: Throwable) { emptyList() }
+    }
+
+    private fun currentTransport(): String {
+        return try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            if (Build.VERSION.SDK_INT >= 23) {
+                val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+                when {
+                    caps == null -> "NONE"
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "CELLULAR"
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ETHERNET"
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "VPN"
+                    else -> "OTHER"
+                }
+            } else {
+                @Suppress("DEPRECATION") cm.activeNetworkInfo?.typeName ?: "NONE"
+            }
+        } catch (_: Throwable) { "?" }
+    }
+
     private fun buildDeviceInfoHeader(): String {
         val sb = StringBuilder()
         val line = "=".repeat(64)
@@ -283,6 +315,36 @@ class MainActivity : AppCompatActivity() {
         sb.append("Proxy Agent · Log Export\n")
         sb.append(line).append('\n')
         kv("Exported-At", now)
+
+        section("CONNECTION STATE")
+        val proxyState = readFile("proxy_state")
+        val info = readFile("conn_info").split("|")
+        val connStatus = info.getOrNull(0).orEmpty()
+        val rxRate = info.getOrNull(1)?.toLongOrNull() ?: -1L
+        val txRate = info.getOrNull(2)?.toLongOrNull() ?: -1L
+        val registrator = info.getOrNull(3).orEmpty()
+        val tunnels = info.getOrNull(4)?.toIntOrNull() ?: 0
+        val connSince = info.getOrNull(5)?.toLongOrNull() ?: 0L
+        val publicIp = info.getOrNull(6).orEmpty()
+        val statusLabel = when {
+            proxyState == "error" -> "ERROR"
+            proxyState == "auto_stopped" -> "AUTO-STOPPED (LOW BATTERY)"
+            connStatus.isNotEmpty() -> connStatus
+            proxyState == "running" -> "RUNNING"
+            proxyState == "starting" -> "STARTING"
+            proxyState == "stopped" -> "STOPPED"
+            else -> "DISCONNECTED"
+        }
+        kv("Status", statusLabel)
+        if (connStatus == "CONNECTED") {
+            if (registrator.isNotEmpty()) kv("Registrator", registrator)
+            if (connSince > 0) kv("Uptime", formatDuration(System.currentTimeMillis() - connSince))
+            kv("Active-Tunnels", tunnels)
+            if (rxRate >= 0 || txRate >= 0)
+                kv("Rate", "↓${humanRate(rxRate)}  ↑${humanRate(txRate)}")
+        }
+        kv("Transport", currentTransport())
+        if (publicIp.isNotEmpty()) kv("Public-IP", publicIp)
 
         section("APP")
         kv("Package", packageName)
@@ -331,21 +393,23 @@ class MainActivity : AppCompatActivity() {
             if (Build.VERSION.SDK_INT >= 23) {
                 val active = cm.activeNetwork
                 val caps = active?.let { cm.getNetworkCapabilities(it) }
-                val transport = when {
-                    caps == null -> "NONE"
-                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
-                    caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "CELLULAR"
-                    caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ETHERNET"
-                    caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "VPN"
-                    else -> "OTHER"
-                }
-                kv("Transport", transport)
+                val link = active?.let { cm.getLinkProperties(it) }
+                kv("Transport", currentTransport())
                 kv("Internet-Capable", caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ?: false)
                 kv("Validated", caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ?: false)
+                val ips = currentLocalIps()
+                if (ips.isNotEmpty()) kv("Local-IPs", ips.joinToString(", "))
+                if (publicIp.isNotEmpty()) kv("Public-IP", publicIp)
+                link?.interfaceName?.let { kv("Interface", it) }
+                link?.dnsServers?.takeIf { it.isNotEmpty() }?.let {
+                    kv("DNS", it.mapNotNull { dns -> dns.hostAddress }.joinToString(", "))
+                }
             } else {
                 @Suppress("DEPRECATION") val info = cm.activeNetworkInfo
                 kv("Type", info?.typeName)
                 @Suppress("DEPRECATION") kv("Connected", info?.isConnected ?: false)
+                val ips = currentLocalIps()
+                if (ips.isNotEmpty()) kv("Local-IPs", ips.joinToString(", "))
             }
         } catch (e: Throwable) {
             kv("(error)", e.message)
@@ -403,6 +467,7 @@ class MainActivity : AppCompatActivity() {
         val registrator = connInfo.getOrNull(3).orEmpty()
         val tunnels = connInfo.getOrNull(4)?.toIntOrNull() ?: 0
         val connectedSinceMs = connInfo.getOrNull(5)?.toLongOrNull() ?: 0L
+        val publicIp = connInfo.getOrNull(6).orEmpty()
 
         val running = proxyState == "running" || proxyState == "starting"
         btnStart.text = if (running) "STOP" else "START"
@@ -420,6 +485,14 @@ class MainActivity : AppCompatActivity() {
         }
         tvStatus.text = label
         tvStatus.setTextColor(color)
+
+        val transport = currentTransport()
+        val wan = when {
+            publicIp.isNotEmpty() -> publicIp
+            running -> "fetching…"
+            else -> "—"
+        }
+        tvNetwork.text = "$wan  ·  $transport"
 
         if (connStatus == "CONNECTED" && registrator.isNotEmpty()) {
             registratorPanel.visibility = View.VISIBLE
