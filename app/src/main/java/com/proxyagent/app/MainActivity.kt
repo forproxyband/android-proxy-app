@@ -582,8 +582,8 @@ class MainActivity : AppCompatActivity() {
                 "up ${formatDuration(System.currentTimeMillis() - connectedSinceMs)}"
             else ""
             tvActivity.text = when {
-                tunnels == 0 -> "◦ idle — no clients"
-                else -> "⚡ $tunnels ${if (tunnels == 1) "client" else "clients"} · " +
+                tunnels == 0 -> "◦ idle — no connections"
+                else -> "⚡ $tunnels ${if (tunnels == 1) "connection" else "connections"} · " +
                     "↓${humanRate(rxRate)} ↑${humanRate(txRate)}"
             }
         } else {
