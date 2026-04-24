@@ -106,6 +106,22 @@ class ProxyService : Service() {
         File(filesDir, "battery_threshold").readText().trim().toIntOrNull() ?: 0
     } catch (_: Throwable) { 0 }
 
+    // System-level check: is there a validated, non-suspended internet path right now?
+    // Returns false when the OS has marked the active network as "no internet" — e.g.
+    // cellular data exhausted, captive portal, or carrier-side suspension.
+    private fun systemSaysInternetUp(): Boolean {
+        return try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val net = cm.activeNetwork ?: return false
+            val caps = cm.getNetworkCapabilities(net) ?: return false
+            if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) return false
+            if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) return false
+            if (Build.VERSION.SDK_INT >= 28 &&
+                !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_SUSPENDED)) return false
+            true
+        } catch (_: Throwable) { true }  // be conservative: assume up on error
+    }
+
     private fun mask(s: String): String {
         if (s.isEmpty()) return "<empty>"
         if (s.length <= 6) return "****"
@@ -250,10 +266,13 @@ class ProxyService : Service() {
         } catch (_: Exception) {}
 
         // Status + speed updater: polls TrafficStats and battery once per second,
-        // refreshes notification + conn_info file, and enforces battery auto-stop.
+        // refreshes notification + conn_info file, and enforces battery /
+        // no-internet auto-stops.
         Thread {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             val bm = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+            var noInternetSince = 0L
+            val noInternetGraceMs = 30_000L
             while (!stopRequested) {
                 try {
                     refreshTrafficStats()
@@ -268,6 +287,22 @@ class ProxyService : Service() {
                             doStop("Battery $level% ≤ $threshold% — auto-stopped")
                             break
                         }
+                    }
+
+                    // System-level "no internet" detection. Stops the agent if OS
+                    // reports no validated internet for `noInternetGraceMs`, instead
+                    // of burning CPU/battery in the subprocess' dial loop.
+                    val now = System.currentTimeMillis()
+                    if (!systemSaysInternetUp()) {
+                        if (noInternetSince == 0L) noInternetSince = now
+                        if (now - noInternetSince >= noInternetGraceMs) {
+                            val secs = (now - noInternetSince) / 1000
+                            log("Auto-stop: system reports no internet for ${secs}s")
+                            doStop("No internet (${secs}s) — auto-stopped")
+                            break
+                        }
+                    } else {
+                        noInternetSince = 0L
                     }
                 } catch (_: Throwable) {}
                 try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
@@ -428,6 +463,12 @@ class ProxyService : Service() {
         activeTunnels = 0
         connectedSinceMs = 0L
         state(if (autoStopReason.isNotEmpty()) "auto_stopped" else "stopped")
+        try {
+            if (autoStopReason.isNotEmpty())
+                File(filesDir, "stop_reason").writeText(autoStopReason)
+            else
+                File(filesDir, "stop_reason").delete()
+        } catch (_: Throwable) {}
         writeConnInfo()
         wakeLock?.let { if (it.isHeld) it.release() }
         if (Build.VERSION.SDK_INT >= 24) {

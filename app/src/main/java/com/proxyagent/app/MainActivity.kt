@@ -677,7 +677,11 @@ class MainActivity : AppCompatActivity() {
 
         val (label, color) = when {
             proxyState == "error" -> "ERROR" to 0xFFFF4444.toInt()
-            proxyState == "auto_stopped" -> "AUTO-STOPPED (LOW BATTERY)" to 0xFFFFAA00.toInt()
+            proxyState == "auto_stopped" -> {
+                val reason = readFile("stop_reason")
+                val text = if (reason.isNotEmpty()) "AUTO-STOPPED · $reason" else "AUTO-STOPPED"
+                text to 0xFFFFAA00.toInt()
+            }
             connStatus == "CONNECTED" ->
                 "CONNECTED · ↓${humanRate(rxRate)} ↑${humanRate(txRate)}" to 0xFF00CC00.toInt()
             connStatus == "CONNECTING" -> "CONNECTING…" to 0xFFFFAA00.toInt()
