@@ -28,6 +28,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.FileProvider
+import androidx.core.view.WindowCompat
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -68,6 +69,9 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Android 15+ forces edge-to-edge; tell the decor view to reserve space
+        // for system bars + camera cutout so title doesn't render under them.
+        WindowCompat.setDecorFitsSystemWindows(window, true)
         setContentView(R.layout.activity_main)
 
         btnStart = findViewById(R.id.btnToggle)
