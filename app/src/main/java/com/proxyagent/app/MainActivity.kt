@@ -71,10 +71,6 @@ class MainActivity : AppCompatActivity() {
             if (uri != null) importSettingsFromUri(uri)
         }
 
-    private val defaultHost = "77.42.29.86"
-    private val defaultPort = "1005"
-    private val defaultKey = "ebf7ece7fd38ad9ce7d550d0934ca60b9979396e2663127de4642f4633823f04"
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Android 15+ forces edge-to-edge; tell the decor view to reserve space
@@ -102,14 +98,6 @@ class MainActivity : AppCompatActivity() {
             "v${BuildConfig.VERSION_NAME}  build ${BuildConfig.VERSION_CODE}"
 
         val prefs = getSharedPreferences("cfg", 0)
-        // Seed defaults on first run so the settings dialog shows sensible values.
-        if (!prefs.contains("h")) {
-            prefs.edit()
-                .putString("h", defaultHost)
-                .putString("p", defaultPort)
-                .putString("k", defaultKey)
-                .apply()
-        }
 
         setupBatteryThresholdSpinner(prefs)
         btnStart.setOnClickListener { toggle() }
@@ -227,9 +215,9 @@ class MainActivity : AppCompatActivity() {
         val prefs = getSharedPreferences("cfg", 0)
 
         fun loadFromPrefs() {
-            etHost.setText(prefs.getString("h", defaultHost))
-            etPort.setText(prefs.getString("p", defaultPort))
-            etKey.setText(prefs.getString("k", defaultKey))
+            etHost.setText(prefs.getString("h", ""))
+            etPort.setText(prefs.getString("p", ""))
+            etKey.setText(prefs.getString("k", ""))
             etDns.setText(prefs.getString("dns", ""))
             cbSpeedBytes.isChecked = prefs.getBoolean("speed_bytes", false)
         }
@@ -391,6 +379,25 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun showConfigurePrompt() {
+        AlertDialog.Builder(this)
+            .setTitle("Connection not configured")
+            .setMessage("Host / Port / Key are required. Import settings from a .txt file, or fill them in manually.")
+            .setPositiveButton("Import") { _, _ ->
+                importLauncher.launch(arrayOf("text/plain", "application/octet-stream", "*/*"))
+            }
+            .setNeutralButton("Configure") { _, _ -> showSettingsDialog() }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun hasConnectionConfig(): Boolean {
+        val p = getSharedPreferences("cfg", 0)
+        return !p.getString("h", "").isNullOrBlank() &&
+            !p.getString("p", "").isNullOrBlank() &&
+            !p.getString("k", "").isNullOrBlank()
+    }
+
     private fun toggle() {
         val st = readFile("proxy_state")
         if (st == "running" || st == "starting") {
@@ -405,9 +412,7 @@ class MainActivity : AppCompatActivity() {
         val k = prefs.getString("k", "")?.trim().orEmpty()
         val d = prefs.getString("dns", "")?.trim().orEmpty()
         if (h.isEmpty() || po.isEmpty() || k.isEmpty()) {
-            tvStatus.text = "CONFIGURE FIRST (⚙)"
-            tvStatus.setTextColor(0xFFFF4444.toInt())
-            showSettingsDialog()
+            showConfigurePrompt()
             return
         }
 
@@ -673,9 +678,15 @@ class MainActivity : AppCompatActivity() {
         val connectedSinceMs = connInfo.getOrNull(5)?.toLongOrNull() ?: 0L
 
         val running = proxyState == "running" || proxyState == "starting"
+        val configured = hasConnectionConfig()
         btnStart.text = if (running) "STOP" else "START"
+        btnStart.backgroundTintList = android.content.res.ColorStateList.valueOf(
+            if (!running && !configured) 0xFF666680.toInt() else 0xFFE94560.toInt()
+        )
 
         val (label, color) = when {
+            !running && !configured ->
+                "NOT CONFIGURED · TAP START TO IMPORT" to 0xFFFFAA00.toInt()
             proxyState == "error" -> "ERROR" to 0xFFFF4444.toInt()
             proxyState == "auto_stopped" -> {
                 val reason = readFile("stop_reason")
