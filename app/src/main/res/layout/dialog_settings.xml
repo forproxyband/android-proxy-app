@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="20dp">
+
+    <EditText
+        android:id="@+id/etHost"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:hint="Host"
+        android:inputType="text"
+        android:textSize="14sp"
+        android:layout_marginBottom="8dp" />
+
+    <EditText
+        android:id="@+id/etPort"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:hint="Port"
+        android:inputType="number"
+        android:textSize="14sp"
+        android:layout_marginBottom="8dp" />
+
+    <EditText
+        android:id="@+id/etKey"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:hint="Agent Key"
+        android:inputType="text"
+        android:textSize="14sp" />
+
+</LinearLayout>

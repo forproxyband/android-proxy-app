@@ -32,16 +32,55 @@ class ProxyService : Service() {
     @Volatile private var connStatus: ConnStatus = ConnStatus.STARTING
     @Volatile private var rxRate = 0L
     @Volatile private var txRate = 0L
+    @Volatile private var currentRegistrator = ""
+    @Volatile private var activeTunnels = 0
     private var lastRx = 0L
     private var lastTx = 0L
     private var lastStatsAt = 0L
 
+    private val regSelectedRe = Regex("""host=(\S+) port=(\d+)""")
+    private val wsUrlRe = Regex("""url=wss?://([^/\s"]+)""")
+
+    @Synchronized
     private fun log(msg: String) {
         try {
             val ts = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
-            File(filesDir, "agent.log").appendText("$ts $msg\n")
+            val logFile = File(filesDir, "agent.log")
+            logFile.appendText("$ts $msg\n")
             Log.d("ProxyAgent", msg)
+            if (logFile.length() > MAX_LOG_BYTES) trimLog(logFile)
         } catch (_: Exception) {}
+    }
+
+    // Keep the last KEEP_LOG_BYTES of agent.log; rotate when it grows past MAX_LOG_BYTES.
+    // Whole `log()` is synchronized so no writer races with the trim.
+    private fun trimLog(logFile: File) {
+        try {
+            val len = logFile.length()
+            if (len <= KEEP_LOG_BYTES) return
+            val skip = len - KEEP_LOG_BYTES
+            val tail: ByteArray
+            logFile.inputStream().use { input ->
+                var skipped = 0L
+                while (skipped < skip) {
+                    val s = input.skip(skip - skipped)
+                    if (s <= 0) break
+                    skipped += s
+                }
+                // Advance to next '\n' so we don't start from mid-line
+                while (true) {
+                    val b = input.read()
+                    if (b < 0 || b == '\n'.code) break
+                }
+                tail = input.readBytes()
+            }
+            logFile.writeBytes(tail)
+        } catch (_: Throwable) {}
+    }
+
+    companion object {
+        private const val MAX_LOG_BYTES = 10L * 1024 * 1024  // trigger rotation
+        private const val KEEP_LOG_BYTES = 8L * 1024 * 1024  // keep this much tail
     }
 
     private fun state(s: String) {
@@ -50,7 +89,8 @@ class ProxyService : Service() {
 
     private fun writeConnInfo() {
         try {
-            File(filesDir, "conn_info").writeText("${connStatus.name}|$rxRate|$txRate")
+            File(filesDir, "conn_info")
+                .writeText("${connStatus.name}|$rxRate|$txRate|$currentRegistrator|$activeTunnels")
         } catch (_: Exception) {}
     }
 
@@ -66,12 +106,30 @@ class ProxyService : Service() {
 
     private fun parseAgentLine(line: String) {
         when {
-            line.contains("ws connected") -> connStatus = ConnStatus.CONNECTED
+            line.contains("tunnel opened") -> activeTunnels++
+            line.contains("tunnel closed") -> activeTunnels = (activeTunnels - 1).coerceAtLeast(0)
+            line.contains("ws connected") -> {
+                connStatus = ConnStatus.CONNECTED
+                wsUrlRe.find(line)?.let { currentRegistrator = it.groupValues[1] }
+            }
+            line.contains("selected") && line.contains("registrator") -> {
+                regSelectedRe.find(line)?.let {
+                    currentRegistrator = "${it.groupValues[1]}:${it.groupValues[2]}"
+                }
+            }
             line.contains("ws read error") ||
                 line.contains("close 1006") ||
-                line.contains("ws close frame") -> connStatus = ConnStatus.RECONNECTING
+                line.contains("ws close frame") -> {
+                connStatus = ConnStatus.RECONNECTING
+                currentRegistrator = ""
+                activeTunnels = 0
+            }
             line.contains("balancer selection failed") ||
-                line.contains("no registrator available") -> connStatus = ConnStatus.RECONNECTING
+                line.contains("no registrator available") -> {
+                connStatus = ConnStatus.RECONNECTING
+                currentRegistrator = ""
+                activeTunnels = 0
+            }
             line.contains("ws dialing") ||
                 line.contains("balancer request") -> {
                 if (connStatus != ConnStatus.CONNECTED) connStatus = ConnStatus.CONNECTING
@@ -91,7 +149,9 @@ class ProxyService : Service() {
         val base = when (connStatus) {
             ConnStatus.STARTING -> "Starting…"
             ConnStatus.CONNECTING -> "Connecting…"
-            ConnStatus.CONNECTED -> "Connected"
+            ConnStatus.CONNECTED ->
+                if (currentRegistrator.isNotEmpty()) "Connected · $currentRegistrator"
+                else "Connected"
             ConnStatus.RECONNECTING -> "Reconnecting…"
             ConnStatus.ERROR -> "Error"
             ConnStatus.STOPPED -> "Stopped"
@@ -228,12 +288,16 @@ class ProxyService : Service() {
                     log("Subprocess exited code=$code")
                     if (stopRequested) break
                     connStatus = ConnStatus.RECONNECTING
+                    currentRegistrator = ""
+                    activeTunnels = 0
                     backoffMs = 1000L
                 } catch (e: Throwable) {
                     val sw = StringWriter(); e.printStackTrace(PrintWriter(sw))
                     log("Subprocess error: $sw")
                     if (stopRequested) break
                     connStatus = ConnStatus.RECONNECTING
+                    currentRegistrator = ""
+                    activeTunnels = 0
                 }
                 log("Restarting in ${backoffMs}ms")
                 try { Thread.sleep(backoffMs) } catch (_: InterruptedException) { break }
@@ -262,6 +326,8 @@ class ProxyService : Service() {
         } catch (t: Throwable) { log("Stop error: ${t.message}") }
         agentProcess = null
         connStatus = ConnStatus.STOPPED
+        currentRegistrator = ""
+        activeTunnels = 0
         state(if (autoStopReason.isNotEmpty()) "auto_stopped" else "stopped")
         writeConnInfo()
         wakeLock?.let { if (it.isHeld) it.release() }

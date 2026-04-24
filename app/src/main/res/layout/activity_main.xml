@@ -35,56 +35,77 @@
         android:textSize="18sp"
         android:textStyle="bold"
         android:layout_gravity="center_horizontal"
-        android:layout_marginBottom="16dp" />
-
-    <EditText
-        android:id="@+id/etHost"
-        android:layout_width="match_parent"
-        android:layout_height="48dp"
-        android:hint="Host"
-        android:textColor="#ffffff"
-        android:textColorHint="#666666"
-        android:background="#16213e"
-        android:padding="10dp"
-        android:textSize="14sp"
-        android:inputType="text"
-        android:layout_marginBottom="6dp" />
-
-    <EditText
-        android:id="@+id/etPort"
-        android:layout_width="match_parent"
-        android:layout_height="48dp"
-        android:hint="Port"
-        android:textColor="#ffffff"
-        android:textColorHint="#666666"
-        android:background="#16213e"
-        android:padding="10dp"
-        android:textSize="14sp"
-        android:inputType="number"
-        android:layout_marginBottom="6dp" />
-
-    <EditText
-        android:id="@+id/etKey"
-        android:layout_width="match_parent"
-        android:layout_height="48dp"
-        android:hint="Agent Key"
-        android:textColor="#ffffff"
-        android:textColorHint="#666666"
-        android:background="#16213e"
-        android:padding="10dp"
-        android:textSize="14sp"
-        android:inputType="text"
         android:layout_marginBottom="10dp" />
 
-    <Button
-        android:id="@+id/btnToggle"
+    <LinearLayout
+        android:id="@+id/registratorPanel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:background="#0f2a1f"
+        android:padding="12dp"
+        android:layout_marginBottom="12dp"
+        android:visibility="gone">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="CONNECTED TO REGISTRATOR"
+            android:textColor="#88ffaa"
+            android:textSize="10sp"
+            android:textStyle="bold"
+            android:letterSpacing="0.1" />
+
+        <TextView
+            android:id="@+id/tvRegistrator"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="—"
+            android:textColor="#00ff41"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:fontFamily="monospace"
+            android:layout_marginTop="4dp" />
+
+        <TextView
+            android:id="@+id/tvActivity"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textColor="#88ffaa"
+            android:textSize="12sp"
+            android:fontFamily="monospace"
+            android:layout_marginTop="6dp" />
+    </LinearLayout>
+
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="50dp"
-        android:text="START"
-        android:textSize="16sp"
-        android:textStyle="bold"
-        android:backgroundTint="#e94560"
-        android:layout_marginBottom="6dp" />
+        android:orientation="horizontal"
+        android:layout_marginBottom="6dp">
+
+        <Button
+            android:id="@+id/btnToggle"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="match_parent"
+            android:text="START"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:backgroundTint="#e94560" />
+
+        <Button
+            android:id="@+id/btnSettings"
+            android:layout_width="50dp"
+            android:layout_height="match_parent"
+            android:text="⚙"
+            android:textSize="22sp"
+            android:textColor="#e94560"
+            android:backgroundTint="#16213e"
+            android:layout_marginStart="6dp"
+            android:padding="0dp" />
+
+    </LinearLayout>
 
     <LinearLayout
         android:layout_width="match_parent"
@@ -120,14 +141,34 @@
         android:layout_marginBottom="10dp"
         android:visibility="gone" />
 
-    <TextView
-        android:layout_width="wrap_content"
+    <LinearLayout
+        android:id="@+id/logsHeader"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="LOGS"
-        android:textColor="#e94560"
-        android:textSize="12sp"
-        android:textStyle="bold"
-        android:layout_marginBottom="4dp" />
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:clickable="true"
+        android:focusable="true"
+        android:paddingTop="4dp"
+        android:paddingBottom="4dp"
+        android:layout_marginBottom="4dp">
+        <TextView
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="wrap_content"
+            android:text="LOGS"
+            android:textColor="#e94560"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+        <TextView
+            android:id="@+id/tvLogsChevron"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="▼"
+            android:textColor="#e94560"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+    </LinearLayout>
 
     <ScrollView
         android:id="@+id/svLogs"
@@ -135,7 +176,8 @@
         android:layout_height="0dp"
         android:layout_weight="1"
         android:background="#0f0f23"
-        android:padding="8dp">
+        android:padding="8dp"
+        android:visibility="gone">
 
         <TextView
             android:id="@+id/tvLogs"
