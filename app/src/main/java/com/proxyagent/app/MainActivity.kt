@@ -5,7 +5,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -56,6 +58,9 @@ class MainActivity : AppCompatActivity() {
             handler.postDelayed(this, 3000)
         }
     }
+
+    @Volatile private var publicIp = ""
+    private var netCallback: ConnectivityManager.NetworkCallback? = null
 
     private val defaultHost = "77.42.29.86"
     private val defaultPort = "1005"
@@ -111,6 +116,78 @@ class MainActivity : AppCompatActivity() {
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
+
+        registerNetCallback()
+        refreshPublicIp()
+    }
+
+    override fun onDestroy() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            netCallback?.let { cm.unregisterNetworkCallback(it) }
+        } catch (_: Throwable) {}
+        netCallback = null
+        super.onDestroy()
+    }
+
+    private fun registerNetCallback() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                private var lastNet: Network? = null
+                override fun onAvailable(network: Network) {
+                    val prev = lastNet
+                    lastNet = network
+                    if (prev == null || prev != network) {
+                        publicIp = ""
+                        runOnUiThread { refresh() }
+                        refreshPublicIp()
+                    }
+                }
+                override fun onLost(network: Network) {
+                    if (lastNet == network) {
+                        lastNet = null
+                        publicIp = ""
+                        runOnUiThread { refresh() }
+                    }
+                }
+            }
+            netCallback = cb
+            if (Build.VERSION.SDK_INT >= 24) {
+                cm.registerDefaultNetworkCallback(cb)
+            } else {
+                val req = NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .build()
+                cm.registerNetworkCallback(req, cb)
+            }
+        } catch (_: Throwable) {}
+    }
+
+    private fun refreshPublicIp() {
+        Thread {
+            // Let the network finalize routes/DNS after a switch.
+            try { Thread.sleep(1200) } catch (_: InterruptedException) { return@Thread }
+            val services = listOf("https://api.ipify.org", "https://icanhazip.com")
+            for (url in services) {
+                try {
+                    val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+                        connectTimeout = 5000
+                        readTimeout = 5000
+                        requestMethod = "GET"
+                        setRequestProperty("User-Agent", "ProxyAgent-Android")
+                    }
+                    val ip = conn.inputStream.bufferedReader().use { it.readText().trim() }
+                    conn.disconnect()
+                    if (ip.isNotEmpty() && ip.length < 40 &&
+                        (ip.matches(Regex("""\d{1,3}(\.\d{1,3}){3}""")) || ip.contains(":"))) {
+                        publicIp = ip
+                        runOnUiThread { refresh() }
+                        return@Thread
+                    }
+                } catch (_: Throwable) {}
+            }
+        }.apply { isDaemon = true; name = "PublicIpFetch"; start() }
     }
 
     override fun onResume() {
@@ -325,7 +402,6 @@ class MainActivity : AppCompatActivity() {
         val registrator = info.getOrNull(3).orEmpty()
         val tunnels = info.getOrNull(4)?.toIntOrNull() ?: 0
         val connSince = info.getOrNull(5)?.toLongOrNull() ?: 0L
-        val publicIp = info.getOrNull(6).orEmpty()
         val statusLabel = when {
             proxyState == "error" -> "ERROR"
             proxyState == "auto_stopped" -> "AUTO-STOPPED (LOW BATTERY)"
@@ -467,7 +543,6 @@ class MainActivity : AppCompatActivity() {
         val registrator = connInfo.getOrNull(3).orEmpty()
         val tunnels = connInfo.getOrNull(4)?.toIntOrNull() ?: 0
         val connectedSinceMs = connInfo.getOrNull(5)?.toLongOrNull() ?: 0L
-        val publicIp = connInfo.getOrNull(6).orEmpty()
 
         val running = proxyState == "running" || proxyState == "starting"
         btnStart.text = if (running) "STOP" else "START"
@@ -487,11 +562,7 @@ class MainActivity : AppCompatActivity() {
         tvStatus.setTextColor(color)
 
         val transport = currentTransport()
-        val wan = when {
-            publicIp.isNotEmpty() -> publicIp
-            running -> "fetching…"
-            else -> "—"
-        }
+        val wan = publicIp.ifEmpty { "fetching…" }
         tvNetwork.text = "$wan  ·  $transport"
 
         if (connStatus == "CONNECTED" && registrator.isNotEmpty()) {
