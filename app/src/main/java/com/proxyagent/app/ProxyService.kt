@@ -148,12 +148,28 @@ class ProxyService : Service() {
         }
     }
 
-    private fun humanRate(bps: Long): String = when {
-        bps < 0 -> "—"
-        bps < 1024 -> "${bps}B/s"
-        bps < 1024 * 1024 -> "${bps / 1024}KB/s"
-        bps < 1024L * 1024 * 1024 -> "%.1fMB/s".format(Locale.US, bps / 1024.0 / 1024.0)
-        else -> "%.1fGB/s".format(Locale.US, bps / 1024.0 / 1024.0 / 1024.0)
+    private fun readSpeedUnitsBytes(): Boolean = try {
+        File(filesDir, "speed_units").readText().trim() == "bytes"
+    } catch (_: Throwable) { false }
+
+    private fun humanRate(bytesPerSec: Long): String {
+        if (bytesPerSec < 0) return "—"
+        return if (readSpeedUnitsBytes()) {
+            when {
+                bytesPerSec < 1024 -> "${bytesPerSec}B/s"
+                bytesPerSec < 1024 * 1024 -> "${bytesPerSec / 1024}KB/s"
+                bytesPerSec < 1024L * 1024 * 1024 -> "%.1fMB/s".format(Locale.US, bytesPerSec / 1024.0 / 1024.0)
+                else -> "%.1fGB/s".format(Locale.US, bytesPerSec / 1024.0 / 1024.0 / 1024.0)
+            }
+        } else {
+            val bits = bytesPerSec * 8
+            when {
+                bits < 1000 -> "${bits}b/s"
+                bits < 1000 * 1000 -> "${bits / 1000}Kb/s"
+                bits < 1000L * 1000 * 1000 -> "%.1fMb/s".format(Locale.US, bits / 1000.0 / 1000.0)
+                else -> "%.1fGb/s".format(Locale.US, bits / 1000.0 / 1000.0 / 1000.0)
+            }
+        }
     }
 
     private fun statusText(): String {

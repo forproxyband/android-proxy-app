@@ -19,11 +19,14 @@ import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
@@ -62,6 +65,11 @@ class MainActivity : AppCompatActivity() {
 
     @Volatile private var publicIp = ""
     private var netCallback: ConnectivityManager.NetworkCallback? = null
+
+    private val importLauncher: ActivityResultLauncher<Array<String>> =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) importSettingsFromUri(uri)
+        }
 
     private val defaultHost = "77.42.29.86"
     private val defaultPort = "1005"
@@ -213,13 +221,21 @@ class MainActivity : AppCompatActivity() {
         val etPort = view.findViewById<EditText>(R.id.etPort)
         val etKey = view.findViewById<EditText>(R.id.etKey)
         val etDns = view.findViewById<EditText>(R.id.etDns)
+        val cbSpeedBytes = view.findViewById<CheckBox>(R.id.cbSpeedBytes)
+        val btnImport = view.findViewById<Button>(R.id.btnImport)
+        val btnExport = view.findViewById<Button>(R.id.btnExport)
         val prefs = getSharedPreferences("cfg", 0)
-        etHost.setText(prefs.getString("h", defaultHost))
-        etPort.setText(prefs.getString("p", defaultPort))
-        etKey.setText(prefs.getString("k", defaultKey))
-        etDns.setText(prefs.getString("dns", ""))
 
-        AlertDialog.Builder(this)
+        fun loadFromPrefs() {
+            etHost.setText(prefs.getString("h", defaultHost))
+            etPort.setText(prefs.getString("p", defaultPort))
+            etKey.setText(prefs.getString("k", defaultKey))
+            etDns.setText(prefs.getString("dns", ""))
+            cbSpeedBytes.isChecked = prefs.getBoolean("speed_bytes", false)
+        }
+        loadFromPrefs()
+
+        val dialog = AlertDialog.Builder(this)
             .setTitle("Connection settings")
             .setView(view)
             .setPositiveButton("Save") { _, _ ->
@@ -231,9 +247,13 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(this, "Host / Port / Key are required", Toast.LENGTH_SHORT).show()
                     return@setPositiveButton
                 }
+                val speedBytes = cbSpeedBytes.isChecked
                 prefs.edit()
                     .putString("h", h).putString("p", p).putString("k", k).putString("dns", d)
+                    .putBoolean("speed_bytes", speedBytes)
                     .apply()
+                try { File(filesDir, "speed_units").writeText(if (speedBytes) "bytes" else "bits") }
+                catch (_: Throwable) {}
                 if (readFile("proxy_state").let { it == "running" || it == "starting" }) {
                     Toast.makeText(this, "Saved — restart agent to apply", Toast.LENGTH_SHORT).show()
                 } else {
@@ -241,7 +261,92 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             .setNegativeButton("Cancel", null)
-            .show()
+            .create()
+
+        btnExport.setOnClickListener {
+            // Export *current dialog state* (user may have edited but not saved).
+            exportConnectionSettings(
+                host = etHost.text.toString().trim(),
+                port = etPort.text.toString().trim(),
+                key = etKey.text.toString().trim(),
+                dns = etDns.text.toString().trim(),
+            )
+        }
+        btnImport.setOnClickListener {
+            dialog.dismiss()
+            importLauncher.launch(arrayOf("text/plain", "application/octet-stream", "*/*"))
+        }
+
+        dialog.show()
+    }
+
+    // Export/import only connection fields — host/port/key/dns.
+    // Display prefs (speed_bytes, bat_threshold, logs_expanded) stay per-device.
+    private fun exportConnectionSettings(host: String, port: String, key: String, dns: String) {
+        try {
+            val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+            val content = buildString {
+                appendLine("# Proxy Agent — Connection Settings Export")
+                appendLine("# Generated: $stamp")
+                appendLine("# Import via settings dialog → IMPORT.")
+                appendLine("# Only host/port/key/dns are ex/imported. Other preferences")
+                appendLine("# (speed units, battery threshold) stay local to each device.")
+                appendLine()
+                appendLine("host=$host")
+                appendLine("port=$port")
+                appendLine("key=$key")
+                appendLine("dns=$dns")
+            }
+            val exportDir = File(filesDir, "exports").apply { mkdirs() }
+            val file = File(exportDir, "proxy-agent-settings-$stamp.txt")
+            file.writeText(content)
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+            val share = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, "Proxy Agent settings $stamp")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(share, "Save / share settings"))
+        } catch (e: Throwable) {
+            Toast.makeText(this, "Export failed: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun importSettingsFromUri(uri: android.net.Uri) {
+        try {
+            val content = contentResolver.openInputStream(uri)?.use {
+                it.bufferedReader().readText()
+            } ?: run {
+                Toast.makeText(this, "Import: cannot read file", Toast.LENGTH_SHORT).show(); return
+            }
+            val map = HashMap<String, String>()
+            for (raw in content.lines()) {
+                val line = raw.trim()
+                if (line.isEmpty() || line.startsWith("#")) continue
+                val eq = line.indexOf('=')
+                if (eq <= 0) continue
+                map[line.substring(0, eq).trim()] = line.substring(eq + 1).trim()
+            }
+            // Only connection keys are honored. Everything else in the file ignored.
+            val allowed = setOf("host", "port", "key", "dns")
+            val applied = map.keys.intersect(allowed)
+            if (applied.isEmpty()) {
+                Toast.makeText(this, "Import: no connection settings in file", Toast.LENGTH_SHORT).show()
+                return
+            }
+            val prefs = getSharedPreferences("cfg", 0)
+            val ed = prefs.edit()
+            map["host"]?.let { ed.putString("h", it) }
+            map["port"]?.let { ed.putString("p", it) }
+            map["key"]?.let { ed.putString("k", it) }
+            map["dns"]?.let { ed.putString("dns", it) }
+            ed.apply()
+            Toast.makeText(this, "Imported: ${applied.joinToString(", ")}", Toast.LENGTH_SHORT).show()
+            showSettingsDialog()   // reopen with fresh values
+        } catch (e: Throwable) {
+            Toast.makeText(this, "Import failed: ${e.message}", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun updateBatteryButton() {
@@ -536,12 +641,25 @@ class MainActivity : AppCompatActivity() {
         tvLogsChevron.text = if (expanded) "▲" else "▼"
     }
 
-    private fun humanRate(bps: Long): String = when {
-        bps < 0 -> "—"
-        bps < 1024 -> "${bps}B/s"
-        bps < 1024 * 1024 -> "${bps / 1024}KB/s"
-        bps < 1024L * 1024 * 1024 -> "%.1fMB/s".format(bps / 1024.0 / 1024.0)
-        else -> "%.1fGB/s".format(bps / 1024.0 / 1024.0 / 1024.0)
+    private fun humanRate(bytesPerSec: Long): String {
+        if (bytesPerSec < 0) return "—"
+        val asBytes = getSharedPreferences("cfg", 0).getBoolean("speed_bytes", false)
+        return if (asBytes) {
+            when {
+                bytesPerSec < 1024 -> "${bytesPerSec}B/s"
+                bytesPerSec < 1024 * 1024 -> "${bytesPerSec / 1024}KB/s"
+                bytesPerSec < 1024L * 1024 * 1024 -> "%.1fMB/s".format(bytesPerSec / 1024.0 / 1024.0)
+                else -> "%.1fGB/s".format(bytesPerSec / 1024.0 / 1024.0 / 1024.0)
+            }
+        } else {
+            val bits = bytesPerSec * 8
+            when {
+                bits < 1000 -> "${bits}b/s"
+                bits < 1000 * 1000 -> "${bits / 1000}Kb/s"
+                bits < 1000L * 1000 * 1000 -> "%.1fMb/s".format(bits / 1000.0 / 1000.0)
+                else -> "%.1fGb/s".format(bits / 1000.0 / 1000.0 / 1000.0)
+            }
+        }
     }
 
     private fun refresh() {
