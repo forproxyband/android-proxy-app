@@ -218,6 +218,8 @@ class ProxyService : Service() {
         val host = intent.getStringExtra("host") ?: ""
         val port = intent.getStringExtra("port") ?: ""
         val key = intent.getStringExtra("key") ?: ""
+        val dnsRaw = intent.getStringExtra("dns")?.trim().orEmpty()
+        val dns = dnsRaw.ifEmpty { "1.1.1.1,8.8.8.8" }
         if (host.isEmpty()) { stopSelf(); return START_NOT_STICKY }
 
         connStatus = ConnStatus.STARTING
@@ -270,7 +272,7 @@ class ProxyService : Service() {
             var backoffMs = 1000L
             while (!stopRequested) {
                 try {
-                    log("Launching subprocess: host=$host port=$port key=${mask(key)}")
+                    log("Launching subprocess: host=$host port=$port key=${mask(key)} dns=$dns")
                     connStatus = ConnStatus.CONNECTING
                     val pb = ProcessBuilder(binary.absolutePath).redirectErrorStream(true)
                     pb.environment().apply {
@@ -282,6 +284,7 @@ class ProxyService : Service() {
                             "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json")
                         put("HOME", filesDir.absolutePath)
                         put("TMPDIR", cacheDir.absolutePath)
+                        put("dns_servers", dns)
                     }
                     val proc = pb.start()
                     agentProcess = proc

@@ -212,10 +212,12 @@ class MainActivity : AppCompatActivity() {
         val etHost = view.findViewById<EditText>(R.id.etHost)
         val etPort = view.findViewById<EditText>(R.id.etPort)
         val etKey = view.findViewById<EditText>(R.id.etKey)
+        val etDns = view.findViewById<EditText>(R.id.etDns)
         val prefs = getSharedPreferences("cfg", 0)
         etHost.setText(prefs.getString("h", defaultHost))
         etPort.setText(prefs.getString("p", defaultPort))
         etKey.setText(prefs.getString("k", defaultKey))
+        etDns.setText(prefs.getString("dns", ""))
 
         AlertDialog.Builder(this)
             .setTitle("Connection settings")
@@ -224,11 +226,14 @@ class MainActivity : AppCompatActivity() {
                 val h = etHost.text.toString().trim()
                 val p = etPort.text.toString().trim()
                 val k = etKey.text.toString().trim()
+                val d = etDns.text.toString().trim()
                 if (h.isEmpty() || p.isEmpty() || k.isEmpty()) {
-                    Toast.makeText(this, "All fields are required", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "Host / Port / Key are required", Toast.LENGTH_SHORT).show()
                     return@setPositiveButton
                 }
-                prefs.edit().putString("h", h).putString("p", p).putString("k", k).apply()
+                prefs.edit()
+                    .putString("h", h).putString("p", p).putString("k", k).putString("dns", d)
+                    .apply()
                 if (readFile("proxy_state").let { it == "running" || it == "starting" }) {
                     Toast.makeText(this, "Saved — restart agent to apply", Toast.LENGTH_SHORT).show()
                 } else {
@@ -293,6 +298,7 @@ class MainActivity : AppCompatActivity() {
         val h = prefs.getString("h", "")?.trim().orEmpty()
         val po = prefs.getString("p", "")?.trim().orEmpty()
         val k = prefs.getString("k", "")?.trim().orEmpty()
+        val d = prefs.getString("dns", "")?.trim().orEmpty()
         if (h.isEmpty() || po.isEmpty() || k.isEmpty()) {
             tvStatus.text = "CONFIGURE FIRST (⚙)"
             tvStatus.setTextColor(0xFFFF4444.toInt())
@@ -305,7 +311,7 @@ class MainActivity : AppCompatActivity() {
 
         try {
             val svc = Intent(this, ProxyService::class.java).apply {
-                putExtra("host", h); putExtra("port", po); putExtra("key", k)
+                putExtra("host", h); putExtra("port", po); putExtra("key", k); putExtra("dns", d)
             }
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc) else startService(svc)
         } catch (e: Throwable) {
