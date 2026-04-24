@@ -7,6 +7,10 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.TrafficStats
 import android.os.BatteryManager
 import android.os.Build
@@ -28,12 +32,15 @@ class ProxyService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     @Volatile private var stopRequested = false
     @Volatile private var agentProcess: Process? = null
+    @Volatile private var runnerThread: Thread? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     @Volatile private var connStatus: ConnStatus = ConnStatus.STARTING
     @Volatile private var rxRate = 0L
     @Volatile private var txRate = 0L
     @Volatile private var currentRegistrator = ""
     @Volatile private var activeTunnels = 0
+    @Volatile private var connectedSinceMs = 0L
     private var lastRx = 0L
     private var lastTx = 0L
     private var lastStatsAt = 0L
@@ -79,8 +86,8 @@ class ProxyService : Service() {
     }
 
     companion object {
-        private const val MAX_LOG_BYTES = 10L * 1024 * 1024  // trigger rotation
-        private const val KEEP_LOG_BYTES = 8L * 1024 * 1024  // keep this much tail
+        private const val MAX_LOG_BYTES = 30L * 1024 * 1024  // trigger rotation
+        private const val KEEP_LOG_BYTES = 25L * 1024 * 1024 // keep this much tail
     }
 
     private fun state(s: String) {
@@ -89,8 +96,9 @@ class ProxyService : Service() {
 
     private fun writeConnInfo() {
         try {
-            File(filesDir, "conn_info")
-                .writeText("${connStatus.name}|$rxRate|$txRate|$currentRegistrator|$activeTunnels")
+            File(filesDir, "conn_info").writeText(
+                "${connStatus.name}|$rxRate|$txRate|$currentRegistrator|$activeTunnels|$connectedSinceMs"
+            )
         } catch (_: Exception) {}
     }
 
@@ -110,6 +118,7 @@ class ProxyService : Service() {
             line.contains("tunnel closed") -> activeTunnels = (activeTunnels - 1).coerceAtLeast(0)
             line.contains("ws connected") -> {
                 connStatus = ConnStatus.CONNECTED
+                connectedSinceMs = System.currentTimeMillis()
                 wsUrlRe.find(line)?.let { currentRegistrator = it.groupValues[1] }
             }
             line.contains("selected") && line.contains("registrator") -> {
@@ -123,12 +132,14 @@ class ProxyService : Service() {
                 connStatus = ConnStatus.RECONNECTING
                 currentRegistrator = ""
                 activeTunnels = 0
+                connectedSinceMs = 0L
             }
             line.contains("balancer selection failed") ||
                 line.contains("no registrator available") -> {
                 connStatus = ConnStatus.RECONNECTING
                 currentRegistrator = ""
                 activeTunnels = 0
+                connectedSinceMs = 0L
             }
             line.contains("ws dialing") ||
                 line.contains("balancer request") -> {
@@ -290,6 +301,7 @@ class ProxyService : Service() {
                     connStatus = ConnStatus.RECONNECTING
                     currentRegistrator = ""
                     activeTunnels = 0
+                    connectedSinceMs = 0L
                     backoffMs = 1000L
                 } catch (e: Throwable) {
                     val sw = StringWriter(); e.printStackTrace(PrintWriter(sw))
@@ -298,20 +310,87 @@ class ProxyService : Service() {
                     connStatus = ConnStatus.RECONNECTING
                     currentRegistrator = ""
                     activeTunnels = 0
+                    connectedSinceMs = 0L
                 }
                 log("Restarting in ${backoffMs}ms")
-                try { Thread.sleep(backoffMs) } catch (_: InterruptedException) { break }
+                try {
+                    Thread.sleep(backoffMs)
+                } catch (_: InterruptedException) {
+                    // Woken up by forceReconnect (network change). Skip backoff.
+                    log("Backoff interrupted; retrying now")
+                    backoffMs = 1000L
+                }
                 backoffMs = (backoffMs * 2).coerceAtMost(30_000L)
             }
             log("Runner loop exited")
-        }.apply { name = "AgentRunner"; isDaemon = true; start() }
+        }.also {
+            it.name = "AgentRunner"; it.isDaemon = true
+            runnerThread = it
+            it.start()
+        }
 
+        registerNetworkCallback()
         return START_REDELIVER_INTENT
+    }
+
+    private fun registerNetworkCallback() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                private var lastNet: Network? = null
+                override fun onAvailable(network: Network) {
+                    val prev = lastNet
+                    lastNet = network
+                    if (prev != null && prev != network) {
+                        forceReconnect("network changed: $prev → $network")
+                    } else {
+                        log("Network available: $network")
+                    }
+                }
+                override fun onLost(network: Network) {
+                    log("Network lost: $network")
+                    if (lastNet == network) lastNet = null
+                }
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                    // Fires on every small change; we rely on onAvailable for actual switches.
+                }
+            }
+            networkCallback = cb
+            if (Build.VERSION.SDK_INT >= 24) {
+                cm.registerDefaultNetworkCallback(cb)
+            } else {
+                val req = NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .build()
+                cm.registerNetworkCallback(req, cb)
+            }
+        } catch (e: Throwable) {
+            log("Network callback register failed: ${e.message}")
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            networkCallback?.let { cm.unregisterNetworkCallback(it) }
+        } catch (_: Throwable) {}
+        networkCallback = null
+    }
+
+    // Immediately tears down the current WS connection and wakes the backoff so a
+    // fresh TCP socket is established on the new interface. Called when the default
+    // network swaps (WiFi ↔ cellular, or AP change) — the old socket is bound to an
+    // IP that's no longer valid.
+    private fun forceReconnect(reason: String) {
+        log("Force reconnect: $reason")
+        try { agentProcess?.destroy() } catch (_: Throwable) {}
+        runnerThread?.interrupt()
     }
 
     private fun doStop(autoStopReason: String = "") {
         if (stopRequested) return
         stopRequested = true
+        unregisterNetworkCallback()
         try {
             agentProcess?.let { p ->
                 log("Terminating subprocess")
@@ -328,6 +407,7 @@ class ProxyService : Service() {
         connStatus = ConnStatus.STOPPED
         currentRegistrator = ""
         activeTunnels = 0
+        connectedSinceMs = 0L
         state(if (autoStopReason.isNotEmpty()) "auto_stopped" else "stopped")
         writeConnInfo()
         wakeLock?.let { if (it.isHeld) it.release() }

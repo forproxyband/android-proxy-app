@@ -1,8 +1,11 @@
 package com.proxyagent.app
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -22,7 +25,11 @@ import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
+import androidx.core.content.FileProvider
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
 
@@ -32,12 +39,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var spBatteryThreshold: Spinner
     private lateinit var tvStatus: TextView
     private lateinit var tvRegistrator: TextView
+    private lateinit var tvUptime: TextView
     private lateinit var tvActivity: TextView
     private lateinit var registratorPanel: View
     private lateinit var tvLogs: TextView
     private lateinit var svLogs: ScrollView
     private lateinit var logsHeader: View
     private lateinit var tvLogsChevron: TextView
+    private lateinit var btnSaveLog: Button
 
     private val handler = Handler(Looper.getMainLooper())
     private val refresher = object : Runnable {
@@ -61,12 +70,14 @@ class MainActivity : AppCompatActivity() {
         spBatteryThreshold = findViewById(R.id.spBatteryThreshold)
         tvStatus = findViewById(R.id.tvStatus)
         tvRegistrator = findViewById(R.id.tvRegistrator)
+        tvUptime = findViewById(R.id.tvUptime)
         tvActivity = findViewById(R.id.tvActivity)
         registratorPanel = findViewById(R.id.registratorPanel)
         tvLogs = findViewById(R.id.tvLogs)
         svLogs = findViewById(R.id.svLogs)
         logsHeader = findViewById(R.id.logsHeader)
         tvLogsChevron = findViewById(R.id.tvLogsChevron)
+        btnSaveLog = findViewById(R.id.btnSaveLog)
 
         findViewById<TextView>(R.id.tvVersion).text =
             "v${BuildConfig.VERSION_NAME}  build ${BuildConfig.VERSION_CODE}"
@@ -92,6 +103,7 @@ class MainActivity : AppCompatActivity() {
             setLogsExpanded(expanded)
             prefs.edit().putBoolean("logs_expanded", expanded).apply()
         }
+        btnSaveLog.setOnClickListener { saveLog() }
 
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
@@ -222,6 +234,153 @@ class MainActivity : AppCompatActivity() {
         tvStatus.setTextColor(0xFFFFAA00.toInt())
     }
 
+    private fun saveLog() {
+        val src = File(filesDir, "agent.log")
+        if (!src.exists() || src.length() == 0L) {
+            Toast.makeText(this, "No log to save yet", Toast.LENGTH_SHORT).show(); return
+        }
+        try {
+            val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+            val exportDir = File(filesDir, "exports").apply { mkdirs() }
+            exportDir.listFiles()?.forEach { it.delete() }
+            val snapshot = File(exportDir, "proxy-agent-$stamp.log")
+
+            // Write device-info header, then stream the log body in.
+            snapshot.outputStream().use { out ->
+                out.write(buildDeviceInfoHeader().toByteArray())
+                src.inputStream().use { it.copyTo(out) }
+            }
+
+            val uri = FileProvider.getUriForFile(
+                this, "$packageName.fileprovider", snapshot
+            )
+            val share = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, "Proxy Agent log $stamp")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(share, "Save / share log"))
+        } catch (e: Throwable) {
+            Toast.makeText(this, "Save failed: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun buildDeviceInfoHeader(): String {
+        val sb = StringBuilder()
+        val line = "=".repeat(64)
+        val now = SimpleDateFormat("yyyy-MM-dd HH:mm:ssZ", Locale.US).format(Date())
+
+        fun kv(k: String, v: Any?) {
+            sb.append(k).append(':')
+            val pad = (22 - k.length - 1).coerceAtLeast(1)
+            repeat(pad) { sb.append(' ') }
+            sb.append(v?.toString() ?: "—").append('\n')
+        }
+        fun section(title: String) { sb.append('\n').append("[").append(title).append("]\n") }
+
+        sb.append(line).append('\n')
+        sb.append("Proxy Agent · Log Export\n")
+        sb.append(line).append('\n')
+        kv("Exported-At", now)
+
+        section("APP")
+        kv("Package", packageName)
+        kv("Version", "${BuildConfig.VERSION_NAME} (code ${BuildConfig.VERSION_CODE})")
+
+        section("DEVICE")
+        kv("Manufacturer", Build.MANUFACTURER)
+        kv("Model", Build.MODEL)
+        kv("Device", Build.DEVICE)
+        kv("Brand", Build.BRAND)
+        kv("Product", Build.PRODUCT)
+        kv("Board", Build.BOARD)
+
+        section("ANDROID")
+        kv("Release", Build.VERSION.RELEASE)
+        kv("SDK", Build.VERSION.SDK_INT)
+        kv("Incremental", Build.VERSION.INCREMENTAL)
+        if (Build.VERSION.SDK_INT >= 23) kv("Security-Patch", Build.VERSION.SECURITY_PATCH)
+        kv("Fingerprint", Build.FINGERPRINT)
+
+        section("ARCH")
+        kv("Supported-ABIs", Build.SUPPORTED_ABIS.joinToString(", "))
+        kv("Kernel", System.getProperty("os.version"))
+
+        section("PERMISSIONS")
+        val perms = listOf(
+            "INTERNET", "ACCESS_NETWORK_STATE",
+            "FOREGROUND_SERVICE", "FOREGROUND_SERVICE_DATA_SYNC",
+            "FOREGROUND_SERVICE_SPECIAL_USE", "WAKE_LOCK",
+            "POST_NOTIFICATIONS", "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
+        )
+        for (p in perms) {
+            val granted = try {
+                checkSelfPermission("android.permission.$p") == PackageManager.PERMISSION_GRANTED
+            } catch (_: Throwable) { false }
+            kv(p, if (granted) "GRANTED" else "DENIED")
+        }
+        if (Build.VERSION.SDK_INT >= 23) {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            kv("Battery-Whitelist", if (pm.isIgnoringBatteryOptimizations(packageName)) "YES" else "NO")
+        }
+
+        section("NETWORK")
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            if (Build.VERSION.SDK_INT >= 23) {
+                val active = cm.activeNetwork
+                val caps = active?.let { cm.getNetworkCapabilities(it) }
+                val transport = when {
+                    caps == null -> "NONE"
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "CELLULAR"
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ETHERNET"
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "VPN"
+                    else -> "OTHER"
+                }
+                kv("Transport", transport)
+                kv("Internet-Capable", caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ?: false)
+                kv("Validated", caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ?: false)
+            } else {
+                @Suppress("DEPRECATION") val info = cm.activeNetworkInfo
+                kv("Type", info?.typeName)
+                @Suppress("DEPRECATION") kv("Connected", info?.isConnected ?: false)
+            }
+        } catch (e: Throwable) {
+            kv("(error)", e.message)
+        }
+
+        section("RESOURCES")
+        try {
+            val freeGB = filesDir.usableSpace / 1024.0 / 1024.0 / 1024.0
+            kv("Free-Storage", "%.2f GB (filesDir)".format(freeGB))
+        } catch (_: Throwable) {}
+        kv("Max-JVM-Heap-MB", Runtime.getRuntime().maxMemory() / 1024 / 1024)
+        kv("Locale", Locale.getDefault())
+        kv("Timezone", java.util.TimeZone.getDefault().id)
+
+        sb.append('\n').append(line).append('\n')
+        sb.append("LOG:\n")
+        sb.append(line).append('\n')
+        return sb.toString()
+    }
+
+    private fun formatDuration(ms: Long): String {
+        if (ms < 0) return "—"
+        val s = ms / 1000
+        val d = s / 86400
+        val h = (s % 86400) / 3600
+        val m = (s % 3600) / 60
+        val sec = s % 60
+        return when {
+            d > 0 -> "${d}d ${h}h"
+            h > 0 -> "${h}h ${m}m"
+            m > 0 -> "${m}m ${sec}s"
+            else -> "${sec}s"
+        }
+    }
+
     private fun setLogsExpanded(expanded: Boolean) {
         svLogs.visibility = if (expanded) View.VISIBLE else View.GONE
         tvLogsChevron.text = if (expanded) "▲" else "▼"
@@ -243,6 +402,7 @@ class MainActivity : AppCompatActivity() {
         val txRate = connInfo.getOrNull(2)?.toLongOrNull() ?: -1L
         val registrator = connInfo.getOrNull(3).orEmpty()
         val tunnels = connInfo.getOrNull(4)?.toIntOrNull() ?: 0
+        val connectedSinceMs = connInfo.getOrNull(5)?.toLongOrNull() ?: 0L
 
         val running = proxyState == "running" || proxyState == "starting"
         btnStart.text = if (running) "STOP" else "START"
@@ -264,6 +424,9 @@ class MainActivity : AppCompatActivity() {
         if (connStatus == "CONNECTED" && registrator.isNotEmpty()) {
             registratorPanel.visibility = View.VISIBLE
             tvRegistrator.text = registrator
+            tvUptime.text = if (connectedSinceMs > 0)
+                "up ${formatDuration(System.currentTimeMillis() - connectedSinceMs)}"
+            else ""
             tvActivity.text = when {
                 tunnels == 0 -> "◦ idle — no clients"
                 else -> "⚡ $tunnels ${if (tunnels == 1) "client" else "clients"} · " +
