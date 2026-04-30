@@ -401,39 +401,70 @@ class ProxyService : Service() {
     }
 
     // In-process engine using the gomobile AAR (proxyagent.sdk.agent.Agent).
-    // Go runtime caches env at init, so config is set via Os.setenv before
-    // touching the Agent class. On stop we kill the :proxy process so the
-    // next start re-initializes with fresh env.
+    //
+    // Go's runtime caches env into runtime.envs at JNI_OnLoad time and never
+    // re-reads it afterwards. libc's setenv() does NOT update that cache, so
+    // any config we want Go to see must be in libc's environ BEFORE
+    // libgojni.so is loaded.
+    //
+    // To prevent ART from eagerly resolving go.Seq / Agent during method
+    // verification (which would load the .so before our setenv runs), we
+    // pull those classes via Class.forName AFTER setenv. This pushes the
+    // System.loadLibrary("gojni") call past our environment setup.
+    //
+    // On stop we kill the :proxy process so the next start re-initializes
+    // with fresh env.
     private fun runAarEngine(host: String, port: String, key: String, dns: String) {
         try {
             log("Capturing native stdout/stderr…")
             captureNativeOutput()
 
             log("Setting environment: host=$host port=$port key=${mask(key)} dns=$dns")
-            Os.setenv("balancer_host", host, true)
-            Os.setenv("balancer_port", port, true)
-            Os.setenv("agent_key", key, true)
-            Os.setenv("enable_netagent", "true", true)
-            Os.setenv("fallback_file_url",
-                "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json", true)
+            // The SDK's Go config helper checks both lowercase ("balancer_host")
+            // and SCREAMING_SNAKE ("BALANCER_HOST") names — set both so we
+            // don't depend on the SDK's casing convention.
+            fun setBoth(name: String, value: String) {
+                Os.setenv(name, value, true)
+                Os.setenv(name.uppercase(Locale.ROOT), value, true)
+            }
+            setBoth("balancer_host", host)
+            setBoth("balancer_port", port)
+            setBoth("agent_key", key)
+            setBoth("enable_netagent", "true")
+            setBoth("fallback_file_url",
+                "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json")
+            setBoth("dns_servers", dns)
             Os.setenv("HOME", filesDir.absolutePath, true)
             Os.setenv("TMPDIR", cacheDir.absolutePath, true)
-            Os.setenv("dns_servers", dns, true)
 
             connStatus = ConnStatus.CONNECTING
-            log("Loading Go runtime (go.Seq.setContext)…")
-            go.Seq.setContext(applicationContext)
 
-            // Newer SDKs expose setDNSServers; fall back silently if unavailable.
+            // Diagnostic: dump what libc reports back, to confirm setenv stuck
+            // in the current process. Shorter form so the agent_key isn't logged.
             try {
-                proxyagent.sdk.agent.Agent.setDNSServers(dns)
+                val h = Os.getenv("balancer_host") ?: "<null>"
+                val p = Os.getenv("balancer_port") ?: "<null>"
+                val k = Os.getenv("agent_key") ?: "<null>"
+                log("libc env check: balancer_host=$h balancer_port=$p agent_key=${if (k == "<null>") k else "set(${k.length}b)"}")
+            } catch (_: Throwable) {}
+
+            log("Loading Go runtime via Class.forName(\"go.Seq\")…")
+            val seqClass = Class.forName("go.Seq")
+            seqClass.getMethod("setContext", android.content.Context::class.java)
+                .invoke(null, applicationContext)
+
+            log("Loading Agent class via Class.forName…")
+            val agentClass = Class.forName("proxyagent.sdk.agent.Agent")
+
+            try {
+                agentClass.getMethod("setDNSServers", String::class.java).invoke(null, dns)
                 log("Agent.setDNSServers applied")
             } catch (t: Throwable) {
                 log("Agent.setDNSServers unavailable: ${t.message}")
             }
 
             log("Calling Agent.startAgent()")
-            proxyagent.sdk.agent.Agent.startAgent()
+            agentClass.getMethod("startAgent").invoke(null)
             state("running")
             log("Agent.startAgent returned")
         } catch (e: Throwable) {
@@ -569,7 +600,8 @@ class ProxyService : Service() {
             } catch (t: Throwable) { log("Stop error: ${t.message}") }
             Engine.AAR -> try {
                 log("Calling Agent.stopAgent()")
-                proxyagent.sdk.agent.Agent.stopAgent()
+                Class.forName("proxyagent.sdk.agent.Agent")
+                    .getMethod("stopAgent").invoke(null)
             } catch (t: Throwable) { log("Agent.stopAgent error: ${t.message}") }
         }
         agentProcess = null
