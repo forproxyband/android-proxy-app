@@ -594,6 +594,7 @@ class MainActivity : AppCompatActivity() {
 
         File(filesDir, "agent.log").delete()
         File(filesDir, "proxy_state").delete()
+        File(filesDir, "conn_info").delete()
 
         val engine = prefs.getString("engine", "binary") ?: "binary"
         return try {
@@ -860,8 +861,13 @@ class MainActivity : AppCompatActivity() {
 
         val pa = pendingAction
         if (pa != null) {
+            // proxy_state="running" flips as soon as the subprocess starts —
+            // before the WS actually dials. Wait for conn_info to advance past
+            // STARTING/CONNECTING, or for proxy_state to indicate end-of-life.
             val resolved = when (pa) {
-                "start" -> proxyState == "running" || proxyState == "error"
+                "start" -> connStatus == "CONNECTED" || connStatus == "RECONNECTING" ||
+                    connStatus == "ERROR" || proxyState == "error" ||
+                    proxyState == "stopped" || proxyState == "auto_stopped"
                 "stop" -> !running
                 else -> true
             }
@@ -891,7 +897,6 @@ class MainActivity : AppCompatActivity() {
 
         if (!cyclingIp) {
             val (label, color) = when {
-                pendingAction == "start" -> "STARTING…" to 0xFFFFAA00.toInt()
                 pendingAction == "stop" -> "STOPPING…" to 0xFFFFAA00.toInt()
                 !running && !configured ->
                     "NOT CONFIGURED · TAP START TO IMPORT" to 0xFFFFAA00.toInt()
@@ -907,6 +912,7 @@ class MainActivity : AppCompatActivity() {
                 connStatus == "RECONNECTING" -> "RECONNECTING…" to 0xFFFFAA00.toInt()
                 connStatus == "STARTING" || proxyState == "starting" -> "STARTING…" to 0xFFFFAA00.toInt()
                 running -> "RUNNING" to 0xFF00CC00.toInt()
+                pendingAction == "start" -> "STARTING…" to 0xFFFFAA00.toInt()
                 else -> "DISCONNECTED" to 0xFFFF4444.toInt()
             }
             tvStatus.text = label
@@ -916,7 +922,7 @@ class MainActivity : AppCompatActivity() {
         val wan = publicIp.ifEmpty { "fetching…" }
         tvNetwork.text = "$wan  ·  $transport"
 
-        if (connStatus == "CONNECTED" && registrator.isNotEmpty()) {
+        if (pendingAction != "stop" && connStatus == "CONNECTED" && registrator.isNotEmpty()) {
             registratorPanel.visibility = View.VISIBLE
             tvRegistrator.text = registrator
             tvUptime.text = if (connectedSinceMs > 0)
