@@ -62,12 +62,16 @@ class MainActivity : AppCompatActivity() {
     private val refresher = object : Runnable {
         override fun run() {
             refresh()
-            handler.postDelayed(this, 3000)
+            handler.postDelayed(this, if (pendingAction != null) 250L else 3000L)
         }
     }
 
     @Volatile private var publicIp = ""
     @Volatile private var cyclingIp = false
+    // While a start/stop is in flight the toggle button is locked so taps don't
+    // race the state file. Cleared once proxy_state settles or the deadline trips.
+    @Volatile private var pendingAction: String? = null
+    private var pendingActionDeadlineMs: Long = 0L
     private var netCallback: ConnectivityManager.NetworkCallback? = null
 
     private val importLauncher: ActivityResultLauncher<Array<String>> =
@@ -415,17 +419,24 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun toggle() {
+        if (pendingAction != null || cyclingIp) return
         val st = readFile("proxy_state")
         if (st == "running" || st == "starting") {
+            pendingAction = "stop"
+            pendingActionDeadlineMs = System.currentTimeMillis() + 10_000
             try { startService(Intent(this, ProxyService::class.java).apply { action = "STOP" }) }
             catch (_: Throwable) {}
-            return
+        } else {
+            if (!hasConnectionConfig()) {
+                showConfigurePrompt()
+                return
+            }
+            if (!startProxyService()) return
+            pendingAction = "start"
+            pendingActionDeadlineMs = System.currentTimeMillis() + 15_000
         }
-        if (!hasConnectionConfig()) {
-            showConfigurePrompt()
-            return
-        }
-        startProxyService()
+        handler.removeCallbacks(refresher)
+        handler.post(refresher)
     }
 
     // Stops the proxy (if running), cycles cellular so the carrier hands out a
@@ -846,18 +857,42 @@ class MainActivity : AppCompatActivity() {
 
         val running = proxyState == "running" || proxyState == "starting"
         val configured = hasConnectionConfig()
-        btnStart.text = if (running) "STOP" else "START"
+
+        val pa = pendingAction
+        if (pa != null) {
+            val resolved = when (pa) {
+                "start" -> proxyState == "running" || proxyState == "error"
+                "stop" -> !running
+                else -> true
+            }
+            if (resolved || System.currentTimeMillis() > pendingActionDeadlineMs) {
+                pendingAction = null
+            }
+        }
+
+        val transitioning = pendingAction != null || cyclingIp
+        btnStart.text = when (pendingAction) {
+            "start" -> "STARTING…"
+            "stop" -> "STOPPING…"
+            else -> if (running) "STOP" else "START"
+        }
+        btnStart.isEnabled = !transitioning
+        btnStart.alpha = if (transitioning) 0.5f else 1f
         btnStart.backgroundTintList = android.content.res.ColorStateList.valueOf(
-            if (!running && !configured) 0xFF666680.toInt() else 0xFFE94560.toInt()
+            if (!running && !configured && pendingAction == null) 0xFF666680.toInt()
+            else 0xFFE94560.toInt()
         )
 
         val transport = currentTransport()
-        val cycleEnabled = !cyclingIp && transport != "WIFI" && transport != "VPN"
+        val cycleEnabled = !cyclingIp && pendingAction == null &&
+            transport != "WIFI" && transport != "VPN"
         btnCycleIp.isEnabled = cycleEnabled
         btnCycleIp.alpha = if (cycleEnabled) 1f else 0.4f
 
         if (!cyclingIp) {
             val (label, color) = when {
+                pendingAction == "start" -> "STARTING…" to 0xFFFFAA00.toInt()
+                pendingAction == "stop" -> "STOPPING…" to 0xFFFFAA00.toInt()
                 !running && !configured ->
                     "NOT CONFIGURED · TAP START TO IMPORT" to 0xFFFFAA00.toInt()
                 proxyState == "error" -> "ERROR" to 0xFFFF4444.toInt()
