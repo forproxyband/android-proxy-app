@@ -123,6 +123,18 @@
             android:backgroundTint="#e94560" />
 
         <Button
+            android:id="@+id/btnCycleIp"
+            android:layout_width="56dp"
+            android:layout_height="match_parent"
+            android:text="↻"
+            android:textSize="22sp"
+            android:textStyle="bold"
+            android:textColor="#FFCC66"
+            android:backgroundTint="#16213e"
+            android:layout_marginStart="6dp"
+            android:padding="0dp" />
+
+        <Button
             android:id="@+id/btnSettings"
             android:layout_width="50dp"
             android:layout_height="match_parent"

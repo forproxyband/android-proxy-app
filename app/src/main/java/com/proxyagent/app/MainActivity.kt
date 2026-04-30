@@ -42,6 +42,7 @@ import java.util.Locale
 class MainActivity : AppCompatActivity() {
 
     private lateinit var btnStart: Button
+    private lateinit var btnCycleIp: Button
     private lateinit var btnSettings: Button
     private lateinit var btnBattery: Button
     private lateinit var spBatteryThreshold: Spinner
@@ -66,6 +67,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     @Volatile private var publicIp = ""
+    @Volatile private var cyclingIp = false
+    @Volatile private var cycleAbortRequested = false
     private var netCallback: ConnectivityManager.NetworkCallback? = null
 
     private val importLauncher: ActivityResultLauncher<Array<String>> =
@@ -81,6 +84,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         btnStart = findViewById(R.id.btnToggle)
+        btnCycleIp = findViewById(R.id.btnCycleIp)
         btnSettings = findViewById(R.id.btnSettings)
         btnBattery = findViewById(R.id.btnBattery)
         spBatteryThreshold = findViewById(R.id.spBatteryThreshold)
@@ -103,6 +107,7 @@ class MainActivity : AppCompatActivity() {
 
         setupBatteryThresholdSpinner(prefs)
         btnStart.setOnClickListener { toggle() }
+        btnCycleIp.setOnClickListener { cycleMobileIp() }
         btnSettings.setOnClickListener { showSettingsDialog() }
         btnBattery.setOnClickListener { requestBatteryWhitelist() }
 
@@ -417,34 +422,247 @@ class MainActivity : AppCompatActivity() {
             catch (_: Throwable) {}
             return
         }
+        if (!hasConnectionConfig()) {
+            showConfigurePrompt()
+            return
+        }
+        startProxyService()
+    }
 
+    // Stops the proxy (if running), cycles cellular so the carrier hands out a
+    // new IP, then restarts the proxy.
+    //
+    // Tries three paths in order, falling through silently:
+    //   1. root: `svc data disable/enable` (or airplane mode if data toggle fails)
+    //   2. WRITE_SECURE_SETTINGS: write Settings.Global.AIRPLANE_MODE_ON directly.
+    //      This permission is signature-level and only obtainable via a one-time
+    //      `adb shell pm grant <pkg> WRITE_SECURE_SETTINGS`.
+    //   3. manual: open the Internet panel and let the user toggle, wait for the
+    //      cellular transport to drop and come back.
+    private fun cycleMobileIp() {
+        if (cyclingIp) return
+        val transport = currentTransport()
+        if (transport == "WIFI") {
+            Toast.makeText(this, "Disable WiFi to cycle mobile IP", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        cyclingIp = true
+        cycleAbortRequested = false
+        btnCycleIp.isEnabled = false
+        val originalLabel = btnCycleIp.text
+        btnCycleIp.text = "…"
+        val wasRunning = readFile("proxy_state").let { it == "running" || it == "starting" }
+
+        Thread {
+            var stage = "init"
+            try {
+                if (wasRunning) {
+                    stage = "stopping proxy"
+                    runOnUiThread { tvStatus.text = "STOPPING…"; tvStatus.setTextColor(0xFFFFAA00.toInt()) }
+                    try {
+                        startService(Intent(this, ProxyService::class.java).apply { action = "STOP" })
+                    } catch (_: Throwable) {}
+                    val stopDeadline = System.currentTimeMillis() + 8_000
+                    while (System.currentTimeMillis() < stopDeadline && !cycleAbortRequested) {
+                        val s = readFile("proxy_state")
+                        if (s != "running" && s != "starting") break
+                        Thread.sleep(200)
+                    }
+                }
+                if (cycleAbortRequested) return@Thread
+
+                stage = "cycling network"
+                runOnUiThread { tvStatus.text = "CYCLING NETWORK…"; tvStatus.setTextColor(0xFFFFAA00.toInt()) }
+
+                val auto = toggleMobileNetworkViaRoot() || toggleMobileNetworkViaSecureSettings()
+                if (cycleAbortRequested) return@Thread
+
+                if (!auto) {
+                    runOnUiThread { promptManualCycle() }
+                    // Wait for the user to flip airplane/data and come back. Detect
+                    // by watching for the cellular transport disappearing then reappearing.
+                    val manualDeadline = System.currentTimeMillis() + 120_000
+                    var sawDown = false
+                    while (System.currentTimeMillis() < manualDeadline && !cycleAbortRequested) {
+                        val t = currentTransport()
+                        if (t == "NONE" || t == "?") sawDown = true
+                        if (sawDown && t == "CELLULAR") break
+                        Thread.sleep(500)
+                    }
+                } else {
+                    // Auto path toggled radio; wait for cellular to reappear.
+                    runOnUiThread { tvStatus.text = "WAITING FOR NET…" }
+                    val netDeadline = System.currentTimeMillis() + 30_000
+                    while (System.currentTimeMillis() < netDeadline && !cycleAbortRequested) {
+                        if (currentTransport() == "CELLULAR") break
+                        Thread.sleep(500)
+                    }
+                    // Small grace for routes/DNS to settle before the agent dials.
+                    if (!cycleAbortRequested) Thread.sleep(1500)
+                }
+                if (cycleAbortRequested) return@Thread
+
+                publicIp = ""
+                refreshPublicIp()
+
+                if (wasRunning) {
+                    stage = "restarting proxy"
+                    runOnUiThread { startProxyService() }
+                }
+
+                runOnUiThread {
+                    Toast.makeText(this, "IP cycle complete", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Throwable) {
+                runOnUiThread {
+                    Toast.makeText(this, "Cycle failed at $stage: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            } finally {
+                cyclingIp = false
+                runOnUiThread {
+                    btnCycleIp.text = originalLabel
+                    refresh()
+                }
+            }
+        }.apply { name = "IpCycler"; isDaemon = true; start() }
+    }
+
+    // `svc data` is fastest and least disruptive (keeps voice/SMS up). If it
+    // doesn't fly, fall back to airplane mode which always cuts the radio.
+    private fun toggleMobileNetworkViaRoot(): Boolean {
+        if (runRoot("svc data disable")) {
+            try { Thread.sleep(2500) } catch (_: InterruptedException) {}
+            if (runRoot("svc data enable")) return true
+        }
+        val onOk = runRoot("settings put global airplane_mode_on 1") &&
+            runRoot("am broadcast -a android.intent.action.AIRPLANE_MODE --ez state true")
+        if (onOk) {
+            try { Thread.sleep(3500) } catch (_: InterruptedException) {}
+            runRoot("settings put global airplane_mode_on 0")
+            runRoot("am broadcast -a android.intent.action.AIRPLANE_MODE --ez state false")
+            return true
+        }
+        return false
+    }
+
+    private fun runRoot(cmd: String): Boolean {
+        return try {
+            val p = ProcessBuilder("su", "-c", cmd).redirectErrorStream(true).start()
+            // Drain output so the child doesn't block on a full pipe.
+            Thread { try { p.inputStream.bufferedReader().use { it.readText() } } catch (_: Throwable) {} }
+                .apply { isDaemon = true; start() }
+            val finished = p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+            if (!finished) { p.destroy(); return false }
+            p.exitValue() == 0
+        } catch (_: Throwable) { false }
+    }
+
+    // Toggles airplane mode by writing Settings.Global directly. Throws
+    // SecurityException if WRITE_SECURE_SETTINGS hasn't been granted via
+    // `adb shell pm grant`. The protected ACTION_AIRPLANE_MODE_CHANGED
+    // broadcast is rejected for non-system apps; we attempt it anyway because
+    // some OEM ROMs need it on top of the setting change.
+    private fun toggleMobileNetworkViaSecureSettings(): Boolean {
+        return try {
+            val cr = contentResolver
+            Settings.Global.putInt(cr, Settings.Global.AIRPLANE_MODE_ON, 1)
+            try {
+                sendBroadcast(Intent(Intent.ACTION_AIRPLANE_MODE_CHANGED).putExtra("state", true))
+            } catch (_: Throwable) {}
+            try { Thread.sleep(3500) } catch (_: InterruptedException) {}
+            Settings.Global.putInt(cr, Settings.Global.AIRPLANE_MODE_ON, 0)
+            try {
+                sendBroadcast(Intent(Intent.ACTION_AIRPLANE_MODE_CHANGED).putExtra("state", false))
+            } catch (_: Throwable) {}
+            true
+        } catch (_: SecurityException) { false }
+        catch (_: Throwable) { false }
+    }
+
+    // First-time hint: explain that auto-cycle needs root or a one-time adb
+    // grant, and offer to copy the grant command. After the first time, just
+    // open the panel directly without nagging.
+    private fun promptManualCycle() {
+        val prefs = getSharedPreferences("cfg", 0)
+        val firstTime = !prefs.getBoolean("manual_cycle_seen", false)
+        if (!firstTime) {
+            Toast.makeText(this, "Toggle mobile data off and on, then return", Toast.LENGTH_LONG).show()
+            openMobileDataPanel()
+            return
+        }
+        prefs.edit().putBoolean("manual_cycle_seen", true).apply()
+        val cmd = "adb shell pm grant $packageName android.permission.WRITE_SECURE_SETTINGS"
+        AlertDialog.Builder(this)
+            .setTitle("Manual IP cycle")
+            .setMessage(
+                "Auto IP cycle needs root or a one-time adb grant.\n\n" +
+                "To enable auto-cycle without root, connect this device to a PC " +
+                "with USB debugging enabled and run:\n\n$cmd\n\n" +
+                "For now, the Internet panel will open — toggle mobile data off " +
+                "and on, then return to this app."
+            )
+            .setPositiveButton("Open panel") { _, _ -> openMobileDataPanel() }
+            .setNeutralButton("Copy adb cmd") { _, _ ->
+                try {
+                    val clip = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                    clip.setPrimaryClip(android.content.ClipData.newPlainText("adb", cmd))
+                    Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show()
+                } catch (_: Throwable) {}
+                openMobileDataPanel()
+            }
+            .setNegativeButton("Cancel") { _, _ -> cycleAbortRequested = true }
+            .setOnCancelListener { cycleAbortRequested = true }
+            .show()
+    }
+
+    // Settings.Panel.ACTION_INTERNET_CONNECTIVITY (API 29+) is the slim popup
+    // with mobile-data toggle inline — much better UX than a full settings
+    // page. Older devices fall back to the airplane-mode page.
+    private fun openMobileDataPanel() {
+        if (Build.VERSION.SDK_INT >= 29) {
+            try {
+                startActivity(Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                return
+            } catch (_: Throwable) {}
+        }
+        try {
+            startActivity(Intent(Settings.ACTION_AIRPLANE_MODE_SETTINGS)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (_: Throwable) {
+            try {
+                startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            } catch (_: Throwable) {}
+        }
+    }
+
+    private fun startProxyService(): Boolean {
         val prefs = getSharedPreferences("cfg", 0)
         val h = prefs.getString("h", "")?.trim().orEmpty()
         val po = prefs.getString("p", "")?.trim().orEmpty()
         val k = prefs.getString("k", "")?.trim().orEmpty()
         val d = prefs.getString("dns", "")?.trim().orEmpty()
-        if (h.isEmpty() || po.isEmpty() || k.isEmpty()) {
-            showConfigurePrompt()
-            return
-        }
+        if (h.isEmpty() || po.isEmpty() || k.isEmpty()) return false
 
         File(filesDir, "agent.log").delete()
         File(filesDir, "proxy_state").delete()
 
         val engine = prefs.getString("engine", "binary") ?: "binary"
-        try {
+        return try {
             val svc = Intent(this, ProxyService::class.java).apply {
                 putExtra("host", h); putExtra("port", po); putExtra("key", k); putExtra("dns", d)
                 putExtra("engine", engine)
             }
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc) else startService(svc)
+            tvStatus.text = "STARTING..."
+            tvStatus.setTextColor(0xFFFFAA00.toInt())
+            true
         } catch (e: Throwable) {
             tvStatus.text = "Error: ${e.message}"
-            return
+            false
         }
-
-        tvStatus.text = "STARTING..."
-        tvStatus.setTextColor(0xFFFFAA00.toInt())
     }
 
     private fun saveLog() {
@@ -698,27 +916,33 @@ class MainActivity : AppCompatActivity() {
             if (!running && !configured) 0xFF666680.toInt() else 0xFFE94560.toInt()
         )
 
-        val (label, color) = when {
-            !running && !configured ->
-                "NOT CONFIGURED · TAP START TO IMPORT" to 0xFFFFAA00.toInt()
-            proxyState == "error" -> "ERROR" to 0xFFFF4444.toInt()
-            proxyState == "auto_stopped" -> {
-                val reason = readFile("stop_reason")
-                val text = if (reason.isNotEmpty()) "AUTO-STOPPED · $reason" else "AUTO-STOPPED"
-                text to 0xFFFFAA00.toInt()
-            }
-            connStatus == "CONNECTED" ->
-                "CONNECTED · ↓${humanRate(rxRate)} ↑${humanRate(txRate)}" to 0xFF00CC00.toInt()
-            connStatus == "CONNECTING" -> "CONNECTING…" to 0xFFFFAA00.toInt()
-            connStatus == "RECONNECTING" -> "RECONNECTING…" to 0xFFFFAA00.toInt()
-            connStatus == "STARTING" || proxyState == "starting" -> "STARTING…" to 0xFFFFAA00.toInt()
-            running -> "RUNNING" to 0xFF00CC00.toInt()
-            else -> "DISCONNECTED" to 0xFFFF4444.toInt()
-        }
-        tvStatus.text = label
-        tvStatus.setTextColor(color)
-
         val transport = currentTransport()
+        val cycleEnabled = !cyclingIp && transport != "WIFI" && transport != "VPN"
+        btnCycleIp.isEnabled = cycleEnabled
+        btnCycleIp.alpha = if (cycleEnabled) 1f else 0.4f
+
+        if (!cyclingIp) {
+            val (label, color) = when {
+                !running && !configured ->
+                    "NOT CONFIGURED · TAP START TO IMPORT" to 0xFFFFAA00.toInt()
+                proxyState == "error" -> "ERROR" to 0xFFFF4444.toInt()
+                proxyState == "auto_stopped" -> {
+                    val reason = readFile("stop_reason")
+                    val text = if (reason.isNotEmpty()) "AUTO-STOPPED · $reason" else "AUTO-STOPPED"
+                    text to 0xFFFFAA00.toInt()
+                }
+                connStatus == "CONNECTED" ->
+                    "CONNECTED · ↓${humanRate(rxRate)} ↑${humanRate(txRate)}" to 0xFF00CC00.toInt()
+                connStatus == "CONNECTING" -> "CONNECTING…" to 0xFFFFAA00.toInt()
+                connStatus == "RECONNECTING" -> "RECONNECTING…" to 0xFFFFAA00.toInt()
+                connStatus == "STARTING" || proxyState == "starting" -> "STARTING…" to 0xFFFFAA00.toInt()
+                running -> "RUNNING" to 0xFF00CC00.toInt()
+                else -> "DISCONNECTED" to 0xFFFF4444.toInt()
+            }
+            tvStatus.text = label
+            tvStatus.setTextColor(color)
+        }
+
         val wan = publicIp.ifEmpty { "fetching…" }
         tvNetwork.text = "$wan  ·  $transport"
 
