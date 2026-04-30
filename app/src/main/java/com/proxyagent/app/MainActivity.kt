@@ -68,7 +68,6 @@ class MainActivity : AppCompatActivity() {
 
     @Volatile private var publicIp = ""
     @Volatile private var cyclingIp = false
-    @Volatile private var cycleAbortRequested = false
     private var netCallback: ConnectivityManager.NetworkCallback? = null
 
     private val importLauncher: ActivityResultLauncher<Array<String>> =
@@ -432,13 +431,13 @@ class MainActivity : AppCompatActivity() {
     // Stops the proxy (if running), cycles cellular so the carrier hands out a
     // new IP, then restarts the proxy.
     //
-    // Tries three paths in order, falling through silently:
+    // Tries two automated paths in order:
     //   1. root: `svc data disable/enable` (or airplane mode if data toggle fails)
     //   2. WRITE_SECURE_SETTINGS: write Settings.Global.AIRPLANE_MODE_ON directly.
-    //      This permission is signature-level and only obtainable via a one-time
-    //      `adb shell pm grant <pkg> WRITE_SECURE_SETTINGS`.
-    //   3. manual: open the Internet panel and let the user toggle, wait for the
-    //      cellular transport to drop and come back.
+    //      Signature-level permission, granted once via:
+    //        adb shell pm grant <pkg> WRITE_SECURE_SETTINGS
+    //
+    // If both fail, the cycle aborts with a Toast — there is no manual fallback.
     private fun cycleMobileIp() {
         if (cyclingIp) return
         val transport = currentTransport()
@@ -448,7 +447,6 @@ class MainActivity : AppCompatActivity() {
         }
 
         cyclingIp = true
-        cycleAbortRequested = false
         btnCycleIp.isEnabled = false
         val originalLabel = btnCycleIp.text
         btnCycleIp.text = "…"
@@ -464,44 +462,39 @@ class MainActivity : AppCompatActivity() {
                         startService(Intent(this, ProxyService::class.java).apply { action = "STOP" })
                     } catch (_: Throwable) {}
                     val stopDeadline = System.currentTimeMillis() + 8_000
-                    while (System.currentTimeMillis() < stopDeadline && !cycleAbortRequested) {
+                    while (System.currentTimeMillis() < stopDeadline) {
                         val s = readFile("proxy_state")
                         if (s != "running" && s != "starting") break
                         Thread.sleep(200)
                     }
                 }
-                if (cycleAbortRequested) return@Thread
 
                 stage = "cycling network"
                 runOnUiThread { tvStatus.text = "CYCLING NETWORK…"; tvStatus.setTextColor(0xFFFFAA00.toInt()) }
 
                 val auto = toggleMobileNetworkViaRoot() || toggleMobileNetworkViaSecureSettings()
-                if (cycleAbortRequested) return@Thread
-
                 if (!auto) {
-                    runOnUiThread { promptManualCycle() }
-                    // Wait for the user to flip airplane/data and come back. Detect
-                    // by watching for the cellular transport disappearing then reappearing.
-                    val manualDeadline = System.currentTimeMillis() + 120_000
-                    var sawDown = false
-                    while (System.currentTimeMillis() < manualDeadline && !cycleAbortRequested) {
-                        val t = currentTransport()
-                        if (t == "NONE" || t == "?") sawDown = true
-                        if (sawDown && t == "CELLULAR") break
-                        Thread.sleep(500)
+                    runOnUiThread {
+                        Toast.makeText(
+                            this,
+                            "Auto-cycle unavailable. Grant: adb shell pm grant $packageName " +
+                                "android.permission.WRITE_SECURE_SETTINGS",
+                            Toast.LENGTH_LONG
+                        ).show()
                     }
-                } else {
-                    // Auto path toggled radio; wait for cellular to reappear.
-                    runOnUiThread { tvStatus.text = "WAITING FOR NET…" }
-                    val netDeadline = System.currentTimeMillis() + 30_000
-                    while (System.currentTimeMillis() < netDeadline && !cycleAbortRequested) {
-                        if (currentTransport() == "CELLULAR") break
-                        Thread.sleep(500)
-                    }
-                    // Small grace for routes/DNS to settle before the agent dials.
-                    if (!cycleAbortRequested) Thread.sleep(1500)
+                    // Restart proxy if it was running so we don't leave it stopped.
+                    if (wasRunning) runOnUiThread { startProxyService() }
+                    return@Thread
                 }
-                if (cycleAbortRequested) return@Thread
+
+                runOnUiThread { tvStatus.text = "WAITING FOR NET…" }
+                val netDeadline = System.currentTimeMillis() + 30_000
+                while (System.currentTimeMillis() < netDeadline) {
+                    if (currentTransport() == "CELLULAR") break
+                    Thread.sleep(500)
+                }
+                // Small grace for routes/DNS to settle before the agent dials.
+                Thread.sleep(1500)
 
                 publicIp = ""
                 refreshPublicIp()
@@ -578,64 +571,6 @@ class MainActivity : AppCompatActivity() {
             true
         } catch (_: SecurityException) { false }
         catch (_: Throwable) { false }
-    }
-
-    // First-time hint: explain that auto-cycle needs root or a one-time adb
-    // grant, and offer to copy the grant command. After the first time, just
-    // open the panel directly without nagging.
-    private fun promptManualCycle() {
-        val prefs = getSharedPreferences("cfg", 0)
-        val firstTime = !prefs.getBoolean("manual_cycle_seen", false)
-        if (!firstTime) {
-            Toast.makeText(this, "Toggle mobile data off and on, then return", Toast.LENGTH_LONG).show()
-            openMobileDataPanel()
-            return
-        }
-        prefs.edit().putBoolean("manual_cycle_seen", true).apply()
-        val cmd = "adb shell pm grant $packageName android.permission.WRITE_SECURE_SETTINGS"
-        AlertDialog.Builder(this)
-            .setTitle("Manual IP cycle")
-            .setMessage(
-                "Auto IP cycle needs root or a one-time adb grant.\n\n" +
-                "To enable auto-cycle without root, connect this device to a PC " +
-                "with USB debugging enabled and run:\n\n$cmd\n\n" +
-                "For now, the Internet panel will open — toggle mobile data off " +
-                "and on, then return to this app."
-            )
-            .setPositiveButton("Open panel") { _, _ -> openMobileDataPanel() }
-            .setNeutralButton("Copy adb cmd") { _, _ ->
-                try {
-                    val clip = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                    clip.setPrimaryClip(android.content.ClipData.newPlainText("adb", cmd))
-                    Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show()
-                } catch (_: Throwable) {}
-                openMobileDataPanel()
-            }
-            .setNegativeButton("Cancel") { _, _ -> cycleAbortRequested = true }
-            .setOnCancelListener { cycleAbortRequested = true }
-            .show()
-    }
-
-    // Settings.Panel.ACTION_INTERNET_CONNECTIVITY (API 29+) is the slim popup
-    // with mobile-data toggle inline — much better UX than a full settings
-    // page. Older devices fall back to the airplane-mode page.
-    private fun openMobileDataPanel() {
-        if (Build.VERSION.SDK_INT >= 29) {
-            try {
-                startActivity(Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                return
-            } catch (_: Throwable) {}
-        }
-        try {
-            startActivity(Intent(Settings.ACTION_AIRPLANE_MODE_SETTINGS)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-        } catch (_: Throwable) {
-            try {
-                startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-            } catch (_: Throwable) {}
-        }
     }
 
     private fun startProxyService(): Boolean {

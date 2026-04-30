@@ -456,6 +456,34 @@ class ProxyService : Service() {
             log("Loading Agent class via Class.forName…")
             val agentClass = Class.forName("proxyagent.sdk.agent.Agent")
 
+            // Newer SDKs expose Java setters that call Go's os.Setenv internally
+            // — that's the only way to get values into runtime.envs from JNI.
+            // Fall back to setenv-only on older AARs that don't have them.
+            var sdkSettersOk = true
+            fun callSetter(name: String, argTypes: Array<Class<*>>, vararg args: Any?) {
+                try {
+                    agentClass.getMethod(name, *argTypes).invoke(null, *args)
+                } catch (t: NoSuchMethodException) {
+                    sdkSettersOk = false
+                    log("Agent.$name not found — falling back to libc setenv only")
+                } catch (t: Throwable) {
+                    sdkSettersOk = false
+                    log("Agent.$name error: ${t.message}")
+                }
+            }
+            val portLong = port.toLongOrNull() ?: 0L
+            callSetter("setBalancer",
+                arrayOf<Class<*>>(String::class.java, Long::class.javaPrimitiveType!!),
+                host, portLong)
+            callSetter("setAgentKey",
+                arrayOf<Class<*>>(String::class.java), key)
+            callSetter("setFallbackURL",
+                arrayOf<Class<*>>(String::class.java),
+                "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json")
+            callSetter("setEnableNetAgent",
+                arrayOf<Class<*>>(Boolean::class.javaPrimitiveType!!), true)
+            log("SDK setters ${if (sdkSettersOk) "applied" else "partial — some fell back to env"}")
+
             try {
                 agentClass.getMethod("setDNSServers", String::class.java).invoke(null, dns)
                 log("Agent.setDNSServers applied")
