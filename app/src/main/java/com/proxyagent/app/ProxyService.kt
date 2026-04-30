@@ -16,9 +16,13 @@ import android.os.BatteryManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.system.Os
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import java.io.BufferedReader
 import java.io.File
+import java.io.FileInputStream
+import java.io.InputStreamReader
 import java.io.PrintWriter
 import java.io.StringWriter
 import java.text.SimpleDateFormat
@@ -28,11 +32,13 @@ import java.util.Locale
 class ProxyService : Service() {
 
     enum class ConnStatus { STARTING, CONNECTING, CONNECTED, RECONNECTING, ERROR, STOPPED }
+    enum class Engine { BINARY, AAR }
 
     private var wakeLock: PowerManager.WakeLock? = null
     @Volatile private var stopRequested = false
     @Volatile private var agentProcess: Process? = null
     @Volatile private var runnerThread: Thread? = null
+    @Volatile private var engine: Engine = Engine.BINARY
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     @Volatile private var connStatus: ConnStatus = ConnStatus.STARTING
@@ -252,6 +258,7 @@ class ProxyService : Service() {
         val key = intent.getStringExtra("key") ?: ""
         val dnsRaw = intent.getStringExtra("dns")?.trim().orEmpty()
         val dns = dnsRaw.ifEmpty { "1.1.1.1,8.8.8.8" }
+        engine = if (intent.getStringExtra("engine") == "aar") Engine.AAR else Engine.BINARY
         if (host.isEmpty()) { stopSelf(); return START_NOT_STICKY }
 
         connStatus = ConnStatus.STARTING
@@ -309,82 +316,176 @@ class ProxyService : Service() {
             }
         }.apply { name = "StatusUpdater"; isDaemon = true; start() }
 
-        Thread {
-            val binary = File(applicationInfo.nativeLibraryDir, "libproxyagent.so")
-            if (!binary.exists()) {
-                log("ERROR: libproxyagent.so missing at ${binary.absolutePath}")
-                connStatus = ConnStatus.ERROR
-                state("error"); writeConnInfo()
-                return@Thread
+        log("Engine: ${engine.name}")
+        val runner = when (engine) {
+            Engine.BINARY -> Thread { runBinaryEngine(host, port, key, dns) }
+            Engine.AAR -> Thread { runAarEngine(host, port, key, dns) }
+        }
+        runner.name = "AgentRunner"
+        runner.isDaemon = true
+        runnerThread = runner
+        runner.start()
+
+        registerNetworkCallback()
+        return START_REDELIVER_INTENT
+    }
+
+    private fun runBinaryEngine(host: String, port: String, key: String, dns: String) {
+        val binary = File(applicationInfo.nativeLibraryDir, "libproxyagent.so")
+        if (!binary.exists()) {
+            log("ERROR: libproxyagent.so missing at ${binary.absolutePath}")
+            connStatus = ConnStatus.ERROR
+            state("error"); writeConnInfo()
+            return
+        }
+        try { binary.setExecutable(true, false) } catch (_: Throwable) {}
+        log("Binary: ${binary.absolutePath} size=${binary.length()}")
+
+        var backoffMs = 1000L
+        while (!stopRequested) {
+            try {
+                log("Launching subprocess: host=$host port=$port key=${mask(key)} dns=$dns")
+                connStatus = ConnStatus.CONNECTING
+                val pb = ProcessBuilder(binary.absolutePath).redirectErrorStream(true)
+                pb.environment().apply {
+                    put("balancer_host", host)
+                    put("balancer_port", port)
+                    put("agent_key", key)
+                    put("enable_netagent", "true")
+                    put("fallback_file_url",
+                        "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json")
+                    put("HOME", filesDir.absolutePath)
+                    put("TMPDIR", cacheDir.absolutePath)
+                    put("dns_servers", dns)
+                }
+                val proc = pb.start()
+                agentProcess = proc
+                state("running")
+                log("Subprocess started")
+
+                val reader = proc.inputStream.bufferedReader()
+                while (true) {
+                    val line = reader.readLine() ?: break
+                    parseAgentLine(line)
+                    log("[agent] $line")
+                }
+                val code = proc.waitFor()
+                agentProcess = null
+                log("Subprocess exited code=$code")
+                if (stopRequested) break
+                connStatus = ConnStatus.RECONNECTING
+                currentRegistrator = ""
+                activeTunnels = 0
+                connectedSinceMs = 0L
+                backoffMs = 1000L
+            } catch (e: Throwable) {
+                val sw = StringWriter(); e.printStackTrace(PrintWriter(sw))
+                log("Subprocess error: $sw")
+                if (stopRequested) break
+                connStatus = ConnStatus.RECONNECTING
+                currentRegistrator = ""
+                activeTunnels = 0
+                connectedSinceMs = 0L
             }
-            try { binary.setExecutable(true, false) } catch (_: Throwable) {}
-            log("Binary: ${binary.absolutePath} size=${binary.length()}")
+            log("Restarting in ${backoffMs}ms")
+            try {
+                Thread.sleep(backoffMs)
+            } catch (_: InterruptedException) {
+                // Woken up by forceReconnect (network change). Skip backoff.
+                log("Backoff interrupted; retrying now")
+                backoffMs = 1000L
+            }
+            backoffMs = (backoffMs * 2).coerceAtMost(30_000L)
+        }
+        log("Runner loop exited")
+    }
 
-            var backoffMs = 1000L
-            while (!stopRequested) {
+    // In-process engine using the gomobile AAR (proxyagent.sdk.agent.Agent).
+    // Go runtime caches env at init, so config is set via Os.setenv before
+    // touching the Agent class. On stop we kill the :proxy process so the
+    // next start re-initializes with fresh env.
+    private fun runAarEngine(host: String, port: String, key: String, dns: String) {
+        try {
+            log("Capturing native stdout/stderr…")
+            captureNativeOutput()
+
+            log("Setting environment: host=$host port=$port key=${mask(key)} dns=$dns")
+            Os.setenv("balancer_host", host, true)
+            Os.setenv("balancer_port", port, true)
+            Os.setenv("agent_key", key, true)
+            Os.setenv("enable_netagent", "true", true)
+            Os.setenv("fallback_file_url",
+                "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json", true)
+            Os.setenv("HOME", filesDir.absolutePath, true)
+            Os.setenv("TMPDIR", cacheDir.absolutePath, true)
+            Os.setenv("dns_servers", dns, true)
+
+            connStatus = ConnStatus.CONNECTING
+            log("Loading Go runtime (go.Seq.setContext)…")
+            go.Seq.setContext(applicationContext)
+
+            // Newer SDKs expose setDNSServers; fall back silently if unavailable.
+            try {
+                proxyagent.sdk.agent.Agent.setDNSServers(dns)
+                log("Agent.setDNSServers applied")
+            } catch (t: Throwable) {
+                log("Agent.setDNSServers unavailable: ${t.message}")
+            }
+
+            log("Calling Agent.startAgent()")
+            proxyagent.sdk.agent.Agent.startAgent()
+            state("running")
+            log("Agent.startAgent returned")
+        } catch (e: Throwable) {
+            val sw = StringWriter(); e.printStackTrace(PrintWriter(sw))
+            log("AAR engine error: $sw")
+            connStatus = ConnStatus.ERROR
+            state("error"); writeConnInfo()
+        }
+    }
+
+    // Pipe Go's stdout/stderr (fd 1/2) into our log so log parsing works.
+    // Also tail logcat for tags gomobile typically writes to.
+    private fun captureNativeOutput() {
+        try {
+            val fds = Os.pipe()
+            val readFd = fds[0]
+            val writeFd = fds[1]
+            Os.dup2(writeFd, 1)
+            Os.dup2(writeFd, 2)
+            Os.close(writeFd)
+            Thread {
                 try {
-                    log("Launching subprocess: host=$host port=$port key=${mask(key)} dns=$dns")
-                    connStatus = ConnStatus.CONNECTING
-                    val pb = ProcessBuilder(binary.absolutePath).redirectErrorStream(true)
-                    pb.environment().apply {
-                        put("balancer_host", host)
-                        put("balancer_port", port)
-                        put("agent_key", key)
-                        put("enable_netagent", "true")
-                        put("fallback_file_url",
-                            "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json")
-                        put("HOME", filesDir.absolutePath)
-                        put("TMPDIR", cacheDir.absolutePath)
-                        put("dns_servers", dns)
+                    val reader = BufferedReader(InputStreamReader(FileInputStream(readFd)))
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        parseAgentLine(line)
+                        log("[go] $line")
                     }
-                    val proc = pb.start()
-                    agentProcess = proc
-                    state("running")
-                    log("Subprocess started")
+                } catch (_: Throwable) {}
+            }.apply { name = "NativeStdoutReader"; isDaemon = true; start() }
+        } catch (e: Throwable) {
+            log("stdout capture failed: ${e.message}")
+        }
 
+        try {
+            val proc = ProcessBuilder(
+                "logcat", "-T", "1", "-v", "time",
+                "GoLog:V", "Go:V", "*:S"
+            ).redirectErrorStream(true).start()
+            Thread {
+                try {
                     val reader = proc.inputStream.bufferedReader()
                     while (true) {
                         val line = reader.readLine() ?: break
                         parseAgentLine(line)
-                        log("[agent] $line")
+                        log("[logcat] $line")
                     }
-                    val code = proc.waitFor()
-                    agentProcess = null
-                    log("Subprocess exited code=$code")
-                    if (stopRequested) break
-                    connStatus = ConnStatus.RECONNECTING
-                    currentRegistrator = ""
-                    activeTunnels = 0
-                    connectedSinceMs = 0L
-                    backoffMs = 1000L
-                } catch (e: Throwable) {
-                    val sw = StringWriter(); e.printStackTrace(PrintWriter(sw))
-                    log("Subprocess error: $sw")
-                    if (stopRequested) break
-                    connStatus = ConnStatus.RECONNECTING
-                    currentRegistrator = ""
-                    activeTunnels = 0
-                    connectedSinceMs = 0L
-                }
-                log("Restarting in ${backoffMs}ms")
-                try {
-                    Thread.sleep(backoffMs)
-                } catch (_: InterruptedException) {
-                    // Woken up by forceReconnect (network change). Skip backoff.
-                    log("Backoff interrupted; retrying now")
-                    backoffMs = 1000L
-                }
-                backoffMs = (backoffMs * 2).coerceAtMost(30_000L)
-            }
-            log("Runner loop exited")
-        }.also {
-            it.name = "AgentRunner"; it.isDaemon = true
-            runnerThread = it
-            it.start()
+                } catch (_: Throwable) {}
+            }.apply { name = "LogcatTailer"; isDaemon = true; start() }
+        } catch (e: Throwable) {
+            log("logcat tail failed: ${e.message}")
         }
-
-        registerNetworkCallback()
-        return START_REDELIVER_INTENT
     }
 
     private fun registerNetworkCallback() {
@@ -437,26 +538,40 @@ class ProxyService : Service() {
     // IP that's no longer valid.
     private fun forceReconnect(reason: String) {
         log("Force reconnect: $reason")
-        try { agentProcess?.destroy() } catch (_: Throwable) {}
-        runnerThread?.interrupt()
+        when (engine) {
+            Engine.BINARY -> {
+                try { agentProcess?.destroy() } catch (_: Throwable) {}
+                runnerThread?.interrupt()
+            }
+            Engine.AAR -> {
+                // AAR engine handles network changes internally via the Go-side
+                // dial loop; nothing to tear down here.
+            }
+        }
     }
 
     private fun doStop(autoStopReason: String = "") {
         if (stopRequested) return
         stopRequested = true
         unregisterNetworkCallback()
-        try {
-            agentProcess?.let { p ->
-                log("Terminating subprocess")
-                p.destroy()
-                try {
-                    if (!p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) {
-                        log("Subprocess did not exit gracefully; forcing")
-                        p.destroyForcibly()
-                    }
-                } catch (_: InterruptedException) { p.destroyForcibly() }
-            }
-        } catch (t: Throwable) { log("Stop error: ${t.message}") }
+        when (engine) {
+            Engine.BINARY -> try {
+                agentProcess?.let { p ->
+                    log("Terminating subprocess")
+                    p.destroy()
+                    try {
+                        if (!p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) {
+                            log("Subprocess did not exit gracefully; forcing")
+                            p.destroyForcibly()
+                        }
+                    } catch (_: InterruptedException) { p.destroyForcibly() }
+                }
+            } catch (t: Throwable) { log("Stop error: ${t.message}") }
+            Engine.AAR -> try {
+                log("Calling Agent.stopAgent()")
+                proxyagent.sdk.agent.Agent.stopAgent()
+            } catch (t: Throwable) { log("Agent.stopAgent error: ${t.message}") }
+        }
         agentProcess = null
         connStatus = ConnStatus.STOPPED
         currentRegistrator = ""
@@ -492,6 +607,18 @@ class ProxyService : Service() {
             } catch (_: Throwable) {}
         }
         stopSelf()
+
+        // libc setenv does not update Go's cached env after runtime init, so the
+        // AAR engine cannot be cleanly restarted in the same process. Killing
+        // the :proxy process forces the next Start to load a fresh Go runtime
+        // with the new env. The binary engine re-execs the subprocess instead,
+        // so it doesn't need this.
+        if (engine == Engine.AAR) {
+            Thread {
+                try { Thread.sleep(400) } catch (_: InterruptedException) {}
+                android.os.Process.killProcess(android.os.Process.myPid())
+            }.apply { name = "AarProcKiller"; isDaemon = true; start() }
+        }
     }
 
     override fun onDestroy() { doStop(); super.onDestroy() }

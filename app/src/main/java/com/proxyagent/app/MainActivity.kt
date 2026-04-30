@@ -21,6 +21,8 @@ import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
@@ -210,6 +212,9 @@ class MainActivity : AppCompatActivity() {
         val etKey = view.findViewById<EditText>(R.id.etKey)
         val etDns = view.findViewById<EditText>(R.id.etDns)
         val cbSpeedBytes = view.findViewById<CheckBox>(R.id.cbSpeedBytes)
+        val rgEngine = view.findViewById<RadioGroup>(R.id.rgEngine)
+        val rbEngineBinary = view.findViewById<RadioButton>(R.id.rbEngineBinary)
+        val rbEngineAar = view.findViewById<RadioButton>(R.id.rbEngineAar)
         val btnImport = view.findViewById<Button>(R.id.btnImport)
         val btnExport = view.findViewById<Button>(R.id.btnExport)
         val prefs = getSharedPreferences("cfg", 0)
@@ -220,6 +225,8 @@ class MainActivity : AppCompatActivity() {
             etKey.setText(prefs.getString("k", ""))
             etDns.setText(prefs.getString("dns", ""))
             cbSpeedBytes.isChecked = prefs.getBoolean("speed_bytes", false)
+            if (prefs.getString("engine", "binary") == "aar") rbEngineAar.isChecked = true
+            else rbEngineBinary.isChecked = true
         }
         loadFromPrefs()
 
@@ -236,17 +243,22 @@ class MainActivity : AppCompatActivity() {
                     return@setPositiveButton
                 }
                 val speedBytes = cbSpeedBytes.isChecked
+                val newEngine = if (rgEngine.checkedRadioButtonId == R.id.rbEngineAar) "aar" else "binary"
+                val engineChanged = prefs.getString("engine", "binary") != newEngine
                 prefs.edit()
                     .putString("h", h).putString("p", p).putString("k", k).putString("dns", d)
                     .putBoolean("speed_bytes", speedBytes)
+                    .putString("engine", newEngine)
                     .apply()
                 try { File(filesDir, "speed_units").writeText(if (speedBytes) "bytes" else "bits") }
                 catch (_: Throwable) {}
-                if (readFile("proxy_state").let { it == "running" || it == "starting" }) {
-                    Toast.makeText(this, "Saved — restart agent to apply", Toast.LENGTH_SHORT).show()
-                } else {
-                    Toast.makeText(this, "Saved", Toast.LENGTH_SHORT).show()
+                val running = readFile("proxy_state").let { it == "running" || it == "starting" }
+                val msg = when {
+                    running && engineChanged -> "Saved — stop & restart to switch engine"
+                    running -> "Saved — restart agent to apply"
+                    else -> "Saved"
                 }
+                Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("Cancel", null)
             .create()
@@ -419,9 +431,11 @@ class MainActivity : AppCompatActivity() {
         File(filesDir, "agent.log").delete()
         File(filesDir, "proxy_state").delete()
 
+        val engine = prefs.getString("engine", "binary") ?: "binary"
         try {
             val svc = Intent(this, ProxyService::class.java).apply {
                 putExtra("host", h); putExtra("port", po); putExtra("key", k); putExtra("dns", d)
+                putExtra("engine", engine)
             }
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc) else startService(svc)
         } catch (e: Throwable) {

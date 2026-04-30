@@ -80,4 +80,39 @@
         android:text="Show speed in MB/s (bytes) instead of Mb/s (bits)"
         android:textSize="12sp" />
 
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:layout_marginTop="14dp"
+        android:layout_marginBottom="10dp"
+        android:background="#33888888" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Engine:"
+        android:textSize="11sp"
+        android:textStyle="bold"
+        android:textColor="#888888"
+        android:layout_marginBottom="4dp" />
+
+    <RadioGroup
+        android:id="@+id/rgEngine"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+        <RadioButton
+            android:id="@+id/rbEngineBinary"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Binary subprocess (default)"
+            android:textSize="13sp" />
+        <RadioButton
+            android:id="@+id/rbEngineAar"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="In-process AAR (gomobile)"
+            android:textSize="13sp" />
+    </RadioGroup>
+
 </LinearLayout>

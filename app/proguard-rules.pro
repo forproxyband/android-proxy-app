@@ -1,0 +1,2 @@
+-keep class proxyagent.sdk.** { *; }
+-keep class go.** { *; }
