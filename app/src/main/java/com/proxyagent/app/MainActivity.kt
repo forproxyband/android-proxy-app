@@ -36,6 +36,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
+import androidx.viewpager2.widget.ViewPager2
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
@@ -57,14 +58,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnStart: Button
     private lateinit var btnCycleIp: Button
     private lateinit var btnSettings: Button
+    private lateinit var btnAnalytics: Button
     private lateinit var btnBattery: Button
     private lateinit var spBatteryThreshold: Spinner
     private lateinit var tvStatus: TextView
     private lateinit var tvNetwork: TextView
-    private lateinit var tvRegistrator: TextView
-    private lateinit var tvUptime: TextView
-    private lateinit var tvActivity: TextView
     private lateinit var registratorPanel: View
+    private lateinit var registratorPager: ViewPager2
+    private lateinit var dot0: View
+    private lateinit var dot1: View
+    private lateinit var dot2: View
+    private val pagerRefs = StatusPagerAdapter.PageRefs()
+    @Volatile private var lastPanelDataAtMs = 0L
     private lateinit var tvLogs: TextView
     private lateinit var svLogs: ScrollView
     private lateinit var logsHeader: View
@@ -129,14 +134,23 @@ class MainActivity : AppCompatActivity() {
         btnStart = findViewById(R.id.btnToggle)
         btnCycleIp = findViewById(R.id.btnCycleIp)
         btnSettings = findViewById(R.id.btnSettings)
+        btnAnalytics = findViewById(R.id.btnAnalytics)
         btnBattery = findViewById(R.id.btnBattery)
         spBatteryThreshold = findViewById(R.id.spBatteryThreshold)
         tvStatus = findViewById(R.id.tvStatus)
         tvNetwork = findViewById(R.id.tvNetwork)
-        tvRegistrator = findViewById(R.id.tvRegistrator)
-        tvUptime = findViewById(R.id.tvUptime)
-        tvActivity = findViewById(R.id.tvActivity)
         registratorPanel = findViewById(R.id.registratorPanel)
+        registratorPager = findViewById(R.id.registratorPager)
+        dot0 = findViewById(R.id.dot0)
+        dot1 = findViewById(R.id.dot1)
+        dot2 = findViewById(R.id.dot2)
+        registratorPager.adapter = StatusPagerAdapter(pagerRefs)
+        registratorPager.registerOnPageChangeCallback(object : ViewPager2.OnPageChangeCallback() {
+            override fun onPageSelected(position: Int) {
+                updatePagerDots(position)
+                if (position != 0) refreshPanelCharts()
+            }
+        })
         tvLogs = findViewById(R.id.tvLogs)
         svLogs = findViewById(R.id.svLogs)
         logsHeader = findViewById(R.id.logsHeader)
@@ -152,7 +166,14 @@ class MainActivity : AppCompatActivity() {
         btnStart.setOnClickListener { toggle() }
         btnCycleIp.setOnClickListener { cycleMobileIp() }
         btnSettings.setOnClickListener { showSettingsDialog() }
+        btnAnalytics.setOnClickListener {
+            startActivity(Intent(this, AnalyticsActivity::class.java))
+        }
         btnBattery.setOnClickListener { requestBatteryWhitelist() }
+
+        // Drop day-files older than the user's retention setting (default 30d).
+        Thread { try { AnalyticsStore.pruneToRetention(this) } catch (_: Throwable) {} }
+            .apply { isDaemon = true; name = "AnalyticsPrune"; start() }
 
         setLogsExpanded(prefs.getBoolean("logs_expanded", false))
         logsHeader.setOnClickListener {
@@ -232,6 +253,7 @@ class MainActivity : AppCompatActivity() {
                     if (ip.isNotEmpty() && ip.length < 40 &&
                         (ip.matches(Regex("""\d{1,3}(\.\d{1,3}){3}""")) || ip.contains(":"))) {
                         publicIp = ip
+                        try { File(filesDir, "nat_ip").writeText(ip) } catch (_: Throwable) {}
                         runOnUiThread { refresh() }
                         return@Thread
                     }
@@ -261,6 +283,7 @@ class MainActivity : AppCompatActivity() {
         val etId = view.findViewById<EditText>(R.id.etId)
         val etDns = view.findViewById<EditText>(R.id.etDns)
         val cbSpeedBytes = view.findViewById<CheckBox>(R.id.cbSpeedBytes)
+        val spRetention = view.findViewById<Spinner>(R.id.spRetention)
         val rgEngine = view.findViewById<RadioGroup>(R.id.rgEngine)
         val rbEngineBinary = view.findViewById<RadioButton>(R.id.rbEngineBinary)
         val rbEngineAar = view.findViewById<RadioButton>(R.id.rbEngineAar)
@@ -279,6 +302,14 @@ class MainActivity : AppCompatActivity() {
             tvScanQrHint.visibility = if (modemMode) View.VISIBLE else View.GONE
         }
 
+        val retentionLabels = arrayOf("Day (1)", "Week (7)", "Month (30)")
+        val retentionDays = intArrayOf(1, 7, 30)
+        run {
+            val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, retentionLabels)
+            adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            spRetention.adapter = adapter
+        }
+
         fun loadFromPrefs() {
             etHost.setText(prefs.getString("h", ""))
             etPort.setText(prefs.getString("p", ""))
@@ -286,6 +317,9 @@ class MainActivity : AppCompatActivity() {
             etId.setText(prefs.getString("id", ""))
             etDns.setText(prefs.getString("dns", ""))
             cbSpeedBytes.isChecked = prefs.getBoolean("speed_bytes", false)
+            val savedRet = prefs.getInt("analytics_retention_days", 30)
+            val rIdx = retentionDays.indexOf(savedRet).let { if (it < 0) 2 else it }
+            spRetention.setSelection(rIdx)
             if (prefs.getString("engine", "binary") == "aar") rbEngineAar.isChecked = true
             else rbEngineBinary.isChecked = true
             val modemMode = prefs.getString("mode", "modem") == "modem"
@@ -316,6 +350,9 @@ class MainActivity : AppCompatActivity() {
                     return@setPositiveButton
                 }
                 val speedBytes = cbSpeedBytes.isChecked
+                val newRetention = retentionDays[
+                    spRetention.selectedItemPosition.coerceIn(0, retentionDays.size - 1)]
+                val retentionChanged = prefs.getInt("analytics_retention_days", 30) != newRetention
                 val newEngine = if (rgEngine.checkedRadioButtonId == R.id.rbEngineAar) "aar" else "binary"
                 val newMode = if (rgMode.checkedRadioButtonId == R.id.rbModeBalancer) "balancer" else "modem"
                 val engineChanged = prefs.getString("engine", "binary") != newEngine
@@ -324,9 +361,14 @@ class MainActivity : AppCompatActivity() {
                     .putString("h", h).putString("p", p).putString("k", k)
                     .putString("id", id).putString("dns", d)
                     .putBoolean("speed_bytes", speedBytes)
+                    .putInt("analytics_retention_days", newRetention)
                     .putString("engine", newEngine)
                     .putString("mode", newMode)
                     .apply()
+                if (retentionChanged) {
+                    Thread { try { AnalyticsStore.pruneToRetention(this) } catch (_: Throwable) {} }
+                        .apply { isDaemon = true; name = "AnalyticsPruneOnSave"; start() }
+                }
                 try { File(filesDir, "speed_units").writeText(if (speedBytes) "bytes" else "bits") }
                 catch (_: Throwable) {}
                 val running = readFile("proxy_state").let { it == "running" || it == "starting" }
@@ -1107,14 +1149,22 @@ class MainActivity : AppCompatActivity() {
 
         if (pendingAction != "stop" && connStatus == "CONNECTED" && registrator.isNotEmpty()) {
             registratorPanel.visibility = View.VISIBLE
-            tvRegistrator.text = registrator
-            tvUptime.text = if (connectedSinceMs > 0)
+            pagerRefs.tvRegistrator?.text = registrator
+            pagerRefs.tvUptime?.text = if (connectedSinceMs > 0)
                 "up ${formatDuration(System.currentTimeMillis() - connectedSinceMs)}"
             else ""
-            tvActivity.text = when {
+            pagerRefs.tvActivity?.text = when {
                 tunnels == 0 -> "◦ idle — no connections"
                 else -> "⚡ $tunnels ${if (tunnels == 1) "connection" else "connections"} · " +
                     "↓${humanRate(rxRate)} ↑${humanRate(txRate)}"
+            }
+            // Refresh charts at most every 30s — they cover 24h, sub-minute updates
+            // are visually pointless and re-reading the JSONL on every tick wastes IO.
+            val nowMs = System.currentTimeMillis()
+            if (registratorPager.currentItem != 0 &&
+                nowMs - lastPanelDataAtMs > 30_000L) {
+                lastPanelDataAtMs = nowMs
+                refreshPanelCharts()
             }
         } else {
             registratorPanel.visibility = View.GONE
@@ -1127,6 +1177,87 @@ class MainActivity : AppCompatActivity() {
                 tvLogs.text = lines.takeLast(200).joinToString("\n")
                 svLogs.post { svLogs.fullScroll(ScrollView.FOCUS_DOWN) }
             }
+        }
+    }
+
+    private fun updatePagerDots(active: Int) {
+        val dots = arrayOf(dot0, dot1, dot2)
+        for (i in dots.indices) {
+            dots[i].setBackgroundColor(if (i == active) 0xFF88FFAA.toInt() else 0x33FFFFFF.toInt())
+        }
+    }
+
+    // Reads the last 24h of buckets and feeds them to the two mini charts.
+    // Done off the UI thread because IO can be slow on cold cache; results
+    // are pushed back via runOnUiThread.
+    private fun refreshPanelCharts() {
+        Thread {
+            try {
+                val now = System.currentTimeMillis()
+                val from = now - 24 * 60 * 60_000L
+                val buckets = AnalyticsStore.load(this, from, now)
+                val (trafficSeries, trafficStartMs, trafficStepMs, trafficTotalBytes) =
+                    aggregateForPanel(buckets, from, now, AnalyticsStore.BUCKET_MS * 10) { it.rxBytes + it.txBytes }
+                val (connSeries, connStartMs, connStepMs, connTotalEvents) =
+                    aggregateForPanel(buckets, from, now, AnalyticsStore.BUCKET_MS * 10) {
+                        (it.opens + it.closes).toLong()
+                    }
+                runOnUiThread {
+                    pagerRefs.trafficChart?.let { ch ->
+                        ch.setSeries(trafficSeries, trafficStartMs, trafficStepMs)
+                        ch.setYLabelFormatter { v -> formatBytesShort(v.toLong()) }
+                    }
+                    pagerRefs.trafficTotal?.text = humanBytes(trafficTotalBytes)
+                    pagerRefs.connChart?.let { ch ->
+                        ch.setSeries(connSeries, connStartMs, connStepMs)
+                        ch.setYLabelFormatter { v -> "%.0f".format(v) }
+                    }
+                    pagerRefs.connTotal?.text = "$connTotalEvents events"
+                }
+            } catch (_: Throwable) {}
+        }.apply { isDaemon = true; name = "PanelChartLoad"; start() }
+    }
+
+    // Shared helper: fold bucket list into a fixed-size series spanning
+    // [fromMs, toMs] using `binMs` width per cell, plus the running total.
+    private fun aggregateForPanel(
+        buckets: List<AnalyticsBucket>,
+        fromMs: Long,
+        toMs: Long,
+        binMs: Long,
+        valueOf: (AnalyticsBucket) -> Long,
+    ): SeriesResult {
+        val n = ((toMs - fromMs) / binMs).toInt().coerceAtLeast(1)
+        val arr = DoubleArray(n)
+        var total = 0L
+        for (b in buckets) {
+            val idx = ((b.tMs - fromMs) / binMs).toInt()
+            if (idx < 0 || idx >= n) continue
+            val v = valueOf(b)
+            arr[idx] += v.toDouble()
+            total += v
+        }
+        return SeriesResult(arr, fromMs, binMs, total)
+    }
+
+    data class SeriesResult(val series: DoubleArray, val startMs: Long, val stepMs: Long, val total: Long)
+
+    private fun humanBytes(b: Long): String {
+        val abs = if (b < 0) 0L else b
+        return when {
+            abs < 1024 -> "${abs} B"
+            abs < 1024L * 1024 -> "%.1f KB".format(abs / 1024.0)
+            abs < 1024L * 1024 * 1024 -> "%.1f MB".format(abs / 1024.0 / 1024.0)
+            else -> "%.2f GB".format(abs / 1024.0 / 1024.0 / 1024.0)
+        }
+    }
+
+    private fun formatBytesShort(b: Long): String {
+        return when {
+            b >= 1024L * 1024 * 1024 -> "%.1fG".format(b / 1024.0 / 1024.0 / 1024.0)
+            b >= 1024L * 1024 -> "%.1fM".format(b / 1024.0 / 1024.0)
+            b >= 1024 -> "%.0fK".format(b / 1024.0)
+            else -> "$b"
         }
     }
 

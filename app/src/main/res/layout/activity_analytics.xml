@@ -1,0 +1,216 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#1a1a2e"
+    android:fillViewport="true"
+    android:fitsSystemWindows="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:layout_marginBottom="12dp">
+            <TextView
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="ANALYTICS"
+                android:textColor="#e94560"
+                android:textSize="22sp"
+                android:textStyle="bold" />
+            <Button
+                android:id="@+id/btnExportAnalytics"
+                android:layout_width="wrap_content"
+                android:layout_height="40dp"
+                android:minWidth="0dp"
+                android:paddingStart="14dp"
+                android:paddingEnd="14dp"
+                android:text="SAVE"
+                android:textSize="11sp"
+                android:textStyle="bold"
+                android:backgroundTint="#16213e"
+                android:textColor="#88ffaa" />
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="PERIOD"
+            android:textColor="#888888"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            android:letterSpacing="0.1"
+            android:layout_marginBottom="4dp" />
+
+        <RadioGroup
+            android:id="@+id/rgPeriod"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="12dp">
+            <RadioButton
+                android:id="@+id/rbPeriodDay"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="Day"
+                android:textColor="#cccccc"
+                android:textSize="13sp"
+                android:checked="true" />
+            <RadioButton
+                android:id="@+id/rbPeriodWeek"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="Week"
+                android:textColor="#cccccc"
+                android:textSize="13sp" />
+            <RadioButton
+                android:id="@+id/rbPeriodMonth"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="Month"
+                android:textColor="#cccccc"
+                android:textSize="13sp" />
+        </RadioGroup>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="#0f2a1f"
+            android:padding="14dp"
+            android:layout_marginBottom="12dp">
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="TOTAL TRAFFIC"
+                android:textColor="#88ffaa"
+                android:textSize="10sp"
+                android:textStyle="bold"
+                android:letterSpacing="0.1" />
+            <TextView
+                android:id="@+id/tvTotal"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="0 B"
+                android:textColor="#00ff41"
+                android:textSize="22sp"
+                android:textStyle="bold"
+                android:fontFamily="monospace"
+                android:layout_marginTop="2dp" />
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:layout_marginTop="4dp">
+                <TextView
+                    android:id="@+id/tvIn"
+                    android:layout_width="0dp"
+                    android:layout_weight="1"
+                    android:layout_height="wrap_content"
+                    android:text="↓ IN: 0 B"
+                    android:textColor="#88ffaa"
+                    android:textSize="12sp"
+                    android:fontFamily="monospace" />
+                <TextView
+                    android:id="@+id/tvOut"
+                    android:layout_width="0dp"
+                    android:layout_weight="1"
+                    android:layout_height="wrap_content"
+                    android:text="↑ OUT: 0 B"
+                    android:textColor="#88ffaa"
+                    android:textSize="12sp"
+                    android:fontFamily="monospace" />
+            </LinearLayout>
+            <TextView
+                android:id="@+id/tvConnTotal"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="0 connections"
+                android:textColor="#88ffaa"
+                android:textSize="12sp"
+                android:fontFamily="monospace"
+                android:layout_marginTop="2dp" />
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="FILTER"
+            android:textColor="#888888"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            android:letterSpacing="0.1"
+            android:layout_marginBottom="4dp" />
+
+        <Spinner
+            android:id="@+id/spFilterType"
+            android:layout_width="match_parent"
+            android:layout_height="44dp"
+            android:background="#16213e"
+            android:layout_marginBottom="6dp" />
+
+        <Spinner
+            android:id="@+id/spFilterValue"
+            android:layout_width="match_parent"
+            android:layout_height="44dp"
+            android:background="#16213e"
+            android:visibility="gone"
+            android:layout_marginBottom="12dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="TRAFFIC"
+            android:textColor="#888888"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            android:letterSpacing="0.1"
+            android:layout_marginBottom="4dp" />
+
+        <com.proxyagent.app.MiniLineChart
+            android:id="@+id/chartTraffic"
+            android:layout_width="match_parent"
+            android:layout_height="160dp"
+            android:background="#0f1f2a"
+            android:layout_marginBottom="12dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="CONNECTIONS"
+            android:textColor="#888888"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            android:letterSpacing="0.1"
+            android:layout_marginBottom="4dp" />
+
+        <com.proxyagent.app.MiniLineChart
+            android:id="@+id/chartConn"
+            android:layout_width="match_parent"
+            android:layout_height="160dp"
+            android:background="#0f1f2a"
+            android:layout_marginBottom="12dp" />
+
+        <TextView
+            android:id="@+id/tvRetentionHint"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textColor="#666666"
+            android:textSize="10sp"
+            android:fontFamily="monospace"
+            android:layout_marginBottom="12dp" />
+
+    </LinearLayout>
+</ScrollView>

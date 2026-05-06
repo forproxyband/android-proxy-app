@@ -49,62 +49,48 @@
         android:layout_gravity="center_horizontal"
         android:layout_marginBottom="10dp" />
 
-    <LinearLayout
+    <FrameLayout
         android:id="@+id/registratorPanel"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="vertical"
-        android:background="#0f2a1f"
-        android:padding="12dp"
         android:layout_marginBottom="12dp"
         android:visibility="gone">
 
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="CONNECTED TO REGISTRATOR"
-            android:textColor="#88ffaa"
-            android:textSize="10sp"
-            android:textStyle="bold"
-            android:letterSpacing="0.1" />
+        <androidx.viewpager2.widget.ViewPager2
+            android:id="@+id/registratorPager"
+            android:layout_width="match_parent"
+            android:layout_height="148dp" />
 
         <LinearLayout
-            android:layout_width="match_parent"
+            android:id="@+id/registratorDots"
+            android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
-            android:layout_marginTop="4dp"
-            android:gravity="center_vertical">
-            <TextView
-                android:id="@+id/tvRegistrator"
-                android:layout_width="0dp"
-                android:layout_weight="1"
-                android:layout_height="wrap_content"
-                android:text="—"
-                android:textColor="#00ff41"
-                android:textSize="18sp"
-                android:textStyle="bold"
-                android:fontFamily="monospace" />
-            <TextView
-                android:id="@+id/tvUptime"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text=""
-                android:textColor="#88ffaa"
-                android:textSize="12sp"
-                android:fontFamily="monospace"
-                android:layout_marginStart="8dp" />
+            android:layout_gravity="bottom|center_horizontal"
+            android:layout_marginBottom="4dp">
+            <View
+                android:id="@+id/dot0"
+                android:layout_width="6dp"
+                android:layout_height="6dp"
+                android:layout_marginStart="3dp"
+                android:layout_marginEnd="3dp"
+                android:background="#88ffaa" />
+            <View
+                android:id="@+id/dot1"
+                android:layout_width="6dp"
+                android:layout_height="6dp"
+                android:layout_marginStart="3dp"
+                android:layout_marginEnd="3dp"
+                android:background="#33ffffff" />
+            <View
+                android:id="@+id/dot2"
+                android:layout_width="6dp"
+                android:layout_height="6dp"
+                android:layout_marginStart="3dp"
+                android:layout_marginEnd="3dp"
+                android:background="#33ffffff" />
         </LinearLayout>
-
-        <TextView
-            android:id="@+id/tvActivity"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text=""
-            android:textColor="#88ffaa"
-            android:textSize="12sp"
-            android:fontFamily="monospace"
-            android:layout_marginTop="6dp" />
-    </LinearLayout>
+    </FrameLayout>
 
     <LinearLayout
         android:layout_width="match_parent"
@@ -130,6 +116,17 @@
             android:textSize="22sp"
             android:textStyle="bold"
             android:textColor="#FFCC66"
+            android:backgroundTint="#16213e"
+            android:layout_marginStart="6dp"
+            android:padding="0dp" />
+
+        <Button
+            android:id="@+id/btnAnalytics"
+            android:layout_width="50dp"
+            android:layout_height="match_parent"
+            android:text="◫"
+            android:textSize="20sp"
+            android:textColor="#88ffaa"
             android:backgroundTint="#16213e"
             android:layout_marginStart="6dp"
             android:padding="0dp" />

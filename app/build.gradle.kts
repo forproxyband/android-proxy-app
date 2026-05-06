@@ -79,4 +79,6 @@ dependencies {
     // ZXing kept as fallback: gallery image decoding + offline scanner on
     // devices without Play Services.
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    // Swipeable status panel: status / 24h-traffic / 24h-connections.
+    implementation("androidx.viewpager2:viewpager2:1.1.0")
 }

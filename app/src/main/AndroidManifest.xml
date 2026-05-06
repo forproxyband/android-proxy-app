@@ -44,6 +44,11 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".AnalyticsActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
         <!-- Portrait-locked CaptureActivity for ZXing embedded scanner.
              Default CaptureActivity is sensorLandscape; on portrait phones it
              shows the "rotate device" overlay instead of the camera preview.

@@ -42,6 +42,8 @@ class ProxyService : Service() {
     @Volatile private var engine: Engine = Engine.BINARY
     @Volatile private var mode: Mode = Mode.MODEM
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var analytics: AnalyticsRecorder? = null
+    @Volatile private var lastNatRefreshMs = 0L
 
     @Volatile private var connStatus: ConnStatus = ConnStatus.STARTING
     @Volatile private var rxRate = 0L
@@ -141,21 +143,32 @@ class ProxyService : Service() {
 
     private fun parseAgentLine(line: String) {
         when {
-            line.contains("tunnel opened") -> activeTunnels++
-            line.contains("tunnel closed") -> activeTunnels = (activeTunnels - 1).coerceAtLeast(0)
+            line.contains("tunnel opened") -> {
+                activeTunnels++
+                analytics?.onTunnelOpen()
+            }
+            line.contains("tunnel closed") -> {
+                activeTunnels = (activeTunnels - 1).coerceAtLeast(0)
+                analytics?.onTunnelClose()
+            }
             line.contains("ws connected") -> {
                 connStatus = ConnStatus.CONNECTED
                 connectedSinceMs = System.currentTimeMillis()
-                wsUrlRe.find(line)?.let { currentRegistrator = it.groupValues[1] }
+                wsUrlRe.find(line)?.let {
+                    currentRegistrator = it.groupValues[1]
+                    analytics?.setRegistrator(currentRegistrator)
+                }
             }
             line.contains("selected") && line.contains("registrator") -> {
                 regSelectedRe.find(line)?.let {
                     currentRegistrator = "${it.groupValues[1]}:${it.groupValues[2]}"
+                    analytics?.setRegistrator(currentRegistrator)
                 }
             }
             line.contains("direct registrator configured") -> {
                 directRegRe.find(line)?.let {
                     currentRegistrator = "${it.groupValues[1]}:${it.groupValues[2]}"
+                    analytics?.setRegistrator(currentRegistrator)
                 }
             }
             line.contains("ws read error") ||
@@ -165,6 +178,7 @@ class ProxyService : Service() {
                 currentRegistrator = ""
                 activeTunnels = 0
                 connectedSinceMs = 0L
+                analytics?.resetActiveTunnels()
             }
             line.contains("balancer selection failed") ||
                 line.contains("no registrator available") -> {
@@ -172,6 +186,7 @@ class ProxyService : Service() {
                 currentRegistrator = ""
                 activeTunnels = 0
                 connectedSinceMs = 0L
+                analytics?.resetActiveTunnels()
             }
             line.contains("ws dialing") ||
                 line.contains("balancer request") -> {
@@ -280,6 +295,37 @@ class ProxyService : Service() {
                 PendingIntent.FLAG_IMMUTABLE))
             .setOngoing(true).build()
 
+    // Public IP refresh runs in-service so analytics buckets always have a
+    // best-known NAT value, even if the UI never opened. Throttled to once
+    // every 5 minutes — public IP shouldn't change unless we cycle.
+    private fun maybeRefreshNatIp() {
+        val now = System.currentTimeMillis()
+        if (now - lastNatRefreshMs < 5 * 60_000L) return
+        lastNatRefreshMs = now
+        Thread {
+            try {
+                for (url in listOf("https://api.ipify.org", "https://icanhazip.com")) {
+                    try {
+                        val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+                            connectTimeout = 4000
+                            readTimeout = 4000
+                            requestMethod = "GET"
+                            setRequestProperty("User-Agent", "ProxyAgent-Android")
+                        }
+                        val ip = conn.inputStream.bufferedReader().use { it.readText().trim() }
+                        conn.disconnect()
+                        if (ip.isNotEmpty() && ip.length < 40 &&
+                            (ip.matches(Regex("""\d{1,3}(\.\d{1,3}){3}""")) || ip.contains(":"))) {
+                            try { File(filesDir, "nat_ip").writeText(ip) } catch (_: Throwable) {}
+                            analytics?.setNatIp(ip)
+                            return@Thread
+                        }
+                    } catch (_: Throwable) {}
+                }
+            } catch (_: Throwable) {}
+        }.apply { isDaemon = true; name = "SvcNatIpFetch"; start() }
+    }
+
     private fun refreshTrafficStats() {
         val uid = android.os.Process.myUid()
         val rx = TrafficStats.getUidRxBytes(uid)
@@ -326,6 +372,10 @@ class ProxyService : Service() {
         state("starting")
         writeConnInfo()
 
+        // Spin up the analytics recorder before any agent log lines arrive so
+        // tunnel-open/close events are counted from the very first connection.
+        analytics = AnalyticsRecorder(this)
+
         try {
             val pm = getSystemService(POWER_SERVICE) as PowerManager
             wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Proxy::WL")
@@ -345,6 +395,8 @@ class ProxyService : Service() {
                     refreshTrafficStats()
                     nm.notify(1, buildNotification(statusText()))
                     writeConnInfo()
+                    analytics?.tick()
+                    maybeRefreshNatIp()
 
                     val threshold = readBatteryThreshold()
                     if (threshold > 0) {
@@ -713,6 +765,7 @@ class ProxyService : Service() {
         if (stopRequested) return
         stopRequested = true
         unregisterNetworkCallback()
+        try { analytics?.flush() } catch (_: Throwable) {}
         when (engine) {
             Engine.BINARY -> try {
                 agentProcess?.let { p ->

@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:background="#0f2a1f"
+    android:padding="12dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="CONNECTED TO REGISTRATOR"
+        android:textColor="#88ffaa"
+        android:textSize="10sp"
+        android:textStyle="bold"
+        android:letterSpacing="0.1" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_marginTop="4dp"
+        android:gravity="center_vertical">
+        <TextView
+            android:id="@+id/tvRegistrator"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="wrap_content"
+            android:text="—"
+            android:textColor="#00ff41"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:fontFamily="monospace" />
+        <TextView
+            android:id="@+id/tvUptime"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textColor="#88ffaa"
+            android:textSize="12sp"
+            android:fontFamily="monospace"
+            android:layout_marginStart="8dp" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/tvActivity"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text=""
+        android:textColor="#88ffaa"
+        android:textSize="12sp"
+        android:fontFamily="monospace"
+        android:layout_marginTop="6dp" />
+
+    <TextView
+        android:id="@+id/tvSwipeHint"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="‹ swipe for 24h graphs ›"
+        android:textColor="#557766"
+        android:textSize="9sp"
+        android:fontFamily="monospace"
+        android:layout_marginTop="4dp"
+        android:layout_gravity="center_horizontal" />
+
+</LinearLayout>

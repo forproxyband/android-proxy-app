@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:background="#0f2a1f"
+    android:padding="12dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical">
+        <TextView
+            android:id="@+id/tvChartTitle"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="wrap_content"
+            android:text="TRAFFIC · LAST 24H"
+            android:textColor="#88ffaa"
+            android:textSize="10sp"
+            android:textStyle="bold"
+            android:letterSpacing="0.1" />
+        <TextView
+            android:id="@+id/tvChartTotal"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textColor="#00ff41"
+            android:textSize="11sp"
+            android:fontFamily="monospace"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <com.proxyagent.app.MiniLineChart
+        android:id="@+id/chart"
+        android:layout_width="match_parent"
+        android:layout_height="80dp"
+        android:layout_marginTop="6dp" />
+
+</LinearLayout>
