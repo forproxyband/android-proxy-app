@@ -33,12 +33,14 @@ class ProxyService : Service() {
 
     enum class ConnStatus { STARTING, CONNECTING, CONNECTED, RECONNECTING, ERROR, STOPPED }
     enum class Engine { BINARY, AAR }
+    enum class Mode { MODEM, BALANCER }
 
     private var wakeLock: PowerManager.WakeLock? = null
     @Volatile private var stopRequested = false
     @Volatile private var agentProcess: Process? = null
     @Volatile private var runnerThread: Thread? = null
     @Volatile private var engine: Engine = Engine.BINARY
+    @Volatile private var mode: Mode = Mode.MODEM
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     @Volatile private var connStatus: ConnStatus = ConnStatus.STARTING
@@ -53,6 +55,7 @@ class ProxyService : Service() {
 
     private val regSelectedRe = Regex("""host=(\S+) port=(\d+)""")
     private val wsUrlRe = Regex("""url=wss?://([^/\s"]+)""")
+    private val directRegRe = Regex("""direct registrator configured.*?host=(\S+) port=(\d+)""")
 
     @Synchronized
     private fun log(msg: String) {
@@ -145,6 +148,11 @@ class ProxyService : Service() {
             }
             line.contains("selected") && line.contains("registrator") -> {
                 regSelectedRe.find(line)?.let {
+                    currentRegistrator = "${it.groupValues[1]}:${it.groupValues[2]}"
+                }
+            }
+            line.contains("direct registrator configured") -> {
+                directRegRe.find(line)?.let {
                     currentRegistrator = "${it.groupValues[1]}:${it.groupValues[2]}"
                 }
             }
@@ -256,9 +264,11 @@ class ProxyService : Service() {
         val host = intent.getStringExtra("host") ?: ""
         val port = intent.getStringExtra("port") ?: ""
         val key = intent.getStringExtra("key") ?: ""
+        val agentId = intent.getStringExtra("id")?.trim().orEmpty()
         val dnsRaw = intent.getStringExtra("dns")?.trim().orEmpty()
         val dns = dnsRaw.ifEmpty { "1.1.1.1,8.8.8.8" }
         engine = if (intent.getStringExtra("engine") == "aar") Engine.AAR else Engine.BINARY
+        mode = if (intent.getStringExtra("mode") == "balancer") Mode.BALANCER else Mode.MODEM
         if (host.isEmpty()) { stopSelf(); return START_NOT_STICKY }
 
         connStatus = ConnStatus.STARTING
@@ -316,10 +326,10 @@ class ProxyService : Service() {
             }
         }.apply { name = "StatusUpdater"; isDaemon = true; start() }
 
-        log("Engine: ${engine.name}")
+        log("Engine: ${engine.name}  Mode: ${mode.name}")
         val runner = when (engine) {
-            Engine.BINARY -> Thread { runBinaryEngine(host, port, key, dns) }
-            Engine.AAR -> Thread { runAarEngine(host, port, key, dns) }
+            Engine.BINARY -> Thread { runBinaryEngine(host, port, key, agentId, dns) }
+            Engine.AAR -> Thread { runAarEngine(host, port, key, agentId, dns) }
         }
         runner.name = "AgentRunner"
         runner.isDaemon = true
@@ -330,7 +340,7 @@ class ProxyService : Service() {
         return START_REDELIVER_INTENT
     }
 
-    private fun runBinaryEngine(host: String, port: String, key: String, dns: String) {
+    private fun runBinaryEngine(host: String, port: String, key: String, agentId: String, dns: String) {
         val binary = File(applicationInfo.nativeLibraryDir, "libproxyagent.so")
         if (!binary.exists()) {
             log("ERROR: libproxyagent.so missing at ${binary.absolutePath}")
@@ -344,19 +354,30 @@ class ProxyService : Service() {
         var backoffMs = 1000L
         while (!stopRequested) {
             try {
-                log("Launching subprocess: host=$host port=$port key=${mask(key)} dns=$dns")
+                log("Launching subprocess: mode=${mode.name} host=$host port=$port key=${mask(key)} id=${if (agentId.isEmpty()) "<empty>" else mask(agentId)} dns=$dns")
                 connStatus = ConnStatus.CONNECTING
                 val pb = ProcessBuilder(binary.absolutePath).redirectErrorStream(true)
                 pb.environment().apply {
-                    put("balancer_host", host)
-                    put("balancer_port", port)
                     put("agent_key", key)
                     put("enable_netagent", "true")
-                    put("fallback_file_url",
-                        "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json")
                     put("HOME", filesDir.absolutePath)
                     put("TMPDIR", cacheDir.absolutePath)
                     put("dns_servers", dns)
+                    when (mode) {
+                        Mode.MODEM -> {
+                            // Direct registrator: SDK skips balancer/fallback when both
+                            // registrator_host AND registrator_port are set.
+                            put("registrator_host", host)
+                            put("registrator_port", port)
+                            if (agentId.isNotEmpty()) put("agent_uuid", agentId)
+                        }
+                        Mode.BALANCER -> {
+                            put("balancer_host", host)
+                            put("balancer_port", port)
+                            put("fallback_file_url",
+                                "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json")
+                        }
+                    }
                 }
                 val proc = pb.start()
                 agentProcess = proc
@@ -414,12 +435,12 @@ class ProxyService : Service() {
     //
     // On stop we kill the :proxy process so the next start re-initializes
     // with fresh env.
-    private fun runAarEngine(host: String, port: String, key: String, dns: String) {
+    private fun runAarEngine(host: String, port: String, key: String, agentId: String, dns: String) {
         try {
             log("Capturing native stdout/stderr…")
             captureNativeOutput()
 
-            log("Setting environment: host=$host port=$port key=${mask(key)} dns=$dns")
+            log("Setting environment: mode=${mode.name} host=$host port=$port key=${mask(key)} id=${if (agentId.isEmpty()) "<empty>" else mask(agentId)} dns=$dns")
             // The SDK's Go config helper checks both lowercase ("balancer_host")
             // and SCREAMING_SNAKE ("BALANCER_HOST") names — set both so we
             // don't depend on the SDK's casing convention.
@@ -427,25 +448,50 @@ class ProxyService : Service() {
                 Os.setenv(name, value, true)
                 Os.setenv(name.uppercase(Locale.ROOT), value, true)
             }
-            setBoth("balancer_host", host)
-            setBoth("balancer_port", port)
             setBoth("agent_key", key)
             setBoth("enable_netagent", "true")
-            setBoth("fallback_file_url",
-                "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json")
             setBoth("dns_servers", dns)
             Os.setenv("HOME", filesDir.absolutePath, true)
             Os.setenv("TMPDIR", cacheDir.absolutePath, true)
+
+            when (mode) {
+                Mode.MODEM -> {
+                    // Direct registrator: SDK has no Java setRegistrator helper,
+                    // so we rely on env vars (config.FromEnvAndFlags reads
+                    // registrator_host/REGISTRATOR_HOST). Set BEFORE Go runtime
+                    // initializes via Class.forName("go.Seq") below.
+                    setBoth("registrator_host", host)
+                    setBoth("registrator_port", port)
+                    if (agentId.isNotEmpty()) setBoth("agent_uuid", agentId)
+                }
+                Mode.BALANCER -> {
+                    setBoth("balancer_host", host)
+                    setBoth("balancer_port", port)
+                    setBoth("fallback_file_url",
+                        "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json")
+                }
+            }
 
             connStatus = ConnStatus.CONNECTING
 
             // Diagnostic: dump what libc reports back, to confirm setenv stuck
             // in the current process. Shorter form so the agent_key isn't logged.
             try {
-                val h = Os.getenv("balancer_host") ?: "<null>"
-                val p = Os.getenv("balancer_port") ?: "<null>"
                 val k = Os.getenv("agent_key") ?: "<null>"
-                log("libc env check: balancer_host=$h balancer_port=$p agent_key=${if (k == "<null>") k else "set(${k.length}b)"}")
+                val keyMsg = "agent_key=${if (k == "<null>") k else "set(${k.length}b)"}"
+                when (mode) {
+                    Mode.MODEM -> {
+                        val rh = Os.getenv("registrator_host") ?: "<null>"
+                        val rp = Os.getenv("registrator_port") ?: "<null>"
+                        val uu = Os.getenv("agent_uuid") ?: "<null>"
+                        log("libc env check: registrator_host=$rh registrator_port=$rp agent_uuid=${if (uu == "<null>") uu else "set(${uu.length}b)"} $keyMsg")
+                    }
+                    Mode.BALANCER -> {
+                        val h = Os.getenv("balancer_host") ?: "<null>"
+                        val p = Os.getenv("balancer_port") ?: "<null>"
+                        log("libc env check: balancer_host=$h balancer_port=$p $keyMsg")
+                    }
+                }
             } catch (_: Throwable) {}
 
             log("Loading Go runtime via Class.forName(\"go.Seq\")…")
@@ -472,16 +518,20 @@ class ProxyService : Service() {
                 }
             }
             val portLong = port.toLongOrNull() ?: 0L
-            callSetter("setBalancer",
-                arrayOf<Class<*>>(String::class.java, Long::class.javaPrimitiveType!!),
-                host, portLong)
             callSetter("setAgentKey",
                 arrayOf<Class<*>>(String::class.java), key)
-            callSetter("setFallbackURL",
-                arrayOf<Class<*>>(String::class.java),
-                "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json")
             callSetter("setEnableNetAgent",
                 arrayOf<Class<*>>(Boolean::class.javaPrimitiveType!!), true)
+            if (mode == Mode.BALANCER) {
+                callSetter("setBalancer",
+                    arrayOf<Class<*>>(String::class.java, Long::class.javaPrimitiveType!!),
+                    host, portLong)
+                callSetter("setFallbackURL",
+                    arrayOf<Class<*>>(String::class.java),
+                    "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json")
+            }
+            // For modem mode, registrator_host/port/agent_uuid go via env only —
+            // the SDK has no Java setRegistrator/setAgentUUID at this AAR version.
             log("SDK setters ${if (sdkSettersOk) "applied" else "partial — some fell back to env"}")
 
             try {

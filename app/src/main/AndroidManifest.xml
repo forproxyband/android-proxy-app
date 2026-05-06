@@ -15,6 +15,12 @@
          without root. Suppressed lint warning: required by design. -->
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
         tools:ignore="ProtectedPermissions" />
+    <!-- QR code scanning for modem-tunnel config import. Camera is opened
+         by the embedded ZXing CaptureActivity; runtime permission is
+         requested by the library on first use. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
 
     <application
         android:allowBackup="false"

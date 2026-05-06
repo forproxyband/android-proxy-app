@@ -34,6 +34,8 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -77,6 +79,22 @@ class MainActivity : AppCompatActivity() {
     private val importLauncher: ActivityResultLauncher<Array<String>> =
         registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
             if (uri != null) importSettingsFromUri(uri)
+        }
+
+    // Holds references to the open settings dialog so the QR-scan result can
+    // populate fields without re-creating the dialog. Cleared on dismiss.
+    private var dlgEtHost: EditText? = null
+    private var dlgEtPort: EditText? = null
+    private var dlgEtKey: EditText? = null
+    private var dlgEtId: EditText? = null
+    private var dlgEtDns: EditText? = null
+    private var dlgRbModeModem: RadioButton? = null
+
+    private val qrLauncher: ActivityResultLauncher<ScanOptions> =
+        registerForActivityResult(ScanContract()) { result ->
+            val text = result?.contents
+            if (text.isNullOrBlank()) return@registerForActivityResult
+            applyQrPayload(text)
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -218,25 +236,49 @@ class MainActivity : AppCompatActivity() {
         val etHost = view.findViewById<EditText>(R.id.etHost)
         val etPort = view.findViewById<EditText>(R.id.etPort)
         val etKey = view.findViewById<EditText>(R.id.etKey)
+        val etId = view.findViewById<EditText>(R.id.etId)
         val etDns = view.findViewById<EditText>(R.id.etDns)
         val cbSpeedBytes = view.findViewById<CheckBox>(R.id.cbSpeedBytes)
         val rgEngine = view.findViewById<RadioGroup>(R.id.rgEngine)
         val rbEngineBinary = view.findViewById<RadioButton>(R.id.rbEngineBinary)
         val rbEngineAar = view.findViewById<RadioButton>(R.id.rbEngineAar)
+        val rgMode = view.findViewById<RadioGroup>(R.id.rgMode)
+        val rbModeModem = view.findViewById<RadioButton>(R.id.rbModeModem)
+        val rbModeBalancer = view.findViewById<RadioButton>(R.id.rbModeBalancer)
         val btnImport = view.findViewById<Button>(R.id.btnImport)
         val btnExport = view.findViewById<Button>(R.id.btnExport)
+        val btnScanQr = view.findViewById<Button>(R.id.btnScanQr)
+        val tvScanQrHint = view.findViewById<TextView>(R.id.tvScanQrHint)
         val prefs = getSharedPreferences("cfg", 0)
+
+        fun applyModeVisibility(modemMode: Boolean) {
+            etId.visibility = if (modemMode) View.VISIBLE else View.GONE
+            btnScanQr.visibility = if (modemMode) View.VISIBLE else View.GONE
+            tvScanQrHint.visibility = if (modemMode) View.VISIBLE else View.GONE
+        }
 
         fun loadFromPrefs() {
             etHost.setText(prefs.getString("h", ""))
             etPort.setText(prefs.getString("p", ""))
             etKey.setText(prefs.getString("k", ""))
+            etId.setText(prefs.getString("id", ""))
             etDns.setText(prefs.getString("dns", ""))
             cbSpeedBytes.isChecked = prefs.getBoolean("speed_bytes", false)
             if (prefs.getString("engine", "binary") == "aar") rbEngineAar.isChecked = true
             else rbEngineBinary.isChecked = true
+            val modemMode = prefs.getString("mode", "modem") == "modem"
+            if (modemMode) rbModeModem.isChecked = true else rbModeBalancer.isChecked = true
+            applyModeVisibility(modemMode)
         }
         loadFromPrefs()
+
+        rgMode.setOnCheckedChangeListener { _, checkedId ->
+            applyModeVisibility(checkedId == R.id.rbModeModem)
+        }
+
+        // Expose the dialog widgets to the QR-result callback.
+        dlgEtHost = etHost; dlgEtPort = etPort; dlgEtKey = etKey
+        dlgEtId = etId; dlgEtDns = etDns; dlgRbModeModem = rbModeModem
 
         val dialog = AlertDialog.Builder(this)
             .setTitle("Connection settings")
@@ -245,6 +287,7 @@ class MainActivity : AppCompatActivity() {
                 val h = etHost.text.toString().trim()
                 val p = etPort.text.toString().trim()
                 val k = etKey.text.toString().trim()
+                val id = etId.text.toString().trim()
                 val d = etDns.text.toString().trim()
                 if (h.isEmpty() || p.isEmpty() || k.isEmpty()) {
                     Toast.makeText(this, "Host / Port / Key are required", Toast.LENGTH_SHORT).show()
@@ -252,31 +295,42 @@ class MainActivity : AppCompatActivity() {
                 }
                 val speedBytes = cbSpeedBytes.isChecked
                 val newEngine = if (rgEngine.checkedRadioButtonId == R.id.rbEngineAar) "aar" else "binary"
+                val newMode = if (rgMode.checkedRadioButtonId == R.id.rbModeBalancer) "balancer" else "modem"
                 val engineChanged = prefs.getString("engine", "binary") != newEngine
+                val modeChanged = prefs.getString("mode", "modem") != newMode
                 prefs.edit()
-                    .putString("h", h).putString("p", p).putString("k", k).putString("dns", d)
+                    .putString("h", h).putString("p", p).putString("k", k)
+                    .putString("id", id).putString("dns", d)
                     .putBoolean("speed_bytes", speedBytes)
                     .putString("engine", newEngine)
+                    .putString("mode", newMode)
                     .apply()
                 try { File(filesDir, "speed_units").writeText(if (speedBytes) "bytes" else "bits") }
                 catch (_: Throwable) {}
                 val running = readFile("proxy_state").let { it == "running" || it == "starting" }
                 val msg = when {
-                    running && engineChanged -> "Saved — stop & restart to switch engine"
+                    running && (engineChanged || modeChanged) -> "Saved — stop & restart to apply"
                     running -> "Saved — restart agent to apply"
                     else -> "Saved"
                 }
                 Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("Cancel", null)
+            .setOnDismissListener {
+                dlgEtHost = null; dlgEtPort = null; dlgEtKey = null
+                dlgEtId = null; dlgEtDns = null; dlgRbModeModem = null
+            }
             .create()
 
         btnExport.setOnClickListener {
             // Export *current dialog state* (user may have edited but not saved).
+            val mode = if (rgMode.checkedRadioButtonId == R.id.rbModeBalancer) "balancer" else "modem"
             exportConnectionSettings(
+                mode = mode,
                 host = etHost.text.toString().trim(),
                 port = etPort.text.toString().trim(),
                 key = etKey.text.toString().trim(),
+                id = etId.text.toString().trim(),
                 dns = etDns.text.toString().trim(),
             )
         }
@@ -284,25 +338,83 @@ class MainActivity : AppCompatActivity() {
             dialog.dismiss()
             importLauncher.launch(arrayOf("text/plain", "application/octet-stream", "*/*"))
         }
+        btnScanQr.setOnClickListener {
+            val opts = ScanOptions().apply {
+                setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                setPrompt("Point camera at the tunnel QR")
+                setBeepEnabled(false)
+                setOrientationLocked(false)
+            }
+            qrLauncher.launch(opts)
+        }
 
         dialog.show()
     }
 
-    // Export/import only connection fields — host/port/key/dns.
+    // Apply a scanned QR payload (key=value lines, same format as export file).
+    // QR is treated as a modem-tunnel config: switches mode to modem and fills
+    // host/port/key/id/dns into the open dialog. If the dialog is closed (e.g.
+    // process died and result resumed), the values are persisted to prefs.
+    private fun applyQrPayload(text: String) {
+        val map = parseKeyValueLines(text)
+        val keys = setOf("host", "port", "key", "id", "dns")
+        if (map.keys.intersect(keys).isEmpty()) {
+            Toast.makeText(this, "QR: no recognizable fields", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        // Update the open dialog if it's still around; otherwise persist directly.
+        val host = dlgEtHost
+        if (host != null) {
+            map["host"]?.let { host.setText(it) }
+            map["port"]?.let { dlgEtPort?.setText(it) }
+            map["key"]?.let { dlgEtKey?.setText(it) }
+            map["id"]?.let { dlgEtId?.setText(it) }
+            map["dns"]?.let { dlgEtDns?.setText(it) }
+            dlgRbModeModem?.isChecked = true
+        } else {
+            val ed = getSharedPreferences("cfg", 0).edit()
+            map["host"]?.let { ed.putString("h", it) }
+            map["port"]?.let { ed.putString("p", it) }
+            map["key"]?.let { ed.putString("k", it) }
+            map["id"]?.let { ed.putString("id", it) }
+            map["dns"]?.let { ed.putString("dns", it) }
+            ed.putString("mode", "modem").apply()
+        }
+        Toast.makeText(this, "QR applied: ${map.keys.intersect(keys).joinToString(", ")}", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun parseKeyValueLines(content: String): HashMap<String, String> {
+        val map = HashMap<String, String>()
+        for (raw in content.lines()) {
+            val line = raw.trim()
+            if (line.isEmpty() || line.startsWith("#")) continue
+            val eq = line.indexOf('=')
+            if (eq <= 0) continue
+            map[line.substring(0, eq).trim().lowercase(Locale.ROOT)] = line.substring(eq + 1).trim()
+        }
+        return map
+    }
+
+    // Export/import only connection fields — mode/host/port/key/id/dns.
     // Display prefs (speed_bytes, bat_threshold, logs_expanded) stay per-device.
-    private fun exportConnectionSettings(host: String, port: String, key: String, dns: String) {
+    private fun exportConnectionSettings(
+        mode: String, host: String, port: String, key: String, id: String, dns: String,
+    ) {
         try {
             val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
             val content = buildString {
                 appendLine("# Proxy Agent — Connection Settings Export")
                 appendLine("# Generated: $stamp")
                 appendLine("# Import via settings dialog → IMPORT.")
-                appendLine("# Only host/port/key/dns are ex/imported. Other preferences")
+                appendLine("# Only mode/host/port/key/id/dns are ex/imported. Other prefs")
                 appendLine("# (speed units, battery threshold) stay local to each device.")
                 appendLine()
+                appendLine("mode=$mode")
                 appendLine("host=$host")
                 appendLine("port=$port")
                 appendLine("key=$key")
+                appendLine("id=$id")
                 appendLine("dns=$dns")
             }
             val exportDir = File(filesDir, "exports").apply { mkdirs() }
@@ -328,16 +440,9 @@ class MainActivity : AppCompatActivity() {
             } ?: run {
                 Toast.makeText(this, "Import: cannot read file", Toast.LENGTH_SHORT).show(); return
             }
-            val map = HashMap<String, String>()
-            for (raw in content.lines()) {
-                val line = raw.trim()
-                if (line.isEmpty() || line.startsWith("#")) continue
-                val eq = line.indexOf('=')
-                if (eq <= 0) continue
-                map[line.substring(0, eq).trim()] = line.substring(eq + 1).trim()
-            }
+            val map = parseKeyValueLines(content)
             // Only connection keys are honored. Everything else in the file ignored.
-            val allowed = setOf("host", "port", "key", "dns")
+            val allowed = setOf("mode", "host", "port", "key", "id", "dns")
             val applied = map.keys.intersect(allowed)
             if (applied.isEmpty()) {
                 Toast.makeText(this, "Import: no connection settings in file", Toast.LENGTH_SHORT).show()
@@ -348,7 +453,12 @@ class MainActivity : AppCompatActivity() {
             map["host"]?.let { ed.putString("h", it) }
             map["port"]?.let { ed.putString("p", it) }
             map["key"]?.let { ed.putString("k", it) }
+            map["id"]?.let { ed.putString("id", it) }
             map["dns"]?.let { ed.putString("dns", it) }
+            map["mode"]?.let {
+                val m = it.lowercase(Locale.ROOT)
+                if (m == "modem" || m == "balancer") ed.putString("mode", m)
+            }
             ed.apply()
             Toast.makeText(this, "Imported: ${applied.joinToString(", ")}", Toast.LENGTH_SHORT).show()
             showSettingsDialog()   // reopen with fresh values
@@ -402,9 +512,15 @@ class MainActivity : AppCompatActivity() {
     private fun showConfigurePrompt() {
         AlertDialog.Builder(this)
             .setTitle("Connection not configured")
-            .setMessage("Host / Port / Key are required. Import settings from a .txt file, or fill them in manually.")
-            .setPositiveButton("Import") { _, _ ->
-                importLauncher.launch(arrayOf("text/plain", "application/octet-stream", "*/*"))
+            .setMessage("Host / Port / Key are required. Scan a tunnel QR, import a .txt, or fill them in manually.")
+            .setPositiveButton("Scan QR") { _, _ ->
+                val opts = ScanOptions().apply {
+                    setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                    setPrompt("Point camera at the tunnel QR")
+                    setBeepEnabled(false)
+                    setOrientationLocked(false)
+                }
+                qrLauncher.launch(opts)
             }
             .setNeutralButton("Configure") { _, _ -> showSettingsDialog() }
             .setNegativeButton("Cancel", null)
@@ -589,6 +705,7 @@ class MainActivity : AppCompatActivity() {
         val h = prefs.getString("h", "")?.trim().orEmpty()
         val po = prefs.getString("p", "")?.trim().orEmpty()
         val k = prefs.getString("k", "")?.trim().orEmpty()
+        val id = prefs.getString("id", "")?.trim().orEmpty()
         val d = prefs.getString("dns", "")?.trim().orEmpty()
         if (h.isEmpty() || po.isEmpty() || k.isEmpty()) return false
 
@@ -597,10 +714,13 @@ class MainActivity : AppCompatActivity() {
         File(filesDir, "conn_info").delete()
 
         val engine = prefs.getString("engine", "binary") ?: "binary"
+        val mode = prefs.getString("mode", "modem") ?: "modem"
         return try {
             val svc = Intent(this, ProxyService::class.java).apply {
-                putExtra("host", h); putExtra("port", po); putExtra("key", k); putExtra("dns", d)
+                putExtra("host", h); putExtra("port", po); putExtra("key", k)
+                putExtra("id", id); putExtra("dns", d)
                 putExtra("engine", engine)
+                putExtra("mode", mode)
             }
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc) else startService(svc)
             tvStatus.text = "STARTING..."
