@@ -56,6 +56,8 @@ class ProxyService : Service() {
     private val regSelectedRe = Regex("""host=(\S+) port=(\d+)""")
     private val wsUrlRe = Regex("""url=wss?://([^/\s"]+)""")
     private val directRegRe = Regex("""direct registrator configured.*?host=(\S+) port=(\d+)""")
+    private val rebootReasonRe = Regex("""reason=(.*)$""")
+    @Volatile private var autoCycling = false
 
     @Synchronized
     private fun log(msg: String) {
@@ -175,7 +177,55 @@ class ProxyService : Service() {
                 line.contains("balancer request") -> {
                 if (connStatus != ConnStatus.CONNECTED) connStatus = ConnStatus.CONNECTING
             }
+            // Server-side REBOOT command. The SDK logs this whenever the
+            // registrator pushes REBOOT over the WS, regardless of whether the
+            // local-WS relay is enabled. Same behavior as the manual ↻ button:
+            // toggle cellular to grab a new carrier IP, then reconnect.
+            line.contains("REBOOT received from registrator") -> {
+                val reason = rebootReasonRe.find(line)?.groupValues?.get(1).orEmpty().trim()
+                triggerAutoIpCycle(reason)
+            }
         }
+    }
+
+    private fun triggerAutoIpCycle(reason: String) {
+        if (autoCycling) {
+            log("Auto IP-cycle already in progress; ignoring REBOOT (reason=\"$reason\")")
+            return
+        }
+        if (stopRequested) return
+        autoCycling = true
+        Thread {
+            try {
+                log("REBOOT auto-cycle: starting (reason=\"$reason\", engine=${engine.name})")
+                // Toggle cellular first. The subprocess will see its WS read
+                // error and enter the SDK's internal backoff loop on its own —
+                // we don't kill it pre-emptively because that would race our
+                // own runner's backoff sleep, restarting it mid-toggle.
+                val toggled = IpCycle.toggleMobileNetworkViaRoot() ||
+                    IpCycle.toggleMobileNetworkViaSecureSettings(this)
+                if (!toggled) {
+                    log("REBOOT auto-cycle: cellular toggle unavailable (no root, " +
+                        "no WRITE_SECURE_SETTINGS); reconnecting on existing IP")
+                } else {
+                    log("REBOOT auto-cycle: cellular toggled, waiting for re-attach")
+                    // Small grace for the radio to come back before we reconnect.
+                    try { Thread.sleep(2000) } catch (_: InterruptedException) {}
+                }
+                if (!stopRequested) {
+                    // For BINARY this kills the subprocess + interrupts our
+                    // runner so it re-dials with fresh state on the new IP.
+                    // For AAR this is a no-op; the in-process SDK reconnects
+                    // on its own after the WS read error from the toggle.
+                    forceReconnect("REBOOT auto-cycle")
+                    log("REBOOT auto-cycle: reconnect kicked")
+                }
+            } catch (e: Throwable) {
+                log("REBOOT auto-cycle error: ${e.message}")
+            } finally {
+                autoCycling = false
+            }
+        }.apply { name = "AutoIpCycler"; isDaemon = true; start() }
     }
 
     private fun readSpeedUnitsBytes(): Boolean = try {

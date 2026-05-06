@@ -1,9 +1,11 @@
 package com.proxyagent.app
 
 import android.Manifest
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -34,6 +36,12 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.BinaryBitmap
+import com.google.zxing.DecodeHintType
+import com.google.zxing.MultiFormatReader
+import com.google.zxing.RGBLuminanceSource
+import com.google.zxing.common.HybridBinarizer
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import java.io.File
@@ -93,8 +101,19 @@ class MainActivity : AppCompatActivity() {
     private val qrLauncher: ActivityResultLauncher<ScanOptions> =
         registerForActivityResult(ScanContract()) { result ->
             val text = result?.contents
-            if (text.isNullOrBlank()) return@registerForActivityResult
+            if (text.isNullOrBlank()) {
+                Toast.makeText(this, "QR scan cancelled", Toast.LENGTH_SHORT).show()
+                return@registerForActivityResult
+            }
             applyQrPayload(text)
+        }
+
+    // Falls back to picking a QR image from gallery when the live camera scan
+    // can't lock on (dense codes, autofocus issues). Decoded via ZXing core.
+    private val qrImageLauncher: ActivityResultLauncher<String> =
+        registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+            if (uri == null) return@registerForActivityResult
+            decodeQrFromUri(uri)
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -338,15 +357,7 @@ class MainActivity : AppCompatActivity() {
             dialog.dismiss()
             importLauncher.launch(arrayOf("text/plain", "application/octet-stream", "*/*"))
         }
-        btnScanQr.setOnClickListener {
-            val opts = ScanOptions().apply {
-                setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                setPrompt("Point camera at the tunnel QR")
-                setBeepEnabled(false)
-                setOrientationLocked(false)
-            }
-            qrLauncher.launch(opts)
-        }
+        btnScanQr.setOnClickListener { showQrSourceChooser() }
 
         dialog.show()
     }
@@ -512,19 +523,86 @@ class MainActivity : AppCompatActivity() {
     private fun showConfigurePrompt() {
         AlertDialog.Builder(this)
             .setTitle("Connection not configured")
-            .setMessage("Host / Port / Key are required. Scan a tunnel QR, import a .txt, or fill them in manually.")
-            .setPositiveButton("Scan QR") { _, _ ->
-                val opts = ScanOptions().apply {
-                    setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                    setPrompt("Point camera at the tunnel QR")
-                    setBeepEnabled(false)
-                    setOrientationLocked(false)
-                }
-                qrLauncher.launch(opts)
-            }
+            .setMessage("Host / Port / Key are required. Scan a tunnel QR, paste it from clipboard, or fill in manually.")
+            .setPositiveButton("Scan QR") { _, _ -> showQrSourceChooser() }
             .setNeutralButton("Configure") { _, _ -> showSettingsDialog() }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    // Three independent ways to ingest a QR config: live camera, picking an
+    // image from gallery (decoded offline), or pasting the plain text payload
+    // shown next to the QR in the dashboard. Camera fails on dense QRs +
+    // weak autofocus, so the alternatives matter for real-world use.
+    private fun showQrSourceChooser() {
+        val items = arrayOf("Camera (live scan)", "Pick QR image from gallery", "Paste from clipboard")
+        AlertDialog.Builder(this)
+            .setTitle("Import tunnel QR")
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> qrLauncher.launch(buildScanOptions())
+                    1 -> qrImageLauncher.launch("image/*")
+                    2 -> applyClipboardQr()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // setOrientationLocked(true) + custom portrait CaptureActivity prevents the
+    // library's default sensorLandscape activity from showing the "rotate the
+    // phone" overlay on portrait-only apps.
+    private fun buildScanOptions(): ScanOptions = ScanOptions().apply {
+        setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+        setPrompt("Point camera at the tunnel QR · close-up + good light helps with dense codes")
+        setBeepEnabled(false)
+        setBarcodeImageEnabled(false)
+        setOrientationLocked(true)
+        setCaptureActivity(PortraitCaptureActivity::class.java)
+    }
+
+    private fun applyClipboardQr() {
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = cm.primaryClip
+            val text = if (clip != null && clip.itemCount > 0) {
+                clip.getItemAt(0).coerceToText(this).toString()
+            } else ""
+            if (text.isBlank()) {
+                Toast.makeText(this, "Clipboard is empty", Toast.LENGTH_SHORT).show()
+                return
+            }
+            applyQrPayload(text)
+        } catch (e: Throwable) {
+            Toast.makeText(this, "Clipboard read failed: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun decodeQrFromUri(uri: Uri) {
+        try {
+            val bitmap = contentResolver.openInputStream(uri).use { input ->
+                if (input == null) null else BitmapFactory.decodeStream(input)
+            } ?: run {
+                Toast.makeText(this, "QR: cannot read image", Toast.LENGTH_SHORT).show()
+                return
+            }
+            val w = bitmap.width
+            val h = bitmap.height
+            val pixels = IntArray(w * h)
+            bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+            val source = RGBLuminanceSource(w, h, pixels)
+            val binary = BinaryBitmap(HybridBinarizer(source))
+            val reader = MultiFormatReader().apply {
+                setHints(mapOf(
+                    DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE),
+                    DecodeHintType.TRY_HARDER to true,
+                ))
+            }
+            val result = reader.decodeWithState(binary)
+            applyQrPayload(result.text)
+        } catch (e: Throwable) {
+            Toast.makeText(this, "QR: decode failed (${e.javaClass.simpleName})", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun hasConnectionConfig(): Boolean {
@@ -599,7 +677,8 @@ class MainActivity : AppCompatActivity() {
                 stage = "cycling network"
                 runOnUiThread { tvStatus.text = "CYCLING NETWORK…"; tvStatus.setTextColor(0xFFFFAA00.toInt()) }
 
-                val auto = toggleMobileNetworkViaRoot() || toggleMobileNetworkViaSecureSettings()
+                val auto = IpCycle.toggleMobileNetworkViaRoot() ||
+                    IpCycle.toggleMobileNetworkViaSecureSettings(this)
                 if (!auto) {
                     runOnUiThread {
                         Toast.makeText(
@@ -646,58 +725,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }.apply { name = "IpCycler"; isDaemon = true; start() }
-    }
-
-    // `svc data` is fastest and least disruptive (keeps voice/SMS up). If it
-    // doesn't fly, fall back to airplane mode which always cuts the radio.
-    private fun toggleMobileNetworkViaRoot(): Boolean {
-        if (runRoot("svc data disable")) {
-            try { Thread.sleep(2500) } catch (_: InterruptedException) {}
-            if (runRoot("svc data enable")) return true
-        }
-        val onOk = runRoot("settings put global airplane_mode_on 1") &&
-            runRoot("am broadcast -a android.intent.action.AIRPLANE_MODE --ez state true")
-        if (onOk) {
-            try { Thread.sleep(3500) } catch (_: InterruptedException) {}
-            runRoot("settings put global airplane_mode_on 0")
-            runRoot("am broadcast -a android.intent.action.AIRPLANE_MODE --ez state false")
-            return true
-        }
-        return false
-    }
-
-    private fun runRoot(cmd: String): Boolean {
-        return try {
-            val p = ProcessBuilder("su", "-c", cmd).redirectErrorStream(true).start()
-            // Drain output so the child doesn't block on a full pipe.
-            Thread { try { p.inputStream.bufferedReader().use { it.readText() } } catch (_: Throwable) {} }
-                .apply { isDaemon = true; start() }
-            val finished = p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
-            if (!finished) { p.destroy(); return false }
-            p.exitValue() == 0
-        } catch (_: Throwable) { false }
-    }
-
-    // Toggles airplane mode by writing Settings.Global directly. Throws
-    // SecurityException if WRITE_SECURE_SETTINGS hasn't been granted via
-    // `adb shell pm grant`. The protected ACTION_AIRPLANE_MODE_CHANGED
-    // broadcast is rejected for non-system apps; we attempt it anyway because
-    // some OEM ROMs need it on top of the setting change.
-    private fun toggleMobileNetworkViaSecureSettings(): Boolean {
-        return try {
-            val cr = contentResolver
-            Settings.Global.putInt(cr, Settings.Global.AIRPLANE_MODE_ON, 1)
-            try {
-                sendBroadcast(Intent(Intent.ACTION_AIRPLANE_MODE_CHANGED).putExtra("state", true))
-            } catch (_: Throwable) {}
-            try { Thread.sleep(3500) } catch (_: InterruptedException) {}
-            Settings.Global.putInt(cr, Settings.Global.AIRPLANE_MODE_ON, 0)
-            try {
-                sendBroadcast(Intent(Intent.ACTION_AIRPLANE_MODE_CHANGED).putExtra("state", false))
-            } catch (_: Throwable) {}
-            true
-        } catch (_: SecurityException) { false }
-        catch (_: Throwable) { false }
     }
 
     private fun startProxyService(): Boolean {

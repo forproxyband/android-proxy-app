@@ -38,6 +38,22 @@
             </intent-filter>
         </activity>
 
+        <!-- Portrait-locked CaptureActivity for ZXing embedded scanner.
+             Default CaptureActivity is sensorLandscape; on portrait phones it
+             shows the "rotate device" overlay instead of the camera preview.
+             configChanges keeps the camera preview alive if the user rotates
+             mid-scan — without it the activity restarts and the user sees a
+             black flash. -->
+        <activity
+            android:name=".PortraitCaptureActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:stateNotNeeded="true"
+            android:configChanges="keyboardHidden|orientation|screenSize"
+            android:theme="@style/zxing_CaptureTheme"
+            android:windowSoftInputMode="stateAlwaysHidden"
+            tools:ignore="LockedOrientationActivity" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

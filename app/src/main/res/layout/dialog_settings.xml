@@ -79,7 +79,7 @@
         android:id="@+id/tvScanQrHint"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Scan a tunnel QR (host/port/key/id) to auto-fill modem settings."
+        android:text="QR import auto-fills modem settings. Pick: live camera, image from gallery, or paste plain text from clipboard."
         android:textSize="10sp"
         android:textColor="#666666"
         android:layout_marginBottom="14dp" />
