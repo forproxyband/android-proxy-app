@@ -1148,26 +1148,30 @@ class MainActivity : AppCompatActivity() {
         tvNetwork.text = "$wan  ·  $transport"
 
         if (pendingAction != "stop" && connStatus == "CONNECTED" && registrator.isNotEmpty()) {
-            registratorPanel.visibility = View.VISIBLE
-            pagerRefs.tvRegistrator?.text = registrator
-            pagerRefs.tvUptime?.text = if (connectedSinceMs > 0)
-                "up ${formatDuration(System.currentTimeMillis() - connectedSinceMs)}"
-            else ""
-            pagerRefs.tvActivity?.text = when {
-                tunnels == 0 -> "◦ idle — no connections"
-                else -> "⚡ $tunnels ${if (tunnels == 1) "connection" else "connections"} · " +
-                    "↓${humanRate(rxRate)} ↑${humanRate(txRate)}"
-            }
-            // Refresh charts at most every 30s — they cover 24h, sub-minute updates
-            // are visually pointless and re-reading the JSONL on every tick wastes IO.
-            val nowMs = System.currentTimeMillis()
-            if (registratorPager.currentItem != 0 &&
-                nowMs - lastPanelDataAtMs > 30_000L) {
-                lastPanelDataAtMs = nowMs
-                refreshPanelCharts()
+            try {
+                registratorPanel.visibility = View.VISIBLE
+                pagerRefs.tvRegistrator?.text = registrator
+                pagerRefs.tvUptime?.text = if (connectedSinceMs > 0)
+                    "up ${formatDuration(System.currentTimeMillis() - connectedSinceMs)}"
+                else ""
+                pagerRefs.tvActivity?.text = when {
+                    tunnels == 0 -> "◦ idle — no connections"
+                    else -> "⚡ $tunnels ${if (tunnels == 1) "connection" else "connections"} · " +
+                        "↓${humanRate(rxRate)} ↑${humanRate(txRate)}"
+                }
+                // Refresh charts at most every 30s — they cover 24h, sub-minute updates
+                // are visually pointless and re-reading the JSONL on every tick wastes IO.
+                val nowMs = System.currentTimeMillis()
+                if (registratorPager.currentItem != 0 &&
+                    nowMs - lastPanelDataAtMs > 30_000L) {
+                    lastPanelDataAtMs = nowMs
+                    refreshPanelCharts()
+                }
+            } catch (e: Throwable) {
+                android.util.Log.e("ProxyAgent", "panel refresh failed", e)
             }
         } else {
-            registratorPanel.visibility = View.GONE
+            try { registratorPanel.visibility = View.GONE } catch (_: Throwable) {}
         }
 
         if (svLogs.visibility == View.VISIBLE) {
