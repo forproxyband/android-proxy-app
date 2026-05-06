@@ -29,6 +29,12 @@
         android:theme="@style/Theme.AndroidProxyApp"
         android:networkSecurityConfig="@xml/network_security_config">
 
+        <!-- Hint to Play Store to pre-download the ML Kit code-scanner module
+             after install, so first scan doesn't have to wait for a download. -->
+        <meta-data
+            android:name="com.google.mlkit.vision.DEPENDENCIES"
+            android:value="barcode_ui" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true">

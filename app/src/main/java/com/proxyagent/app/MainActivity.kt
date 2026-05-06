@@ -36,6 +36,9 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
+import com.google.mlkit.vision.barcode.common.Barcode
+import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.BinaryBitmap
 import com.google.zxing.DecodeHintType
@@ -530,23 +533,56 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    // Three independent ways to ingest a QR config: live camera, picking an
-    // image from gallery (decoded offline), or pasting the plain text payload
-    // shown next to the QR in the dashboard. Camera fails on dense QRs +
-    // weak autofocus, so the alternatives matter for real-world use.
+    // Three independent ways to ingest a QR config: live camera (Google ML
+    // Kit code scanner — way more robust than ZXing on stylized/dense QRs),
+    // picking an image from gallery (decoded via ZXing offline), or pasting
+    // the plain text payload shown next to the QR in the dashboard.
     private fun showQrSourceChooser() {
-        val items = arrayOf("Camera (live scan)", "Pick QR image from gallery", "Paste from clipboard")
+        val items = arrayOf("Camera (Google scanner)", "Pick QR image from gallery", "Paste from clipboard")
         AlertDialog.Builder(this)
             .setTitle("Import tunnel QR")
             .setItems(items) { _, which ->
                 when (which) {
-                    0 -> qrLauncher.launch(buildScanOptions())
+                    0 -> launchGoogleCodeScanner()
                     1 -> qrImageLauncher.launch("image/*")
                     2 -> applyClipboardQr()
                 }
             }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    // Google ML Kit code scanner — Play-Services-backed, no CAMERA permission
+    // needed, handles stylized/dense QRs that ZXing struggles with. Falls back
+    // to ZXing when Play Services is missing or the scan client errors.
+    private fun launchGoogleCodeScanner() {
+        try {
+            val options = GmsBarcodeScannerOptions.Builder()
+                .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+                .build()
+            val scanner = GmsBarcodeScanning.getClient(this, options)
+            scanner.startScan()
+                .addOnSuccessListener { barcode ->
+                    val text = barcode.rawValue
+                    if (text.isNullOrBlank()) {
+                        Toast.makeText(this, "QR: empty payload", Toast.LENGTH_SHORT).show()
+                    } else {
+                        applyQrPayload(text)
+                    }
+                }
+                .addOnCanceledListener {
+                    Toast.makeText(this, "QR scan cancelled", Toast.LENGTH_SHORT).show()
+                }
+                .addOnFailureListener { e ->
+                    Toast.makeText(this, "Google scanner failed (${e.message}); falling back to ZXing",
+                        Toast.LENGTH_LONG).show()
+                    qrLauncher.launch(buildScanOptions())
+                }
+        } catch (e: Throwable) {
+            Toast.makeText(this, "No Play Services scanner; falling back to ZXing",
+                Toast.LENGTH_SHORT).show()
+            qrLauncher.launch(buildScanOptions())
+        }
     }
 
     // setOrientationLocked(true) + custom portrait CaptureActivity prevents the

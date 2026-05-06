@@ -72,5 +72,11 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.constraintlayout:constraintlayout:2.2.0")
+    // Google Code Scanner (ML Kit) — primary QR scanner. Works on stylized /
+    // dense codes that ZXing's CameraX-less BarcodeView misses. No CAMERA
+    // permission needed — Play Services owns the camera pipeline.
+    implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
+    // ZXing kept as fallback: gallery image decoding + offline scanner on
+    // devices without Play Services.
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 }
