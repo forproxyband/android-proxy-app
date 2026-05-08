@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -368,7 +369,15 @@ class ProxyService : Service() {
         if (host.isEmpty()) { stopSelf(); return START_NOT_STICKY }
 
         connStatus = ConnStatus.STARTING
-        startForeground(1, buildNotification(statusText()))
+        // Android 14+ ties FGS time-limits to the type. specialUse has no
+        // 6h/24h dataSync cap, but the system silently treats absent type as
+        // "unknown" and time-limits it too. Pass type explicitly.
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(1, buildNotification(statusText()),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(1, buildNotification(statusText()))
+        }
         state("starting")
         writeConnInfo()
 
