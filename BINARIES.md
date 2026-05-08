@@ -4,7 +4,7 @@ These binaries are built from upstream `proxy-agent` and are embedded into the
 APK at build time. The files at the repository root are staging copies kept
 there for easy refresh; the actual build consumes the copies under `app/`.
 
-## Version: v2.0.9 (updated 2026-05-08)
+## Version: v2.0.10 (updated 2026-05-08)
 
 | Artifact | Role in the APK | Path in the repo |
 | --- | --- | --- |
