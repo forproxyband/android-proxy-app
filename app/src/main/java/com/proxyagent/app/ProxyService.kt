@@ -58,6 +58,11 @@ class ProxyService : Service() {
 
     private val regSelectedRe = Regex("""host=(\S+) port=(\d+)""")
     private val wsUrlRe = Regex("""url=wss?://([^/\s"]+)""")
+    // New yamux-uplink log line: `msg="uplink dialing" endpoint=host:port`.
+    // No URL anymore (transport is plain TCP + yamux), so we read the
+    // endpoint key directly. Used to fill currentRegistrator in direct/
+    // modem mode where there's no preceding "selected registrator" line.
+    private val endpointRe = Regex("""endpoint=([^\s"]+):(\d+)""")
     private val directRegRe = Regex("""direct registrator configured.*?host=(\S+) port=(\d+)""")
     private val rebootReasonRe = Regex("""reason=(.*)$""")
     @Volatile private var autoCycling = false
@@ -142,9 +147,23 @@ class ProxyService : Service() {
         return s.substring(0, 3) + "****" + s.substring(s.length - 3)
     }
 
+    // SDK ≥ v2.0.10 dropped WebSocket and now uses plain TCP + yamux on the
+    // uplink. Log strings changed too, so we match both old and new wording
+    // here — keeping the old keys means older binaries (and the AAR before
+    // it gets bumped) keep parsing correctly during the rollout.
+    //
+    //   old WS                          new yamux uplink
+    //   "ws connected"                  "uplink connected"
+    //   "tunnel opened"                 "opening tunnel"
+    //   "ws dialing"                    "uplink dialing"   (endpoint=host:port)
+    //   "ws read error"/"close 1006"/   "uplink accept loop ended" /
+    //   "ws close frame"                "uplink control loop ended" /
+    //                                   "uplink dial failed" /
+    //                                   "uplink yamux init failed" /
+    //                                   "uplink AUTH …"
     private fun parseAgentLine(line: String) {
         when {
-            line.contains("tunnel opened") -> {
+            line.contains("tunnel opened") || line.contains("opening tunnel") -> {
                 activeTunnels++
                 analytics?.onTunnelOpen()
             }
@@ -152,9 +171,13 @@ class ProxyService : Service() {
                 activeTunnels = (activeTunnels - 1).coerceAtLeast(0)
                 analytics?.onTunnelClose()
             }
-            line.contains("ws connected") -> {
+            line.contains("ws connected") || line.contains("uplink connected") -> {
                 connStatus = ConnStatus.CONNECTED
                 connectedSinceMs = System.currentTimeMillis()
+                // Old WS log carried `url=wss://host:port/…`; new uplink log
+                // has only `uuid=…`. currentRegistrator on the new path is
+                // filled earlier by "selected registrator …", "direct
+                // registrator configured", or the "uplink dialing" branch.
                 wsUrlRe.find(line)?.let {
                     currentRegistrator = it.groupValues[1]
                     analytics?.setRegistrator(currentRegistrator)
@@ -174,7 +197,15 @@ class ProxyService : Service() {
             }
             line.contains("ws read error") ||
                 line.contains("close 1006") ||
-                line.contains("ws close frame") -> {
+                line.contains("ws close frame") ||
+                line.contains("uplink dial failed") ||
+                line.contains("uplink yamux init failed") ||
+                line.contains("uplink control stream open failed") ||
+                line.contains("uplink AUTH send failed") ||
+                line.contains("uplink AUTH reply read failed") ||
+                line.contains("uplink AUTH denied") ||
+                line.contains("uplink accept loop ended") ||
+                line.contains("uplink control loop ended") -> {
                 connStatus = ConnStatus.RECONNECTING
                 currentRegistrator = ""
                 activeTunnels = 0
@@ -190,13 +221,23 @@ class ProxyService : Service() {
                 analytics?.resetActiveTunnels()
             }
             line.contains("ws dialing") ||
+                line.contains("uplink dialing") ||
                 line.contains("balancer request") -> {
                 if (connStatus != ConnStatus.CONNECTED) connStatus = ConnStatus.CONNECTING
+                // "uplink dialing" carries `endpoint=host:port` — surface
+                // that as the registrator address so direct/modem mode
+                // shows something useful before any tunnel opens.
+                endpointRe.find(line)?.let {
+                    currentRegistrator = "${it.groupValues[1]}:${it.groupValues[2]}"
+                    analytics?.setRegistrator(currentRegistrator)
+                }
             }
             // Server-side REBOOT command. The SDK logs this whenever the
-            // registrator pushes REBOOT over the WS, regardless of whether the
-            // local-WS relay is enabled. Same behavior as the manual ↻ button:
-            // toggle cellular to grab a new carrier IP, then reconnect.
+            // registrator pushes REBOOT (over the WS in pre-2.0.10 builds,
+            // over the yamux control stream in 2.0.10+), regardless of
+            // whether the local-WS relay is enabled. Same behavior as the
+            // manual ↻ button: toggle cellular to grab a new carrier IP,
+            // then reconnect.
             line.contains("REBOOT received from registrator") -> {
                 val reason = rebootReasonRe.find(line)?.groupValues?.get(1).orEmpty().trim()
                 triggerAutoIpCycle(reason)
