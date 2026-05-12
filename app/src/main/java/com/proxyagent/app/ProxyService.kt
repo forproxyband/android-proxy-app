@@ -52,6 +52,12 @@ class ProxyService : Service() {
     @Volatile private var currentRegistrator = ""
     @Volatile private var activeTunnels = 0
     @Volatile private var connectedSinceMs = 0L
+    // Human-readable uplink transport label exposed via conn_info so the
+    // UI can show "QUIC" vs "TCP+yamux" vs "WebSocket". Filled from the
+    // SDK's "uplink connected … transport=quic|tcp" log (v2.0.14-quic+);
+    // older builds without the key default to "TCP+yamux" or "WebSocket"
+    // depending on which "connected" line variant we saw.
+    @Volatile private var currentUplinkTransport: String = ""
     private var lastRx = 0L
     private var lastTx = 0L
     private var lastStatsAt = 0L
@@ -63,6 +69,10 @@ class ProxyService : Service() {
     // endpoint key directly. Used to fill currentRegistrator in direct/
     // modem mode where there's no preceding "selected registrator" line.
     private val endpointRe = Regex("""endpoint=([^\s"]+):(\d+)""")
+    // `transport=quic|tcp` appears on the post-AUTH "uplink connected" log
+    // line and on "uplink dialing" / "transport dial failed" diagnostics.
+    // We only act on the post-AUTH one to avoid flipping the badge mid-probe.
+    private val transportRe = Regex("""\btransport=(\w+)""")
     private val directRegRe = Regex("""direct registrator configured.*?host=(\S+) port=(\d+)""")
     private val rebootReasonRe = Regex("""reason=(.*)$""")
     @Volatile private var autoCycling = false
@@ -115,8 +125,11 @@ class ProxyService : Service() {
 
     private fun writeConnInfo() {
         try {
+            // 7th field (currentUplinkTransport) was added in v2.0.14-quic.
+            // Readers must use getOrNull(N) for forward compatibility so the
+            // field stays optional if a downgrade ever writes a 6-field file.
             File(filesDir, "conn_info").writeText(
-                "${connStatus.name}|$rxRate|$txRate|$currentRegistrator|$activeTunnels|$connectedSinceMs"
+                "${connStatus.name}|$rxRate|$txRate|$currentRegistrator|$activeTunnels|$connectedSinceMs|$currentUplinkTransport"
             )
         } catch (_: Exception) {}
     }
@@ -174,6 +187,21 @@ class ProxyService : Service() {
             line.contains("ws connected") || line.contains("uplink connected") -> {
                 connStatus = ConnStatus.CONNECTED
                 connectedSinceMs = System.currentTimeMillis()
+                // Detect the underlying uplink transport for the status card.
+                //   • v2.0.14-quic+ logs `uplink connected … transport=quic|tcp`
+                //   • v2.0.10..v2.0.13 logged the same "uplink connected" line
+                //     without the key — always TCP+yamux there.
+                //   • pre-v2.0.10 logged "ws connected" with no key — WebSocket.
+                currentUplinkTransport = if (line.contains("uplink connected")) {
+                    when (transportRe.find(line)?.groupValues?.get(1)?.lowercase(Locale.US)) {
+                        "quic" -> "QUIC"
+                        "tcp" -> "TCP+yamux"
+                        null -> "TCP+yamux"
+                        else -> transportRe.find(line)?.groupValues?.get(1)?.uppercase(Locale.US).orEmpty()
+                    }
+                } else {
+                    "WebSocket"
+                }
                 // Old WS log carried `url=wss://host:port/…`; new uplink log
                 // has only `uuid=…`. currentRegistrator on the new path is
                 // filled earlier by "selected registrator …", "direct
@@ -210,6 +238,7 @@ class ProxyService : Service() {
                 currentRegistrator = ""
                 activeTunnels = 0
                 connectedSinceMs = 0L
+                currentUplinkTransport = ""
                 analytics?.resetActiveTunnels()
             }
             line.contains("balancer selection failed") ||
@@ -218,6 +247,7 @@ class ProxyService : Service() {
                 currentRegistrator = ""
                 activeTunnels = 0
                 connectedSinceMs = 0L
+                currentUplinkTransport = ""
                 analytics?.resetActiveTunnels()
             }
             line.contains("ws dialing") ||
@@ -550,6 +580,7 @@ class ProxyService : Service() {
                 currentRegistrator = ""
                 activeTunnels = 0
                 connectedSinceMs = 0L
+                currentUplinkTransport = ""
                 backoffMs = 1000L
             } catch (e: Throwable) {
                 val sw = StringWriter(); e.printStackTrace(PrintWriter(sw))
@@ -559,6 +590,7 @@ class ProxyService : Service() {
                 currentRegistrator = ""
                 activeTunnels = 0
                 connectedSinceMs = 0L
+                currentUplinkTransport = ""
             }
             log("Restarting in ${backoffMs}ms")
             try {
@@ -840,6 +872,7 @@ class ProxyService : Service() {
         currentRegistrator = ""
         activeTunnels = 0
         connectedSinceMs = 0L
+        currentUplinkTransport = ""
         state(if (autoStopReason.isNotEmpty()) "auto_stopped" else "stopped")
         try {
             if (autoStopReason.isNotEmpty())

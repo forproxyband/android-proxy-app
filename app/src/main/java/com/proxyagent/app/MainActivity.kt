@@ -1080,6 +1080,10 @@ class MainActivity : AppCompatActivity() {
         val registrator = connInfo.getOrNull(3).orEmpty()
         val tunnels = connInfo.getOrNull(4)?.toIntOrNull() ?: 0
         val connectedSinceMs = connInfo.getOrNull(5)?.toLongOrNull() ?: 0L
+        // 7th field (uplink transport label, e.g. "QUIC", "TCP+yamux",
+        // "WebSocket") was added in v2.0.14-quic. Stay forward-compatible
+        // with older conn_info files that only have 6 fields.
+        val uplinkTransport = connInfo.getOrNull(6).orEmpty()
 
         val running = proxyState == "running" || proxyState == "starting"
         val configured = hasConnectionConfig()
@@ -1154,9 +1158,13 @@ class MainActivity : AppCompatActivity() {
                 pagerRefs.tvUptime?.text = if (connectedSinceMs > 0)
                     "up ${formatDuration(System.currentTimeMillis() - connectedSinceMs)}"
                 else ""
+                // Transport prefix sits at the front of the activity line so
+                // "QUIC" / "TCP+yamux" / "WebSocket" is always visible while
+                // connected. Empty for older agents that don't publish it.
+                val transportPrefix = if (uplinkTransport.isNotEmpty()) "$uplinkTransport · " else ""
                 pagerRefs.tvActivity?.text = when {
-                    tunnels == 0 -> "◦ idle — no connections"
-                    else -> "⚡ $tunnels ${if (tunnels == 1) "connection" else "connections"} · " +
+                    tunnels == 0 -> "◦ ${transportPrefix}idle — no connections"
+                    else -> "⚡ $transportPrefix$tunnels ${if (tunnels == 1) "connection" else "connections"} · " +
                         "↓${humanRate(rxRate)} ↑${humanRate(txRate)}"
                 }
                 // Refresh charts at most every 30s — they cover 24h, sub-minute updates

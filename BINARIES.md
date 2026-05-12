@@ -4,7 +4,12 @@ These binaries are built from upstream `proxy-agent` and are embedded into the
 APK at build time. The files at the repository root are staging copies kept
 there for easy refresh; the actual build consumes the copies under `app/`.
 
-## Version: v2.0.11 (updated 2026-05-11)
+## Version: v2.0.14-quic (updated 2026-05-12)
+
+QUIC-first uplink with TCP+yamux fallback and a sticky transport cache
+(`$HOME/.proxyagent_transport`). After AUTH the agent logs
+`uplink connected … transport=quic|tcp` — the Android app reads that to
+display the active transport in the status card.
 
 | Artifact | Role in the APK | Path in the repo |
 | --- | --- | --- |
