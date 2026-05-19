@@ -53,10 +53,10 @@ class ProxyService : Service() {
     @Volatile private var activeTunnels = 0
     @Volatile private var connectedSinceMs = 0L
     // Human-readable uplink transport label exposed via conn_info so the
-    // UI can show "QUIC" vs "TCP+yamux" vs "WebSocket". Filled from the
-    // SDK's "uplink connected … transport=quic|tcp" log (v2.0.14-quic+);
-    // older builds without the key default to "TCP+yamux" or "WebSocket"
-    // depending on which "connected" line variant we saw.
+    // UI can show "QUIC" / "TCP (splice)" / "TCP+yamux" / "WebSocket".
+    // Filled from the SDK's "uplink connected … transport=quic|tcp" log
+    // (v2.0.14-quic+); older builds without the key default to "TCP+yamux"
+    // or "WebSocket" depending on which "connected" line variant we saw.
     @Volatile private var currentUplinkTransport: String = ""
     private var lastRx = 0L
     private var lastTx = 0L
@@ -195,7 +195,7 @@ class ProxyService : Service() {
                 currentUplinkTransport = if (line.contains("uplink connected")) {
                     when (transportRe.find(line)?.groupValues?.get(1)?.lowercase(Locale.US)) {
                         "quic" -> "QUIC"
-                        "tcp" -> "TCP+yamux"
+                        "tcp" -> "TCP (splice)"
                         null -> "TCP+yamux"
                         else -> transportRe.find(line)?.groupValues?.get(1)?.uppercase(Locale.US).orEmpty()
                     }

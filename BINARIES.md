@@ -4,10 +4,15 @@ These binaries are built from upstream `proxy-agent` and are embedded into the
 APK at build time. The files at the repository root are staging copies kept
 there for easy refresh; the actual build consumes the copies under `app/`.
 
-## Version: v2.0.14-quic (updated 2026-05-12)
+## Version: v2.0.16-quic (updated 2026-05-19)
 
-QUIC-first uplink with TCP+yamux fallback and a sticky transport cache
-(`$HOME/.proxyagent_transport`). After AUTH the agent logs
+TCP-first uplink with a QUIC fallback and a sticky transport cache
+(`$HOME/.proxyagent_transport`). The TCP path drops yamux: one control
+TCP socket plus an on-demand fleet of data TCP sockets (warm pool of 8),
+bridged via `io.Copy` between `*net.TCPConn` so the kernel handles the
+data path with `splice(2)` — no userspace copies on the hot side. The
+QUIC fallback uses `apernet/quic-go` with Brutal congestion control at
+100 Mbps over a 32 MiB-buffered UDP socket. After AUTH the agent logs
 `uplink connected … transport=quic|tcp` — the Android app reads that to
 display the active transport in the status card.
 
