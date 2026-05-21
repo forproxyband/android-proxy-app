@@ -4,7 +4,7 @@ These binaries are built from upstream `proxy-agent` and are embedded into the
 APK at build time. The files at the repository root are staging copies kept
 there for easy refresh; the actual build consumes the copies under `app/`.
 
-## Version: v2.0.17 (updated 2026-05-21)
+## Version: v2.0.18 (updated 2026-05-21)
 
 TCP-first uplink with a QUIC fallback and a sticky transport cache
 (`$HOME/.proxyagent_transport`). The TCP path drops yamux: one control
@@ -31,7 +31,7 @@ display the active transport in the status card.
    refresh.
 3. Bump the version in this file and update the date.
 
-## SDK runtime surface (proxy-agent-sdk-go @ v2.0.17)
+## SDK runtime surface (proxy-agent-sdk-go @ v2.0.18)
 
 What the bundled binaries actually do at runtime — useful when reading
 agent logs or extending the integration.
