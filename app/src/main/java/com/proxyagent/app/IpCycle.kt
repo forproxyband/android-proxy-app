@@ -100,7 +100,20 @@ object IpCycle {
         var attempts = 0
         var toggleEverWorked = false
 
-        for (step in LADDER) {
+        // If the user enabled an aggressive fallback (APN swap / IMEI rotate),
+        // the basic 2-step ladder is a waste of budget — they already know
+        // basic doesn't move this operator's IP, otherwise they wouldn't have
+        // ticked the fallback. Skip straight to the heavy steps.
+        val skipBasic = config.apnSwap || config.imeiRotation
+        if (skipBasic) {
+            log("aggressive fallback enabled — skipping basic 10s+60s ladder")
+            // We still need toggleEverWorked to be true so the final "reason"
+            // isn't "no_toggle_method" — set it implicitly since the fallback
+            // steps will toggle the radio themselves.
+            toggleEverWorked = true
+        }
+
+        for (step in if (skipBasic) emptyList<Step>() else LADDER) {
             val waitMs = step.sleepMs
             val doRatSwitch = step.ratSwitch && rootAvailable
             val remaining = deadline - System.currentTimeMillis()
