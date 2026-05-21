@@ -285,19 +285,30 @@ class ProxyService : Service() {
         Thread {
             try {
                 log("REBOOT auto-cycle: starting (reason=\"$reason\", engine=${engine.name})")
-                // Toggle cellular first. The subprocess will see its WS read
-                // error and enter the SDK's internal backoff loop on its own —
-                // we don't kill it pre-emptively because that would race our
-                // own runner's backoff sleep, restarting it mid-toggle.
-                val toggled = IpCycle.toggleMobileNetworkViaRoot() ||
-                    IpCycle.toggleMobileNetworkViaSecureSettings(this)
-                if (!toggled) {
-                    log("REBOOT auto-cycle: cellular toggle unavailable (no root, " +
-                        "no WRITE_SECURE_SETTINGS); reconnecting on existing IP")
-                } else {
-                    log("REBOOT auto-cycle: cellular toggled, waiting for re-attach")
-                    // Small grace for the radio to come back before we reconnect.
-                    try { Thread.sleep(2000) } catch (_: InterruptedException) {}
+                // cycleAndVerify drives the 10/20/40s ladder under a 120s budget.
+                // The subprocess will see its WS read error during airplane-on
+                // and enter the SDK's internal backoff loop on its own; we
+                // don't kill it pre-emptively because that would race our own
+                // runner's backoff sleep, restarting it mid-toggle.
+                val baseline = try {
+                    File(filesDir, "nat_ip").readText().trim()
+                } catch (_: Throwable) { "" }
+                val result = IpCycle.cycleAndVerify(this, baseline) { msg ->
+                    log("REBOOT auto-cycle: $msg")
+                }
+                val secs = result.totalMs / 1000
+                when {
+                    result.reason == "no_toggle_method" ->
+                        log("REBOOT auto-cycle: no root + no WRITE_SECURE_SETTINGS; reconnecting on existing IP")
+                    result.changed -> {
+                        log("REBOOT auto-cycle: IP ${result.oldIp} -> ${result.newIp} in ${result.attempts} try(s) / ${secs}s")
+                        try { File(filesDir, "nat_ip").writeText(result.newIp) } catch (_: Throwable) {}
+                        analytics?.setNatIp(result.newIp)
+                    }
+                    result.newIp.isNotEmpty() ->
+                        log("REBOOT auto-cycle: IP unchanged (${result.newIp}) after ${result.attempts} try(s) / ${secs}s")
+                    else ->
+                        log("REBOOT auto-cycle: ${result.reason} after ${result.attempts} try(s) / ${secs}s")
                 }
                 if (!stopRequested) {
                     // For BINARY this kills the subprocess + interrupts our

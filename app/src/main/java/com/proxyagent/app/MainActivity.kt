@@ -17,6 +17,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
+import android.util.Log
 import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
@@ -755,9 +756,13 @@ class MainActivity : AppCompatActivity() {
                 stage = "cycling network"
                 runOnUiThread { tvStatus.text = "CYCLING NETWORK…"; tvStatus.setTextColor(0xFFFFAA00.toInt()) }
 
-                val auto = IpCycle.toggleMobileNetworkViaRoot() ||
-                    IpCycle.toggleMobileNetworkViaSecureSettings(this)
-                if (!auto) {
+                val baselineIp = publicIp
+                val result = IpCycle.cycleAndVerify(this, baselineIp) { msg ->
+                    Log.i("IpCycle", msg)
+                    runOnUiThread { tvStatus.text = ("CYCLE: $msg").take(64) }
+                }
+
+                if (result.reason == "no_toggle_method") {
                     runOnUiThread {
                         Toast.makeText(
                             this,
@@ -766,30 +771,38 @@ class MainActivity : AppCompatActivity() {
                             Toast.LENGTH_LONG
                         ).show()
                     }
-                    // Restart proxy if it was running so we don't leave it stopped.
                     if (wasRunning) runOnUiThread { startProxyService() }
                     return@Thread
                 }
 
-                runOnUiThread { tvStatus.text = "WAITING FOR NET…" }
-                val netDeadline = System.currentTimeMillis() + 30_000
-                while (System.currentTimeMillis() < netDeadline) {
-                    if (currentTransport() == "CELLULAR") break
-                    Thread.sleep(500)
+                if (result.newIp.isNotEmpty()) {
+                    publicIp = result.newIp
+                    try { File(filesDir, "nat_ip").writeText(result.newIp) } catch (_: Throwable) {}
+                } else {
+                    // Couldn't read IP during the cycle (no network yet, or all
+                    // fetches failed). Trigger an async refresh so the UI heals
+                    // once the network stabilises.
+                    publicIp = ""
+                    refreshPublicIp()
                 }
-                // Small grace for routes/DNS to settle before the agent dials.
-                Thread.sleep(1500)
-
-                publicIp = ""
-                refreshPublicIp()
 
                 if (wasRunning) {
                     stage = "restarting proxy"
                     runOnUiThread { startProxyService() }
                 }
 
+                val secs = result.totalMs / 1000
+                val toastMsg = when {
+                    result.changed ->
+                        "IP changed in ${result.attempts} try(s) / ${secs}s: ${result.oldIp} → ${result.newIp}"
+                    result.reason == "ok_no_baseline" ->
+                        "IP cycle done in ${secs}s; baseline unknown — current: ${result.newIp}"
+                    result.reason == "ip_unchanged" ->
+                        "IP unchanged after ${result.attempts} try(s) / ${secs}s — try again later"
+                    else -> "IP cycle: ${result.reason} (${secs}s)"
+                }
                 runOnUiThread {
-                    Toast.makeText(this, "IP cycle complete", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, toastMsg, Toast.LENGTH_LONG).show()
                 }
             } catch (e: Throwable) {
                 runOnUiThread {
