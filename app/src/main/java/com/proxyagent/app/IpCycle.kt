@@ -417,28 +417,31 @@ object IpCycle {
         attempt: Int,
     ): String? {
         val tag = "attempt $attempt (APN swap)"
-        return try {
+        // try/finally with bare `return` inside the try works in Kotlin: the
+        // finally still runs before the value propagates out. We can't use
+        // `return@try` — try-expressions aren't labellable, only lambdas are.
+        try {
             val currentId = readPreferredApnId(log) ?: run {
                 log("$tag: aborted — couldn't read preferapn")
-                return@try null
+                return null
             }
             val altApn = findOrCreateAlternateApn(currentId, log) ?: run {
                 log("$tag: aborted — no alternate APN and couldn't create duplicate")
-                return@try null
+                return null
             }
             log("$tag: preferapn $currentId -> ${altApn.id} (${altApn.name}/${altApn.apn})")
             if (!setPreferredApn(altApn.id)) {
                 log("$tag: aborted — preferapn write failed")
-                return@try null
+                return null
             }
             if (!innerCycle(context, 10_000, true, log, deadline, "$tag (alt)")) {
                 setPreferredApn(currentId)   // best-effort restore
-                return@try null
+                return null
             }
             log("$tag: restoring preferapn -> $currentId")
             setPreferredApn(currentId)
             innerCycle(context, 5_000, true, log, deadline, "$tag (restore)")
-            fetchPublicIp().ifEmpty { null }
+            return fetchPublicIp().ifEmpty { null }
         } finally {
             // Always remove our rotation duplicate (if any), regardless of
             // how this step exited. Real APNs are untouched — cleanup only
