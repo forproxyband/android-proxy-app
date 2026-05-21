@@ -12,11 +12,14 @@ import java.util.concurrent.TimeUnit
 // Cellular IP-cycling primitives shared by the manual button (MainActivity)
 // and the server-triggered REBOOT auto-cycle (ProxyService).
 //
-// `cycleAndVerify` runs an escalating ladder: airplane on (+ restart radio under
-// root) → sleep 10/20/40s → airplane off → wait for cellular reattach → fetch
-// public IP via ipify → compare with baseline. If unchanged it bumps the sleep
-// and tries again, up to a 120-second total budget. The caller decides what to
-// do with the subprocess; this only manipulates radio + verifies IP.
+// `cycleAndVerify` runs two "nuclear" passes: airplane on + restart rild +
+// flip RAT to GSM-only → sleep 10s (then 60s if the first try didn't move
+// the IP) → airplane off → reattach in 2G/3G → flip RAT back to original →
+// reattach in LTE → fetch public IP via ipify → compare. Light data-toggle
+// passes are skipped on purpose: on operators that hold the PDP context,
+// they almost never win, so we'd just burn budget. Total budget ~180s.
+// The caller decides what to do with the subprocess; this only manipulates
+// the radio + verifies IP.
 object IpCycle {
 
     data class CycleResult(
@@ -30,10 +33,21 @@ object IpCycle {
         val reason: String,
     )
 
-    private val WAIT_LADDER_MS = longArrayOf(10_000, 20_000, 40_000)
-    private const val TOTAL_BUDGET_MS = 120_000L
+    private data class Step(val sleepMs: Long, val ratSwitch: Boolean)
+
+    // Both steps go full-nuclear. We're not escalating mechanism, just dwell
+    // time: 10s catches the fast operators; 60s the stubborn ones. Past 60s
+    // the IP is usually pinned for minutes — waiting longer doesn't help.
+    private val LADDER = listOf(
+        Step(10_000, true),
+        Step(60_000, true),
+    )
+    private const val TOTAL_BUDGET_MS = 180_000L
     private const val REATTACH_WAIT_MS = 20_000L
     private const val POST_REATTACH_GRACE_MS = 1_500L
+    // Extra reattach window after we flip RAT back; LTE re-acquisition can
+    // take longer than a normal reattach because the modem is mid-handover.
+    private const val RAT_RESTORE_REATTACH_MS = 15_000L
 
     fun cycleAndVerify(
         context: Context,
@@ -58,20 +72,32 @@ object IpCycle {
         var attempts = 0
         var toggleEverWorked = false
 
-        for (waitMs in WAIT_LADDER_MS) {
+        for (step in LADDER) {
+            val waitMs = step.sleepMs
+            val doRatSwitch = step.ratSwitch && rootAvailable
             val remaining = deadline - System.currentTimeMillis()
             // Need ~waitMs + REATTACH_WAIT_MS + fetch overhead. If we can't
             // fit a meaningful attempt, bail rather than start a partial one.
-            if (remaining < waitMs + 5_000) {
-                log("budget exhausted (${remaining}ms left); skipping remaining steps")
+            val needed = waitMs + 5_000 + (if (doRatSwitch) RAT_RESTORE_REATTACH_MS else 0)
+            if (remaining < needed) {
+                log("budget exhausted (${remaining}ms left, need ${needed}ms); skipping remaining steps")
                 break
             }
 
             attempts++
-            log("attempt $attempts: airplane on${if (rootAvailable) " + restart ril" else ""}, sleeping ${waitMs / 1000}s")
+            val extras = buildString {
+                if (rootAvailable) append(" + restart ril")
+                if (doRatSwitch) append(" + RAT→GSM")
+            }
+            log("attempt $attempts: airplane on$extras, sleeping ${waitMs / 1000}s")
+
+            // Save & switch RAT before we kill the radio so the modem comes
+            // back in GSM/2G on airplane-off. We restore after the re-attach.
+            val savedRat: String? = if (doRatSwitch) saveAndSetGsmOnly(log) else null
 
             if (!airplaneOn(context, rootAvailable)) {
                 log("attempt $attempts: airplane on failed")
+                if (savedRat != null) restoreRat(savedRat)
                 continue
             }
             toggleEverWorked = true
@@ -79,6 +105,7 @@ object IpCycle {
 
             try { Thread.sleep(waitMs) } catch (_: InterruptedException) {
                 airplaneOff(context, rootAvailable)
+                if (savedRat != null) restoreRat(savedRat)
                 return CycleResult(
                     oldIp, lastNewIp, false, attempts,
                     System.currentTimeMillis() - start, "interrupted",
@@ -87,6 +114,7 @@ object IpCycle {
 
             if (!airplaneOff(context, rootAvailable)) {
                 log("attempt $attempts: airplane off failed")
+                if (savedRat != null) restoreRat(savedRat)
                 continue
             }
 
@@ -95,6 +123,7 @@ object IpCycle {
             while (System.currentTimeMillis() < reattachDeadline) {
                 if (hasCellularInternet(context)) break
                 try { Thread.sleep(500) } catch (_: InterruptedException) {
+                    if (savedRat != null) restoreRat(savedRat)
                     return CycleResult(
                         oldIp, lastNewIp, false, attempts,
                         System.currentTimeMillis() - start, "interrupted",
@@ -103,6 +132,25 @@ object IpCycle {
             }
             // Routes/DNS settle window before we hit ipify.
             try { Thread.sleep(POST_REATTACH_GRACE_MS) } catch (_: InterruptedException) {}
+
+            // Now restore RAT so the modem switches back to LTE-preferred.
+            // The RAT change itself often triggers a fresh PDP context — which
+            // is half the reason we did the GSM detour in the first place.
+            if (savedRat != null) {
+                log("attempt $attempts: restoring RAT to $savedRat, waiting for LTE")
+                restoreRat(savedRat)
+                val ratDeadline = minOf(System.currentTimeMillis() + RAT_RESTORE_REATTACH_MS, deadline)
+                while (System.currentTimeMillis() < ratDeadline) {
+                    if (hasCellularInternet(context)) break
+                    try { Thread.sleep(500) } catch (_: InterruptedException) {
+                        return CycleResult(
+                            oldIp, lastNewIp, false, attempts,
+                            System.currentTimeMillis() - start, "interrupted",
+                        )
+                    }
+                }
+                try { Thread.sleep(POST_REATTACH_GRACE_MS) } catch (_: InterruptedException) {}
+            }
 
             log("attempt $attempts: fetching public IP")
             val newIp = fetchPublicIp()
@@ -211,5 +259,44 @@ object IpCycle {
             if (!finished) { p.destroy(); return false }
             p.exitValue() == 0
         } catch (_: Throwable) { false }
+    }
+
+    private fun runRootOutput(cmd: String): String? {
+        return try {
+            val p = ProcessBuilder("su", "-c", cmd).redirectErrorStream(true).start()
+            val sb = StringBuilder()
+            val t = Thread {
+                try { p.inputStream.bufferedReader().use { sb.append(it.readText()) } } catch (_: Throwable) {}
+            }.apply { isDaemon = true; start() }
+            val finished = p.waitFor(5, TimeUnit.SECONDS)
+            if (!finished) { p.destroy(); return null }
+            if (p.exitValue() != 0) return null
+            try { t.join(1000) } catch (_: InterruptedException) {}
+            sb.toString().trim()
+        } catch (_: Throwable) { null }
+    }
+
+    // Reads `settings get global preferred_network_mode` (RAT preference) and
+    // switches to GSM-only (mode 1). Returns the original numeric mode for
+    // restoreRat to put back, or null if we couldn't read/write.
+    private fun saveAndSetGsmOnly(log: (String) -> Unit): String? {
+        val original = runRootOutput("settings get global preferred_network_mode")
+        if (original == null || !original.matches(Regex("""\d+"""))) {
+            log("RAT switch skipped — couldn't read current mode (got \"${original ?: "null"}\")")
+            return null
+        }
+        if (original == "1") {
+            log("RAT switch skipped — already GSM-only")
+            return null
+        }
+        if (!runRoot("settings put global preferred_network_mode 1")) {
+            log("RAT switch skipped — write failed")
+            return null
+        }
+        return original
+    }
+
+    private fun restoreRat(originalMode: String) {
+        runRoot("settings put global preferred_network_mode $originalMode")
     }
 }
