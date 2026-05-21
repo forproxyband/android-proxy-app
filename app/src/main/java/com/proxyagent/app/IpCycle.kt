@@ -344,12 +344,31 @@ object IpCycle {
         } catch (_: Throwable) { false }
     }
 
-    private fun runRootOutput(cmd: String): String? {
+    // maxBytes caps how much output we'll buffer. Defensive against commands
+    // that accidentally return huge results (e.g. `content query` against
+    // telephony/carriers without a --where filter — the global APN DB is
+    // tens of MB and will OOM us before LMK kills us). 256 KB is plenty for
+    // any sane filtered query.
+    private fun runRootOutput(cmd: String, maxBytes: Int = 256 * 1024): String? {
         return try {
             val p = ProcessBuilder("su", "-c", cmd).redirectErrorStream(true).start()
             val sb = StringBuilder()
             val t = Thread {
-                try { p.inputStream.bufferedReader().use { sb.append(it.readText()) } } catch (_: Throwable) {}
+                try {
+                    p.inputStream.bufferedReader().use { reader ->
+                        val buf = CharArray(4096)
+                        while (true) {
+                            val n = reader.read(buf)
+                            if (n < 0) break
+                            if (sb.length + n > maxBytes) {
+                                sb.append(buf, 0, maxBytes - sb.length)
+                                sb.append("\n[OUTPUT TRUNCATED]")
+                                break
+                            }
+                            sb.append(buf, 0, n)
+                        }
+                    }
+                } catch (_: Throwable) {}
             }.apply { isDaemon = true; start() }
             val finished = p.waitFor(5, TimeUnit.SECONDS)
             if (!finished) { p.destroy(); return null }
@@ -434,11 +453,15 @@ object IpCycle {
         // finally still runs before the value propagates out. We can't use
         // `return@try` — try-expressions aren't labellable, only lambdas are.
         try {
-            val currentId = readPreferredApnId(log) ?: run {
+            val currentApn = readPreferredApn(log) ?: run {
                 log("$tag: aborted — couldn't read preferapn")
                 return null
             }
-            val altApn = findOrCreateAlternateApn(currentId, log) ?: run {
+            val currentId = currentApn["_id"]?.toIntOrNull() ?: run {
+                log("$tag: aborted — preferapn row has no _id")
+                return null
+            }
+            val altApn = findOrCreateAlternateApn(currentApn, log) ?: run {
                 log("$tag: aborted — no alternate APN and couldn't create duplicate")
                 return null
             }
@@ -463,27 +486,78 @@ object IpCycle {
         }
     }
 
-    private fun readPreferredApnId(log: (String) -> Unit): Int? {
+    // Reads the preferred APN's full row in one go. On most ROMs (Xiaomi
+    // included) `content query --uri .../preferapn` returns the joined row
+    // with all carrier fields; on a few stock builds it returns only
+    // `apn_id=N`, in which case we follow up with a filtered query for that
+    // specific _id (small response — no risk of pulling the global APN DB).
+    private fun readPreferredApn(log: (String) -> Unit): Map<String, String>? {
         val output = runRootOutput("content query --uri content://telephony/carriers/preferapn")
             ?: return null
-        // "Row: 0 apn_id=2"  (Android 10+) or  "Row: 0 _id=2"  (older)
-        val match = Regex("""(?:apn_id|_id)=(\d+)""").find(output)
-        val id = match?.groupValues?.get(1)?.toIntOrNull()
-        log("APN: preferapn raw=\"${output.take(120).replace("\n", " ")}\" parsed_id=$id")
-        return id
+        log("APN: preferapn raw=\"${output.take(200).replace("\n", " ")}\"")
+        val rowRe = Regex("""Row:\s*\d+\s+([^\n]+)""")
+        val match = rowRe.find(output)
+        if (match != null) {
+            val fields = parseRowFields(match.groupValues[1])
+            if (fields["apn"] != null && fields["_id"] != null) {
+                log("APN: preferapn id=${fields["_id"]} numeric=${fields["numeric"]} apn=${fields["apn"]}")
+                return fields
+            }
+            // ROM only gave us apn_id — fall through to a targeted second query.
+            val idStr = fields["apn_id"] ?: fields["_id"]
+            val id = idStr?.toIntOrNull() ?: return null
+            return queryApnById(id, log)
+        }
+        // No "Row:" prefix — try to extract just an id and refetch.
+        val idMatch = Regex("""(?:apn_id|_id)=(\d+)""").find(output) ?: return null
+        val id = idMatch.groupValues[1].toIntOrNull() ?: return null
+        return queryApnById(id, log)
     }
 
-    // Tries to find a real alternate APN already on the SIM. If there isn't
-    // one, duplicates the current APN into a new row (same `apn` string,
-    // same MCC/MNC/protocol/etc., different `name` and `_id`) so we have
-    // something to swap to. The duplicate is tagged with DUP_APN_NAME so
-    // cleanupRotationDuplicates() can remove it after the swap.
-    private fun findOrCreateAlternateApn(currentId: Int, log: (String) -> Unit): ApnInfo? {
-        val output = runRootOutput("content query --uri content://telephony/carriers") ?: return null
+    private fun queryApnById(id: Int, log: (String) -> Unit): Map<String, String>? {
+        val output = runRootOutput(
+            "content query --uri content://telephony/carriers --where \"_id=$id\""
+        ) ?: return null
+        val rowRe = Regex("""Row:\s*\d+\s+([^\n]+)""")
+        val match = rowRe.find(output) ?: run {
+            log("APN: queryApnById($id) returned no rows")
+            return null
+        }
+        val fields = parseRowFields(match.groupValues[1])
+        log("APN: queryApnById($id) → numeric=${fields["numeric"]} apn=${fields["apn"]}")
+        return fields
+    }
+
+    private fun parseRowFields(rowContent: String): Map<String, String> {
+        val fields = HashMap<String, String>()
+        for (part in rowContent.split(", ")) {
+            val eq = part.indexOf('=')
+            if (eq <= 0) continue
+            fields[part.substring(0, eq).trim()] = part.substring(eq + 1).trim()
+        }
+        return fields
+    }
+
+    // Tries to find a real alternate APN for the SAME SIM operator (filtered
+    // by `numeric` = MCC+MNC). If there isn't one, duplicates the current APN
+    // into a new row (same `apn` string, same MCC/MNC/protocol/etc., different
+    // `name` and `_id`) so we have something to swap to. The duplicate is
+    // tagged with DUP_APN_NAME so cleanupRotationDuplicates() can remove it
+    // after the swap.
+    //
+    // CRITICAL: the query MUST be filtered. Without `--where`, on many ROMs
+    // this returns the entire global APN database (thousands of rows, tens of
+    // MB), which on a memory-pressed device triggers the LowMemoryKiller and
+    // gets our own foreground app SIGKILL'd ~10 seconds later.
+    private fun findOrCreateAlternateApn(
+        currentApn: Map<String, String>,
+        log: (String) -> Unit,
+    ): ApnInfo? {
+        val currentId = currentApn["_id"]?.toIntOrNull() ?: return null
+        val numeric = currentApn["numeric"]?.takeIf { it.isNotEmpty() && it != "NULL" }
+        val output = queryCarriersForNumeric(numeric) ?: return null
         val apns = parseApns(output)
-        log("APN: ${apns.size} APN(s) on device; current id=$currentId")
-        // Real alternate first — anything that isn't current and isn't our
-        // own leftover dup, and has an actual apn string.
+        log("APN: ${apns.size} APN(s) for numeric=${numeric ?: "<unfiltered>"} (current id=$currentId)")
         val realAlt = apns.firstOrNull {
             it.id != currentId && it.apn.isNotEmpty() && it.name != DUP_APN_NAME
         }
@@ -492,17 +566,10 @@ object IpCycle {
             return realAlt
         }
         log("APN: no real alternate — will duplicate current APN")
-        // Clean up any stale dups from a prior interrupted cycle before we
-        // create a fresh one, otherwise findOrCreate could pick up an old dup.
         cleanupRotationDuplicates(log)
-        val srcFields = queryFullApn(currentId, log) ?: run {
-            log("APN: couldn't read full current row for duplication")
-            return null
-        }
-        if (!insertDuplicateApn(srcFields, log)) return null
-        // Re-query to get the assigned _id of our new row.
-        val newOutput = runRootOutput("content query --uri content://telephony/carriers") ?: return null
-        val created = parseApns(newOutput).firstOrNull { it.name == DUP_APN_NAME }
+        if (!insertDuplicateApn(currentApn, log)) return null
+        val refresh = queryCarriersForNumeric(numeric) ?: return null
+        val created = parseApns(refresh).firstOrNull { it.name == DUP_APN_NAME }
         if (created == null) {
             log("APN: inserted duplicate but it doesn't appear in re-query")
             return null
@@ -511,27 +578,16 @@ object IpCycle {
         return created
     }
 
-    private fun queryFullApn(id: Int, log: (String) -> Unit): Map<String, String>? {
-        // `--where` is supported on Android 9+; on older versions we fall back
-        // to querying all and filtering in-process.
-        val output = runRootOutput("content query --uri content://telephony/carriers --where \"_id=$id\"")
-            ?: runRootOutput("content query --uri content://telephony/carriers")
-            ?: return null
-        val rowRe = Regex("""Row:\s*\d+\s+([^\n]+)""")
-        for (match in rowRe.findAll(output)) {
-            val fields = HashMap<String, String>()
-            for (part in match.groupValues[1].split(", ")) {
-                val eq = part.indexOf('=')
-                if (eq <= 0) continue
-                fields[part.substring(0, eq).trim()] = part.substring(eq + 1).trim()
-            }
-            if (fields["_id"]?.toIntOrNull() == id) {
-                log("APN: read ${fields.size} fields from row id=$id (apn=${fields["apn"]})")
-                return fields
-            }
+    private fun queryCarriersForNumeric(numeric: String?): String? {
+        return if (!numeric.isNullOrEmpty()) {
+            runRootOutput(
+                "content query --uri content://telephony/carriers --where \"numeric='$numeric'\""
+            )
+        } else {
+            // No numeric available (very rare) — at least try, but with a much
+            // smaller output cap so a global query can't OOM us.
+            runRootOutput("content query --uri content://telephony/carriers", maxBytes = 64 * 1024)
         }
-        log("APN: row id=$id not found in query output")
-        return null
     }
 
     // Builds a `content insert` that copies a curated subset of fields from
@@ -567,8 +623,13 @@ object IpCycle {
             log("APN: cleaned up duplicates via --where")
             return
         }
-        // Older Android: enumerate and delete by row URI.
-        val output = runRootOutput("content query --uri content://telephony/carriers") ?: return
+        // Older Android fallback: query filtered by our marker name (output is
+        // tiny, max a few rows), then delete each by row URI. Never query the
+        // unfiltered carriers table — it pulls the entire global APN database
+        // and was the original cause of the OOM/LMK crash.
+        val output = runRootOutput(
+            "content query --uri content://telephony/carriers --where \"name='$DUP_APN_NAME'\""
+        ) ?: return
         val dups = parseApns(output).filter { it.name == DUP_APN_NAME }
         for (dup in dups) {
             runRoot("content delete --uri content://telephony/carriers/${dup.id}")
