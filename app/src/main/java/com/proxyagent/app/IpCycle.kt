@@ -17,9 +17,19 @@ import java.util.concurrent.TimeUnit
 // the IP) → airplane off → reattach in 2G/3G → flip RAT back to original →
 // reattach in LTE → fetch public IP via ipify → compare. Light data-toggle
 // passes are skipped on purpose: on operators that hold the PDP context,
-// they almost never win, so we'd just burn budget. Total budget ~180s.
+// they almost never win, so we'd just burn budget. Base budget ~180s.
+//
+// If basic nuclear doesn't move the IP and the caller passes a CycleConfig
+// with optional fallbacks enabled, two extra steps fire:
+//   - APN swap: toggles preferred APN between SIM-configured entries to
+//     force a fresh PDP context with the operator (extra ~50s).
+//   - IMEI rotation: runs a user-supplied root command (custom shell, or
+//     a preset like resetprop / magisk-imei) to change device identity
+//     before re-attaching (extra ~50s). Requires Magisk + identity-changer
+//     module installed; the app only invokes the command.
+//
 // The caller decides what to do with the subprocess; this only manipulates
-// the radio + verifies IP.
+// radio + APN + identity, then verifies IP.
 object IpCycle {
 
     data class CycleResult(
@@ -32,6 +42,18 @@ object IpCycle {
         // "interrupted"
         val reason: String,
     )
+
+    data class CycleConfig(
+        val apnSwap: Boolean = false,
+        val imeiRotation: Boolean = false,
+        // "custom" → run imeiCustomCmd as-is via su
+        // "props"  → resetprop a random IMEI (needs MagiskHidePropsConfig)
+        // "magisk-imei" → magisk-imei --random (needs the module)
+        val imeiMethod: String = "custom",
+        val imeiCustomCmd: String = "",
+    )
+
+    private data class ApnInfo(val id: Int, val name: String, val apn: String)
 
     private data class Step(val sleepMs: Long, val ratSwitch: Boolean)
 
@@ -49,10 +71,16 @@ object IpCycle {
     // take longer than a normal reattach because the modem is mid-handover.
     private const val RAT_RESTORE_REATTACH_MS = 15_000L
 
+    // Marker name for APN rows we created ourselves as rotation duplicates.
+    // Used both to identify our rows for cleanup and to filter them out of
+    // the "real alternate" search (so we don't double-swap our own dup).
+    private const val DUP_APN_NAME = "ProxyAgent-rotation-tmp"
+
     fun cycleAndVerify(
         context: Context,
         knownIp: String,
         log: (String) -> Unit = {},
+        config: CycleConfig = CycleConfig(),
     ): CycleResult {
         val start = System.currentTimeMillis()
         val deadline = start + TOTAL_BUDGET_MS
@@ -174,6 +202,48 @@ object IpCycle {
                 )
             }
             log("attempt $attempts: IP unchanged ($newIp); escalating")
+        }
+
+        // ── Fallback step: APN swap ─────────────────────────────────────
+        // Only useful if oldIp is known (we need to compare), and only
+        // possible with root (writing to telephony content provider).
+        if (config.apnSwap && rootAvailable && oldIp.isNotEmpty()) {
+            val remaining = deadline - System.currentTimeMillis()
+            if (remaining < 30_000) {
+                log("APN swap skipped — only ${remaining}ms left in budget")
+            } else {
+                attempts++
+                val swapIp = runApnSwapStep(context, log, deadline, attempts)
+                if (swapIp != null) lastNewIp = swapIp
+                if (swapIp != null && swapIp != oldIp) {
+                    log("APN swap: success — $oldIp -> $swapIp")
+                    return CycleResult(
+                        oldIp, swapIp, true, attempts,
+                        System.currentTimeMillis() - start, "ok",
+                    )
+                }
+                log("APN swap: IP still ${swapIp ?: "unknown"}; falling through")
+            }
+        }
+
+        // ── Fallback step: IMEI rotation ────────────────────────────────
+        if (config.imeiRotation && rootAvailable && oldIp.isNotEmpty()) {
+            val remaining = deadline - System.currentTimeMillis()
+            if (remaining < 30_000) {
+                log("IMEI rotation skipped — only ${remaining}ms left in budget")
+            } else {
+                attempts++
+                val imeiIp = runImeiRotateStep(context, config, log, deadline, attempts)
+                if (imeiIp != null) lastNewIp = imeiIp
+                if (imeiIp != null && imeiIp != oldIp) {
+                    log("IMEI rotation: success — $oldIp -> $imeiIp")
+                    return CycleResult(
+                        oldIp, imeiIp, true, attempts,
+                        System.currentTimeMillis() - start, "ok",
+                    )
+                }
+                log("IMEI rotation: IP still ${imeiIp ?: "unknown"}")
+            }
         }
 
         val reason = if (!toggleEverWorked) "no_toggle_method" else "ip_unchanged"
@@ -298,5 +368,264 @@ object IpCycle {
 
     private fun restoreRat(originalMode: String) {
         runRoot("settings put global preferred_network_mode $originalMode")
+    }
+
+    // ── Shared inner cycle for fallback steps ──────────────────────────
+    // Strips the RAT-switch dance (kept only in the basic ladder where the
+    // 80-second variant relies on it). Fallback steps already have a strong
+    // identity/route change of their own, so airplane + rild restart is
+    // enough — no need to double the budget with two RAT toggles.
+    private fun innerCycle(
+        context: Context,
+        waitMs: Long,
+        rootAvailable: Boolean,
+        log: (String) -> Unit,
+        deadline: Long,
+        label: String,
+    ): Boolean {
+        log("$label: airplane on${if (rootAvailable) " + restart ril" else ""}, sleeping ${waitMs / 1000}s")
+        if (!airplaneOn(context, rootAvailable)) {
+            log("$label: airplane on failed")
+            return false
+        }
+        if (rootAvailable) runRoot("setprop ctl.restart ril-daemon")
+        try { Thread.sleep(waitMs) } catch (_: InterruptedException) { return false }
+        if (!airplaneOff(context, rootAvailable)) {
+            log("$label: airplane off failed")
+            return false
+        }
+        log("$label: waiting for cellular reattach")
+        val reattachDeadline = minOf(System.currentTimeMillis() + REATTACH_WAIT_MS, deadline)
+        while (System.currentTimeMillis() < reattachDeadline) {
+            if (hasCellularInternet(context)) break
+            try { Thread.sleep(500) } catch (_: InterruptedException) { return false }
+        }
+        try { Thread.sleep(POST_REATTACH_GRACE_MS) } catch (_: InterruptedException) {}
+        return true
+    }
+
+    // ── APN swap step ───────────────────────────────────────────────────
+    // Switches the preferred APN to an alternate entry on the SIM, cycles
+    // the radio so the modem attaches under the new APN (fresh PDP), then
+    // swaps back and cycles again. The double swap forces two PDP context
+    // establishments with different APNs — usually enough to break a
+    // pinned IP, IF the SIM has more than one APN configured.
+    private fun runApnSwapStep(
+        context: Context,
+        log: (String) -> Unit,
+        deadline: Long,
+        attempt: Int,
+    ): String? {
+        val tag = "attempt $attempt (APN swap)"
+        return try {
+            val currentId = readPreferredApnId(log) ?: run {
+                log("$tag: aborted — couldn't read preferapn")
+                return@try null
+            }
+            val altApn = findOrCreateAlternateApn(currentId, log) ?: run {
+                log("$tag: aborted — no alternate APN and couldn't create duplicate")
+                return@try null
+            }
+            log("$tag: preferapn $currentId -> ${altApn.id} (${altApn.name}/${altApn.apn})")
+            if (!setPreferredApn(altApn.id)) {
+                log("$tag: aborted — preferapn write failed")
+                return@try null
+            }
+            if (!innerCycle(context, 10_000, true, log, deadline, "$tag (alt)")) {
+                setPreferredApn(currentId)   // best-effort restore
+                return@try null
+            }
+            log("$tag: restoring preferapn -> $currentId")
+            setPreferredApn(currentId)
+            innerCycle(context, 5_000, true, log, deadline, "$tag (restore)")
+            fetchPublicIp().ifEmpty { null }
+        } finally {
+            // Always remove our rotation duplicate (if any), regardless of
+            // how this step exited. Real APNs are untouched — cleanup only
+            // matches rows named DUP_APN_NAME.
+            cleanupRotationDuplicates(log)
+        }
+    }
+
+    private fun readPreferredApnId(log: (String) -> Unit): Int? {
+        val output = runRootOutput("content query --uri content://telephony/carriers/preferapn")
+            ?: return null
+        // "Row: 0 apn_id=2"  (Android 10+) or  "Row: 0 _id=2"  (older)
+        val match = Regex("""(?:apn_id|_id)=(\d+)""").find(output)
+        val id = match?.groupValues?.get(1)?.toIntOrNull()
+        log("APN: preferapn raw=\"${output.take(120).replace("\n", " ")}\" parsed_id=$id")
+        return id
+    }
+
+    // Tries to find a real alternate APN already on the SIM. If there isn't
+    // one, duplicates the current APN into a new row (same `apn` string,
+    // same MCC/MNC/protocol/etc., different `name` and `_id`) so we have
+    // something to swap to. The duplicate is tagged with DUP_APN_NAME so
+    // cleanupRotationDuplicates() can remove it after the swap.
+    private fun findOrCreateAlternateApn(currentId: Int, log: (String) -> Unit): ApnInfo? {
+        val output = runRootOutput("content query --uri content://telephony/carriers") ?: return null
+        val apns = parseApns(output)
+        log("APN: ${apns.size} APN(s) on device; current id=$currentId")
+        // Real alternate first — anything that isn't current and isn't our
+        // own leftover dup, and has an actual apn string.
+        val realAlt = apns.firstOrNull {
+            it.id != currentId && it.apn.isNotEmpty() && it.name != DUP_APN_NAME
+        }
+        if (realAlt != null) {
+            log("APN: using existing alternate id=${realAlt.id} name=${realAlt.name} apn=${realAlt.apn}")
+            return realAlt
+        }
+        log("APN: no real alternate — will duplicate current APN")
+        // Clean up any stale dups from a prior interrupted cycle before we
+        // create a fresh one, otherwise findOrCreate could pick up an old dup.
+        cleanupRotationDuplicates(log)
+        val srcFields = queryFullApn(currentId, log) ?: run {
+            log("APN: couldn't read full current row for duplication")
+            return null
+        }
+        if (!insertDuplicateApn(srcFields, log)) return null
+        // Re-query to get the assigned _id of our new row.
+        val newOutput = runRootOutput("content query --uri content://telephony/carriers") ?: return null
+        val created = parseApns(newOutput).firstOrNull { it.name == DUP_APN_NAME }
+        if (created == null) {
+            log("APN: inserted duplicate but it doesn't appear in re-query")
+            return null
+        }
+        log("APN: duplicate created id=${created.id} name=${created.name} apn=${created.apn}")
+        return created
+    }
+
+    private fun queryFullApn(id: Int, log: (String) -> Unit): Map<String, String>? {
+        // `--where` is supported on Android 9+; on older versions we fall back
+        // to querying all and filtering in-process.
+        val output = runRootOutput("content query --uri content://telephony/carriers --where \"_id=$id\"")
+            ?: runRootOutput("content query --uri content://telephony/carriers")
+            ?: return null
+        val rowRe = Regex("""Row:\s*\d+\s+([^\n]+)""")
+        for (match in rowRe.findAll(output)) {
+            val fields = HashMap<String, String>()
+            for (part in match.groupValues[1].split(", ")) {
+                val eq = part.indexOf('=')
+                if (eq <= 0) continue
+                fields[part.substring(0, eq).trim()] = part.substring(eq + 1).trim()
+            }
+            if (fields["_id"]?.toIntOrNull() == id) {
+                log("APN: read ${fields.size} fields from row id=$id (apn=${fields["apn"]})")
+                return fields
+            }
+        }
+        log("APN: row id=$id not found in query output")
+        return null
+    }
+
+    // Builds a `content insert` that copies a curated subset of fields from
+    // the source row. We restrict to fields that are documented in Android's
+    // Telephony.Carriers and skip anything that contains shell-unsafe chars
+    // — APN values in practice never contain quotes, but we still defend.
+    private fun insertDuplicateApn(fields: Map<String, String>, log: (String) -> Unit): Boolean {
+        val safeKeys = listOf(
+            "apn", "type", "mcc", "mnc", "numeric", "protocol", "roaming_protocol",
+            "user", "password", "server", "proxy", "port",
+            "mmsc", "mmsproxy", "mmsport",
+            "authtype", "bearer", "mvno_type", "mvno_match_data",
+            "carrier_enabled",
+        )
+        val sb = StringBuilder("content insert --uri content://telephony/carriers")
+        sb.append(" --bind name:s:'$DUP_APN_NAME'")
+        var copied = 0
+        for (k in safeKeys) {
+            val v = fields[k] ?: continue
+            if (v.isEmpty() || v == "NULL") continue
+            if (v.contains('\'') || v.contains('"') || v.contains('\n') || v.contains('\\')) continue
+            sb.append(" --bind $k:s:'$v'")
+            copied++
+        }
+        val ok = runRoot(sb.toString())
+        log("APN: insert duplicate ${if (ok) "ok" else "failed"} (copied $copied fields, apn=${fields["apn"]})")
+        return ok
+    }
+
+    private fun cleanupRotationDuplicates(log: (String) -> Unit) {
+        // Android 9+: WHERE clause delete works directly.
+        if (runRoot("content delete --uri content://telephony/carriers --where \"name='$DUP_APN_NAME'\"")) {
+            log("APN: cleaned up duplicates via --where")
+            return
+        }
+        // Older Android: enumerate and delete by row URI.
+        val output = runRootOutput("content query --uri content://telephony/carriers") ?: return
+        val dups = parseApns(output).filter { it.name == DUP_APN_NAME }
+        for (dup in dups) {
+            runRoot("content delete --uri content://telephony/carriers/${dup.id}")
+        }
+        if (dups.isNotEmpty()) log("APN: cleaned up ${dups.size} duplicate(s) by id")
+    }
+
+    private fun parseApns(output: String): List<ApnInfo> {
+        val rowRe = Regex("""Row:\s*\d+\s+([^\n]+)""")
+        return rowRe.findAll(output).mapNotNull { match ->
+            val fields = HashMap<String, String>()
+            for (part in match.groupValues[1].split(", ")) {
+                val eq = part.indexOf('=')
+                if (eq <= 0) continue
+                fields[part.substring(0, eq).trim()] = part.substring(eq + 1).trim()
+            }
+            val id = fields["_id"]?.toIntOrNull() ?: return@mapNotNull null
+            val name = fields["name"]?.takeIf { it != "NULL" } ?: ""
+            val apn = fields["apn"]?.takeIf { it != "NULL" } ?: ""
+            ApnInfo(id, name, apn)
+        }.toList()
+    }
+
+    private fun setPreferredApn(apnId: Int): Boolean {
+        // preferapn behaves as INSERT on older Android, UPDATE on newer. Try
+        // both — only one will succeed; the other is a no-op error.
+        return runRoot("content insert --uri content://telephony/carriers/preferapn --bind apn_id:i:$apnId") ||
+            runRoot("content update --uri content://telephony/carriers/preferapn --bind apn_id:i:$apnId")
+    }
+
+    // ── IMEI rotation step ──────────────────────────────────────────────
+    // Runs the user-supplied identity-change command (custom shell, or a
+    // preset). We don't change IMEI ourselves — we just invoke whatever
+    // module the user has installed. After the command runs, a radio
+    // cycle re-presents the device to the operator under the new identity.
+    private fun runImeiRotateStep(
+        context: Context,
+        config: CycleConfig,
+        log: (String) -> Unit,
+        deadline: Long,
+        attempt: Int,
+    ): String? {
+        val tag = "attempt $attempt (IMEI rotate)"
+        val cmd = resolveImeiCommand(config, log) ?: run {
+            log("$tag: aborted — no command for method '${config.imeiMethod}'")
+            return null
+        }
+        log("$tag: running root cmd: $cmd")
+        if (!runRoot(cmd)) {
+            log("$tag: command exited non-zero")
+            return null
+        }
+        if (!innerCycle(context, 10_000, true, log, deadline, tag)) {
+            return null
+        }
+        return fetchPublicIp().ifEmpty { null }
+    }
+
+    private fun resolveImeiCommand(config: CycleConfig, log: (String) -> Unit): String? {
+        return when (config.imeiMethod) {
+            "custom" -> config.imeiCustomCmd.trim().takeIf { it.isNotEmpty() }
+            "props" -> "resetprop -n -p ro.ril.imei0 ${randomImei()}"
+            "magisk-imei" -> "magisk-imei --random"
+            else -> {
+                log("IMEI rotation: unknown method '${config.imeiMethod}'")
+                null
+            }
+        }
+    }
+
+    private fun randomImei(): String {
+        val sb = StringBuilder(15)
+        repeat(15) { sb.append((0..9).random()) }
+        return sb.toString()
     }
 }

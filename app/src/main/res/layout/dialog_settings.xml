@@ -205,5 +205,90 @@
             android:textSize="13sp" />
     </RadioGroup>
 
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:layout_marginTop="14dp"
+        android:layout_marginBottom="10dp"
+        android:background="#33888888" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="IP rotation fallbacks (root required):"
+        android:textSize="11sp"
+        android:textStyle="bold"
+        android:textColor="#888888"
+        android:layout_marginBottom="4dp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Triggered only after the basic 2-step nuclear cycle fails to change the IP."
+        android:textSize="10sp"
+        android:textColor="#666666"
+        android:layout_marginBottom="8dp" />
+
+    <CheckBox
+        android:id="@+id/cbApnSwap"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="APN swap"
+        android:textSize="12sp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Toggles preferred APN to an alternate entry and back, forcing two fresh PDP contexts. Effective only if the SIM has 2+ APNs configured."
+        android:textSize="10sp"
+        android:textColor="#666666"
+        android:layout_marginBottom="10dp" />
+
+    <CheckBox
+        android:id="@+id/cbImeiRotate"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="IMEI rotation"
+        android:textSize="12sp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Invokes an identity-change command (needs a Magisk module installed) and re-attaches the radio under the new IMEI."
+        android:textSize="10sp"
+        android:textColor="#666666"
+        android:layout_marginBottom="6dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="IMEI rotation method:"
+        android:textSize="11sp"
+        android:textColor="#888888"
+        android:layout_marginBottom="2dp" />
+
+    <Spinner
+        android:id="@+id/spImeiMethod"
+        android:layout_width="match_parent"
+        android:layout_height="44dp"
+        android:layout_marginBottom="6dp" />
+
+    <EditText
+        android:id="@+id/etImeiCustomCmd"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:hint="Custom root command (e.g. magisk-imei --random)"
+        android:inputType="text"
+        android:textSize="13sp"
+        android:layout_marginBottom="4dp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="resetprop: spoofs IMEI via MagiskHidePropsConfig (Android-level only — modem may still report real IMEI). magisk-imei: assumes the magisk-imei CLI is on PATH. Custom: runs whatever you type as root."
+        android:textSize="10sp"
+        android:textColor="#666666"
+        android:layout_marginBottom="6dp" />
+
 </LinearLayout>
 </ScrollView>

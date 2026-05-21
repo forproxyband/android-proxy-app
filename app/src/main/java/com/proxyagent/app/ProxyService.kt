@@ -293,9 +293,19 @@ class ProxyService : Service() {
                 val baseline = try {
                     File(filesDir, "nat_ip").readText().trim()
                 } catch (_: Throwable) { "" }
-                val result = IpCycle.cycleAndVerify(this, baseline) { msg ->
-                    log("REBOOT auto-cycle: $msg")
-                }
+                val cyclePrefs = getSharedPreferences("cfg", 0)
+                val cfg = IpCycle.CycleConfig(
+                    apnSwap = cyclePrefs.getBoolean("apn_swap", false),
+                    imeiRotation = cyclePrefs.getBoolean("imei_rotate", false),
+                    imeiMethod = cyclePrefs.getString("imei_method", "custom") ?: "custom",
+                    imeiCustomCmd = cyclePrefs.getString("imei_cmd", "") ?: "",
+                )
+                val result = IpCycle.cycleAndVerify(
+                    context = this,
+                    knownIp = baseline,
+                    log = { msg -> log("REBOOT auto-cycle: $msg") },
+                    config = cfg,
+                )
                 val secs = result.totalMs / 1000
                 when {
                     result.reason == "no_toggle_method" ->

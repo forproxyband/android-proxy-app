@@ -295,6 +295,10 @@ class MainActivity : AppCompatActivity() {
         val btnExport = view.findViewById<Button>(R.id.btnExport)
         val btnScanQr = view.findViewById<Button>(R.id.btnScanQr)
         val tvScanQrHint = view.findViewById<TextView>(R.id.tvScanQrHint)
+        val cbApnSwap = view.findViewById<CheckBox>(R.id.cbApnSwap)
+        val cbImeiRotate = view.findViewById<CheckBox>(R.id.cbImeiRotate)
+        val spImeiMethod = view.findViewById<Spinner>(R.id.spImeiMethod)
+        val etImeiCustomCmd = view.findViewById<EditText>(R.id.etImeiCustomCmd)
         val prefs = getSharedPreferences("cfg", 0)
 
         fun applyModeVisibility(modemMode: Boolean) {
@@ -309,6 +313,26 @@ class MainActivity : AppCompatActivity() {
             val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, retentionLabels)
             adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
             spRetention.adapter = adapter
+        }
+
+        val imeiMethodLabels = arrayOf(
+            "Custom shell command",
+            "resetprop random IMEI (MagiskHide Props)",
+            "magisk-imei --random",
+        )
+        val imeiMethodKeys = arrayOf("custom", "props", "magisk-imei")
+        run {
+            val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, imeiMethodLabels)
+            adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            spImeiMethod.adapter = adapter
+        }
+
+        fun applyImeiVisibility() {
+            val customSelected = imeiMethodKeys
+                .getOrNull(spImeiMethod.selectedItemPosition) == "custom"
+            etImeiCustomCmd.visibility =
+                if (cbImeiRotate.isChecked && customSelected) View.VISIBLE else View.GONE
+            spImeiMethod.isEnabled = cbImeiRotate.isChecked
         }
 
         fun loadFromPrefs() {
@@ -326,11 +350,25 @@ class MainActivity : AppCompatActivity() {
             val modemMode = prefs.getString("mode", "modem") == "modem"
             if (modemMode) rbModeModem.isChecked = true else rbModeBalancer.isChecked = true
             applyModeVisibility(modemMode)
+            cbApnSwap.isChecked = prefs.getBoolean("apn_swap", false)
+            cbImeiRotate.isChecked = prefs.getBoolean("imei_rotate", false)
+            val savedMethod = prefs.getString("imei_method", "custom") ?: "custom"
+            val mIdx = imeiMethodKeys.indexOf(savedMethod).let { if (it < 0) 0 else it }
+            spImeiMethod.setSelection(mIdx)
+            etImeiCustomCmd.setText(prefs.getString("imei_cmd", ""))
+            applyImeiVisibility()
         }
         loadFromPrefs()
 
         rgMode.setOnCheckedChangeListener { _, checkedId ->
             applyModeVisibility(checkedId == R.id.rbModeModem)
+        }
+        cbImeiRotate.setOnCheckedChangeListener { _, _ -> applyImeiVisibility() }
+        spImeiMethod.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, v: View?, position: Int, id: Long) {
+                applyImeiVisibility()
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) { applyImeiVisibility() }
         }
 
         // Expose the dialog widgets to the QR-result callback.
@@ -358,6 +396,8 @@ class MainActivity : AppCompatActivity() {
                 val newMode = if (rgMode.checkedRadioButtonId == R.id.rbModeBalancer) "balancer" else "modem"
                 val engineChanged = prefs.getString("engine", "binary") != newEngine
                 val modeChanged = prefs.getString("mode", "modem") != newMode
+                val imeiMethodKey = imeiMethodKeys[
+                    spImeiMethod.selectedItemPosition.coerceIn(0, imeiMethodKeys.size - 1)]
                 prefs.edit()
                     .putString("h", h).putString("p", p).putString("k", k)
                     .putString("id", id).putString("dns", d)
@@ -365,6 +405,10 @@ class MainActivity : AppCompatActivity() {
                     .putInt("analytics_retention_days", newRetention)
                     .putString("engine", newEngine)
                     .putString("mode", newMode)
+                    .putBoolean("apn_swap", cbApnSwap.isChecked)
+                    .putBoolean("imei_rotate", cbImeiRotate.isChecked)
+                    .putString("imei_method", imeiMethodKey)
+                    .putString("imei_cmd", etImeiCustomCmd.text.toString().trim())
                     .apply()
                 if (retentionChanged) {
                     Thread { try { AnalyticsStore.pruneToRetention(this) } catch (_: Throwable) {} }
@@ -757,10 +801,22 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread { tvStatus.text = "CYCLING NETWORK…"; tvStatus.setTextColor(0xFFFFAA00.toInt()) }
 
                 val baselineIp = publicIp
-                val result = IpCycle.cycleAndVerify(this, baselineIp) { msg ->
-                    Log.i("IpCycle", msg)
-                    runOnUiThread { tvStatus.text = ("CYCLE: $msg").take(64) }
-                }
+                val cyclePrefs = getSharedPreferences("cfg", 0)
+                val cfg = IpCycle.CycleConfig(
+                    apnSwap = cyclePrefs.getBoolean("apn_swap", false),
+                    imeiRotation = cyclePrefs.getBoolean("imei_rotate", false),
+                    imeiMethod = cyclePrefs.getString("imei_method", "custom") ?: "custom",
+                    imeiCustomCmd = cyclePrefs.getString("imei_cmd", "") ?: "",
+                )
+                val result = IpCycle.cycleAndVerify(
+                    context = this,
+                    knownIp = baselineIp,
+                    log = { msg ->
+                        Log.i("IpCycle", msg)
+                        runOnUiThread { tvStatus.text = ("CYCLE: $msg").take(64) }
+                    },
+                    config = cfg,
+                )
 
                 if (result.reason == "no_toggle_method") {
                     runOnUiThread {
