@@ -512,8 +512,18 @@ class ProxyService : Service() {
                     // System-level "no internet" detection. Stops the agent if OS
                     // reports no validated internet for `noInternetGraceMs`, instead
                     // of burning CPU/battery in the subprocess' dial loop.
+                    //
+                    // Suppressed while a REBOOT auto-cycle is in flight — that step
+                    // intentionally kills cellular for up to ~90 seconds (airplane +
+                    // rild restart, optionally RAT switch / APN swap / IMEI rotate),
+                    // so a 30-second no-internet grace would trip mid-rotation and
+                    // auto-stop the agent right as we're about to come back with a
+                    // fresh IP. Manual ↻ from the UI doesn't hit this path because
+                    // the activity stops the service before cycling.
                     val now = System.currentTimeMillis()
-                    if (!systemSaysInternetUp()) {
+                    if (autoCycling) {
+                        noInternetSince = 0L
+                    } else if (!systemSaysInternetUp()) {
                         if (noInternetSince == 0L) noInternetSince = now
                         if (now - noInternetSince >= noInternetGraceMs) {
                             val secs = (now - noInternetSince) / 1000
