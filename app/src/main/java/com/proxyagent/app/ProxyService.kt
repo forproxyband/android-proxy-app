@@ -323,6 +323,23 @@ class ProxyService : Service() {
                     },
                     config = cfg,
                 )
+                // Persist the rotation event with full result detail so the
+                // analytics screen can show the IP change + outcome. Done
+                // right after cycleAndVerify so even if the post-cycle logic
+                // below errors we still have the event row.
+                AnalyticsStore.recordCycleEvent(
+                    this,
+                    CycleEvent(
+                        tMs = System.currentTimeMillis(),
+                        kind = AnalyticsStore.CYCLE_AUTO,
+                        oldIp = result.oldIp,
+                        newIp = result.newIp,
+                        changed = result.changed,
+                        reason = result.reason,
+                        attempts = result.attempts,
+                        durationMs = result.totalMs,
+                    ),
+                )
                 val secs = result.totalMs / 1000
                 when {
                     result.reason == "no_toggle_method" ->

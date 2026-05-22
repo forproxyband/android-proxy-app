@@ -69,6 +69,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var dot0: View
     private lateinit var dot1: View
     private lateinit var dot2: View
+    private lateinit var dot3: View
     private val pagerRefs = StatusPagerAdapter.PageRefs()
     @Volatile private var lastPanelDataAtMs = 0L
     private lateinit var tvLogs: TextView
@@ -145,6 +146,7 @@ class MainActivity : AppCompatActivity() {
         dot0 = findViewById(R.id.dot0)
         dot1 = findViewById(R.id.dot1)
         dot2 = findViewById(R.id.dot2)
+        dot3 = findViewById(R.id.dot3)
         registratorPager.adapter = StatusPagerAdapter(pagerRefs)
         registratorPager.registerOnPageChangeCallback(object : ViewPager2.OnPageChangeCallback() {
             override fun onPageSelected(position: Int) {
@@ -817,6 +819,23 @@ class MainActivity : AppCompatActivity() {
                     },
                     config = cfg,
                 )
+                // Persist the rotation event with full result detail so the
+                // analytics screen can show the IP change + outcome. Recorded
+                // immediately so the row exists even if a later UI/restart
+                // step fails.
+                AnalyticsStore.recordCycleEvent(
+                    this,
+                    CycleEvent(
+                        tMs = System.currentTimeMillis(),
+                        kind = AnalyticsStore.CYCLE_MANUAL,
+                        oldIp = result.oldIp,
+                        newIp = result.newIp,
+                        changed = result.changed,
+                        reason = result.reason,
+                        attempts = result.attempts,
+                        durationMs = result.totalMs,
+                    ),
+                )
 
                 if (result.reason == "no_toggle_method") {
                     runOnUiThread {
@@ -1273,27 +1292,38 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updatePagerDots(active: Int) {
-        val dots = arrayOf(dot0, dot1, dot2)
+        val dots = arrayOf(dot0, dot1, dot2, dot3)
         for (i in dots.indices) {
             dots[i].setBackgroundColor(if (i == active) 0xFF88FFAA.toInt() else 0x33FFFFFF.toInt())
         }
     }
 
-    // Reads the last 24h of buckets and feeds them to the two mini charts.
-    // Done off the UI thread because IO can be slow on cold cache; results
-    // are pushed back via runOnUiThread.
+    // Reads the last 24h of buckets and feeds them to the three mini charts
+    // (traffic, connections, rotations). Done off the UI thread because IO
+    // can be slow on cold cache; results are pushed back via runOnUiThread.
     private fun refreshPanelCharts() {
         Thread {
             try {
                 val now = System.currentTimeMillis()
                 val from = now - 24 * 60 * 60_000L
+                val binMs = AnalyticsStore.BUCKET_MS * 10
                 val buckets = AnalyticsStore.load(this, from, now)
                 val (trafficSeries, trafficStartMs, trafficStepMs, trafficTotalBytes) =
-                    aggregateForPanel(buckets, from, now, AnalyticsStore.BUCKET_MS * 10) { it.rxBytes + it.txBytes }
+                    aggregateForPanel(buckets, from, now, binMs) { it.rxBytes + it.txBytes }
                 val (connSeries, connStartMs, connStepMs, connTotalEvents) =
-                    aggregateForPanel(buckets, from, now, AnalyticsStore.BUCKET_MS * 10) {
+                    aggregateForPanel(buckets, from, now, binMs) {
                         (it.opens + it.closes).toLong()
                     }
+                // Rotations: two stacked series from cycle_events.jsonl.
+                val cycleEvents = AnalyticsStore.loadCycleEvents(this, from, now)
+                val rotSeries = aggregateCyclesForPanel(cycleEvents, from, now, binMs)
+                val rotManual = rotSeries.manual
+                val rotAuto = rotSeries.auto
+                val rotStartMs = rotSeries.startMs
+                val rotStepMs = rotSeries.stepMs
+                val rotManualTotal = rotSeries.manualTotal
+                val rotAutoTotal = rotSeries.autoTotal
+                val rotChangedTotal = rotSeries.changedTotal
                 runOnUiThread {
                     pagerRefs.trafficChart?.let { ch ->
                         ch.setSeries(trafficSeries, trafficStartMs, trafficStepMs)
@@ -1305,9 +1335,55 @@ class MainActivity : AppCompatActivity() {
                         ch.setYLabelFormatter { v -> "%.0f".format(v) }
                     }
                     pagerRefs.connTotal?.text = "$connTotalEvents events"
+                    pagerRefs.rotChart?.let { ch ->
+                        ch.setStackedSeries(rotManual, rotAuto, rotStartMs, rotStepMs)
+                        ch.setYLabelFormatter { v -> "%.0f".format(v) }
+                    }
+                    // "M+A · K→IP" — total attempts (manual + auto) and how
+                    // many of them actually moved the IP. Compact enough to fit
+                    // next to the chart title even at narrow widths.
+                    pagerRefs.rotTotal?.text =
+                        "$rotManualTotal m + $rotAutoTotal a · $rotChangedTotal →IP"
                 }
             } catch (_: Throwable) {}
         }.apply { isDaemon = true; name = "PanelChartLoad"; start() }
+    }
+
+    // Tuple result for aggregateCyclesForPanel — two parallel series (manual
+    // and auto counts per bin), the time axis, per-kind totals, plus the
+    // count of attempts that actually moved the IP (`changed` flag true).
+    private data class CycleSeries(
+        val manual: DoubleArray,
+        val auto: DoubleArray,
+        val startMs: Long,
+        val stepMs: Long,
+        val manualTotal: Int,
+        val autoTotal: Int,
+        val changedTotal: Int,
+    )
+
+    private fun aggregateCyclesForPanel(
+        events: List<CycleEvent>,
+        fromMs: Long,
+        toMs: Long,
+        binMs: Long,
+    ): CycleSeries {
+        val n = ((toMs - fromMs) / binMs).toInt().coerceAtLeast(1)
+        val manual = DoubleArray(n)
+        val auto = DoubleArray(n)
+        var mTotal = 0
+        var aTotal = 0
+        var changedTotal = 0
+        for (e in events) {
+            val idx = ((e.tMs - fromMs) / binMs).toInt()
+            if (idx < 0 || idx >= n) continue
+            when (e.kind) {
+                AnalyticsStore.CYCLE_MANUAL -> { manual[idx] += 1.0; mTotal++ }
+                AnalyticsStore.CYCLE_AUTO -> { auto[idx] += 1.0; aTotal++ }
+            }
+            if (e.changed) changedTotal++
+        }
+        return CycleSeries(manual, auto, fromMs, binMs, mTotal, aTotal, changedTotal)
     }
 
     // Shared helper: fold bucket list into a fixed-size series spanning

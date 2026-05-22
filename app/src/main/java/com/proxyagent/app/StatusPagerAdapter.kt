@@ -10,6 +10,7 @@ import androidx.recyclerview.widget.RecyclerView
 // Page 0: live status text (registrator / tunnels / current rate)
 // Page 1: 24h traffic mini chart
 // Page 2: 24h connections mini chart
+// Page 3: 24h IP-rotation mini chart (stacked bars: manual + auto)
 //
 // Holders are cached on the activity (refs is populated in onCreateViewHolder)
 // so MainActivity can update them in-place from its 1Hz refresh loop without
@@ -33,6 +34,11 @@ class StatusPagerAdapter(
         var connTitle: TextView? = null
         var connTotal: TextView? = null
         var connChart: MiniLineChart? = null
+
+        var rotRoot: View? = null
+        var rotTitle: TextView? = null
+        var rotTotal: TextView? = null
+        var rotChart: MiniLineChart? = null
     }
 
     class VH(v: View) : RecyclerView.ViewHolder(v)
@@ -61,7 +67,7 @@ class StatusPagerAdapter(
                 refs.trafficChart?.setStyle(MiniLineChart.Style.LINE)
                 VH(v)
             }
-            else -> {
+            2 -> {
                 val v = inflater.inflate(R.layout.panel_chart, parent, false)
                 refs.connRoot = v
                 refs.connTitle = v.findViewById(R.id.tvChartTitle)
@@ -72,10 +78,25 @@ class StatusPagerAdapter(
                 refs.connChart?.setStyle(MiniLineChart.Style.BARS)
                 VH(v)
             }
+            else -> {
+                val v = inflater.inflate(R.layout.panel_chart, parent, false)
+                refs.rotRoot = v
+                refs.rotTitle = v.findViewById(R.id.tvChartTitle)
+                refs.rotTotal = v.findViewById(R.id.tvChartTotal)
+                refs.rotChart = v.findViewById(R.id.chart)
+                refs.rotTitle?.text = "ROTATIONS · LAST 24H · ■ manual  ■ auto"
+                // Bottom = manual (cyan), top stacked = auto (magenta). Two
+                // visibly distinct hues so a glance at the bar shows the mix.
+                refs.rotChart?.setColors(0xFF66E0FF.toInt(), 0x3366E0FF.toInt())
+                refs.rotChart?.setStackedTopColor(0xFFFF66CC.toInt())
+                refs.rotChart?.setStyle(MiniLineChart.Style.STACKED_BARS)
+                refs.rotChart?.setEmptyText("no rotations yet")
+                VH(v)
+            }
         }
     }
 
-    override fun getItemCount(): Int = 3
+    override fun getItemCount(): Int = 4
 
     override fun onBindViewHolder(holder: VH, position: Int) { /* no-op; refs are populated on create */ }
 }

@@ -32,6 +32,13 @@ class AnalyticsActivity : AppCompatActivity() {
     private lateinit var tvConnTotal: TextView
     private lateinit var chartTraffic: MiniLineChart
     private lateinit var chartConn: MiniLineChart
+    private lateinit var tvRotTotal: TextView
+    private lateinit var tvRotManual: TextView
+    private lateinit var tvRotAuto: TextView
+    private lateinit var tvRotRate: TextView
+    private lateinit var tvRotLast: TextView
+    private lateinit var chartRot: MiniLineChart
+    private lateinit var tvRotList: TextView
     private lateinit var tvRetentionHint: TextView
     private lateinit var btnExport: Button
 
@@ -39,6 +46,7 @@ class AnalyticsActivity : AppCompatActivity() {
     private var currentFilterType = 0
     private var currentFilterValue: String = ""
     private var currentBuckets: List<AnalyticsBucket> = emptyList()
+    private var currentCycleEvents: List<CycleEvent> = emptyList()
     private var currentPeriodMs = 24L * 3600_000L
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -56,6 +64,13 @@ class AnalyticsActivity : AppCompatActivity() {
         tvConnTotal = findViewById(R.id.tvConnTotal)
         chartTraffic = findViewById(R.id.chartTraffic)
         chartConn = findViewById(R.id.chartConn)
+        tvRotTotal = findViewById(R.id.tvRotTotal)
+        tvRotManual = findViewById(R.id.tvRotManual)
+        tvRotAuto = findViewById(R.id.tvRotAuto)
+        tvRotRate = findViewById(R.id.tvRotRate)
+        tvRotLast = findViewById(R.id.tvRotLast)
+        chartRot = findViewById(R.id.chartRot)
+        tvRotList = findViewById(R.id.tvRotList)
         tvRetentionHint = findViewById(R.id.tvRetentionHint)
         btnExport = findViewById(R.id.btnExportAnalytics)
 
@@ -68,6 +83,15 @@ class AnalyticsActivity : AppCompatActivity() {
         chartConn.setStyle(MiniLineChart.Style.BARS)
         chartConn.setEmptyText("no connections in this period")
         chartConn.setYLabelFormatter { v -> "%.0f".format(v) }
+
+        // Bottom = manual (cyan), stacked top = auto (magenta). Same hue
+        // mapping as the swipe-panel mini chart so the colors carry across
+        // the two surfaces.
+        chartRot.setColors(0xFF66E0FF.toInt(), 0x3366E0FF.toInt())
+        chartRot.setStackedTopColor(0xFFFF66CC.toInt())
+        chartRot.setStyle(MiniLineChart.Style.STACKED_BARS)
+        chartRot.setEmptyText("no rotations in this period")
+        chartRot.setYLabelFormatter { v -> "%.0f".format(v) }
 
         rgPeriod.setOnCheckedChangeListener { _, _ -> reload() }
 
@@ -113,8 +137,10 @@ class AnalyticsActivity : AppCompatActivity() {
         val from = to - currentPeriodMs
         Thread {
             val buckets = try { AnalyticsStore.load(this, from, to) } catch (_: Throwable) { emptyList() }
+            val events = try { AnalyticsStore.loadCycleEvents(this, from, to) } catch (_: Throwable) { emptyList() }
             runOnUiThread {
                 currentBuckets = buckets
+                currentCycleEvents = events
                 refreshFilterValues()
                 applyFilter()
             }
@@ -190,6 +216,90 @@ class AnalyticsActivity : AppCompatActivity() {
         }
         chartTraffic.setSeries(traffic, from, binMs)
         chartConn.setSeries(conns, from, binMs)
+
+        // Rotations: events have no registrator/natIp/transport association,
+        // so the bucket filter doesn't apply — we always show all events in
+        // the period (the heading next to the chart says "filter not applied").
+        val rotManual = DoubleArray(n)
+        val rotAuto = DoubleArray(n)
+        var manualTotal = 0
+        var autoTotal = 0
+        var changedTotal = 0
+        var lastEvent: CycleEvent? = null
+        for (e in currentCycleEvents) {
+            val idx = ((e.tMs - from) / binMs).toInt()
+            if (idx < 0 || idx >= n) continue
+            when (e.kind) {
+                AnalyticsStore.CYCLE_MANUAL -> { rotManual[idx] += 1.0; manualTotal++ }
+                AnalyticsStore.CYCLE_AUTO -> { rotAuto[idx] += 1.0; autoTotal++ }
+            }
+            if (e.changed) changedTotal++
+            if (lastEvent == null || e.tMs > lastEvent.tMs) lastEvent = e
+        }
+        val rotTotal = manualTotal + autoTotal
+        tvRotTotal.text = rotTotal.toString()
+        tvRotManual.text = "↻ MANUAL: $manualTotal"
+        tvRotAuto.text = "◉ AUTO: $autoTotal"
+        // Average per day. Periods are 1d/7d/30d so this is the natural unit.
+        val periodDays = (currentPeriodMs / 86_400_000.0).coerceAtLeast(1.0 / 24.0)
+        val avgPerDay = rotTotal / periodDays
+        tvRotRate.text = "avg ${"%.1f".format(avgPerDay)}/day · $changedTotal IP change${if (changedTotal == 1) "" else "s"}"
+        tvRotLast.text = lastEvent?.let { e ->
+            val ago = humanAgo(System.currentTimeMillis() - e.tMs)
+            val ipPart = when {
+                e.changed && e.newIp.isNotEmpty() && e.oldIp.isNotEmpty() ->
+                    " · ${e.oldIp} → ${e.newIp}"
+                e.newIp.isNotEmpty() && e.oldIp.isNotEmpty() && e.newIp == e.oldIp ->
+                    " · unchanged ${e.newIp}"
+                else -> ""
+            }
+            "last rotation: $ago ago$ipPart"
+        } ?: "no rotations recorded"
+        chartRot.setStackedSeries(rotManual, rotAuto, from, binMs)
+
+        // Recent rotations list — most-recent first, capped at 10 rows so we
+        // don't blow up the screen. Each row: HH:mm · kind · old→new (or
+        // unchanged) · attempts/duration. Matches the CSV format roughly.
+        val recent = currentCycleEvents.asReversed().take(10)
+        tvRotList.text = if (recent.isEmpty()) {
+            "no rotations recorded in this period"
+        } else {
+            val tsFmt = SimpleDateFormat("HH:mm", Locale.US)
+            recent.joinToString("\n") { e -> formatRotationRow(e, tsFmt) }
+        }
+    }
+
+    private fun formatRotationRow(e: CycleEvent, tsFmt: SimpleDateFormat): String {
+        val time = tsFmt.format(Date(e.tMs))
+        val kindLabel = if (e.kind == AnalyticsStore.CYCLE_MANUAL) "↻ man " else "◉ auto"
+        val ipPart = when {
+            e.changed && e.oldIp.isNotEmpty() && e.newIp.isNotEmpty() ->
+                "${e.oldIp} → ${e.newIp}"
+            e.oldIp.isNotEmpty() && e.newIp.isNotEmpty() && e.newIp == e.oldIp ->
+                "unchanged ${e.newIp}"
+            e.oldIp.isNotEmpty() ->
+                "from ${e.oldIp} (no result)"
+            e.reason == "no_toggle_method" -> "no toggle available"
+            e.reason.isNotEmpty() -> e.reason
+            else -> "(no detail)"
+        }
+        val meta = buildString {
+            if (e.attempts > 0) append(" · ${e.attempts}× try")
+            if (e.durationMs > 0) append(" / ${e.durationMs / 1000}s")
+        }
+        return "$time  $kindLabel  $ipPart$meta"
+    }
+
+    // Compact "N units ago" — used for "last rotation". Not exact (floors),
+    // just enough granularity for the eye to glance and move on.
+    private fun humanAgo(deltaMs: Long): String {
+        val d = if (deltaMs < 0) 0L else deltaMs
+        return when {
+            d < 60_000L -> "${d / 1000}s"
+            d < 3600_000L -> "${d / 60_000L}m"
+            d < 86_400_000L -> "${d / 3600_000L}h"
+            else -> "${d / 86_400_000L}d"
+        }
     }
 
     private fun pickBinMs(periodMs: Long): Long {
@@ -220,6 +330,8 @@ class AnalyticsActivity : AppCompatActivity() {
             val exportDir = File(filesDir, "exports").apply { mkdirs() }
             val out = File(exportDir, "proxy-agent-analytics-$periodLabel-$filterLabel-$stamp.csv")
             val tsFmt = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
+            val manualCount = currentCycleEvents.count { it.kind == AnalyticsStore.CYCLE_MANUAL }
+            val autoCount = currentCycleEvents.count { it.kind == AnalyticsStore.CYCLE_AUTO }
             out.bufferedWriter().use { w ->
                 w.append("# Proxy Agent · Analytics export\n")
                 w.append("# Generated: $stamp\n")
@@ -228,6 +340,10 @@ class AnalyticsActivity : AppCompatActivity() {
                 w.append("# Totals: rxBytes=").append(buckets.sumOf { it.rxBytes }.toString())
                 w.append(" txBytes=").append(buckets.sumOf { it.txBytes }.toString())
                 w.append(" opens=").append(buckets.sumOf { it.opens }.toString()).append("\n")
+                w.append("# Rotations: total=").append((manualCount + autoCount).toString())
+                w.append(" manual=").append(manualCount.toString())
+                w.append(" auto=").append(autoCount.toString())
+                w.append(" (filter not applied — events have no registrator/transport association)\n")
                 w.append("timestamp,unix_ms,rx_bytes,tx_bytes,opens,closes,peak_tunnels,registrator,nat_ip,transport\n")
                 for (b in buckets) {
                     w.append(tsFmt.format(Date(b.tMs))).append(',')
@@ -240,6 +356,25 @@ class AnalyticsActivity : AppCompatActivity() {
                     w.append(csvEscape(b.registrator)).append(',')
                     w.append(csvEscape(b.natIp)).append(',')
                     w.append(csvEscape(b.transport)).append('\n')
+                }
+                // Second logical table after a blank-line separator. Lets the
+                // user grep / awk just the rotation events without touching
+                // the bucket rows. Header re-stated for clarity.
+                if (currentCycleEvents.isNotEmpty()) {
+                    w.append('\n')
+                    w.append("# Cycle events (one row per rotation; filter does not apply)\n")
+                    w.append("timestamp,unix_ms,kind,old_ip,new_ip,changed,reason,attempts,duration_ms\n")
+                    for (e in currentCycleEvents) {
+                        w.append(tsFmt.format(Date(e.tMs))).append(',')
+                        w.append(e.tMs.toString()).append(',')
+                        w.append(if (e.kind == AnalyticsStore.CYCLE_MANUAL) "manual" else "auto").append(',')
+                        w.append(csvEscape(e.oldIp)).append(',')
+                        w.append(csvEscape(e.newIp)).append(',')
+                        w.append(if (e.changed) "true" else "false").append(',')
+                        w.append(csvEscape(e.reason)).append(',')
+                        w.append(e.attempts.toString()).append(',')
+                        w.append(e.durationMs.toString()).append('\n')
+                    }
                 }
             }
             val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", out)

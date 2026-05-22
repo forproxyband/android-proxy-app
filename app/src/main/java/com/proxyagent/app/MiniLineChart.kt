@@ -18,14 +18,18 @@ class MiniLineChart @JvmOverloads constructor(
     defStyleAttr: Int = 0,
 ) : View(context, attrs, defStyleAttr) {
 
-    enum class Style { LINE, BARS }
+    enum class Style { LINE, BARS, STACKED_BARS }
 
     private var seriesValues: DoubleArray = DoubleArray(0)
+    // Second (top) series for STACKED_BARS — drawn on top of seriesValues in
+    // the same X column using stackedTopColor. Ignored by LINE/BARS.
+    private var seriesValuesTop: DoubleArray = DoubleArray(0)
     private var seriesStartMs: Long = 0L
     private var seriesStepMs: Long = AnalyticsStore.BUCKET_MS
     private var chartStyle: Style = Style.LINE
     private var lineColor = 0xFF00FF41.toInt()
     private var fillColor = 0x3300FF41
+    private var stackedTopColor = 0xFFFFCC66.toInt()
     private var gridColor = 0x33FFFFFF.toInt()
     private var labelColor = 0x99FFFFFF.toInt()
     private var emptyText: String = "no data"
@@ -60,8 +64,25 @@ class MiniLineChart @JvmOverloads constructor(
 
     fun setSeries(values: DoubleArray, startMs: Long, stepMs: Long) {
         this.seriesValues = values
+        this.seriesValuesTop = DoubleArray(0)
         this.seriesStartMs = startMs
         this.seriesStepMs = stepMs
+        invalidate()
+    }
+
+    // For STACKED_BARS: `bottom` rendered with lineColor, `top` stacked on
+    // top with stackedTopColor. Arrays must be the same length; mismatch is
+    // safely truncated to the shorter one.
+    fun setStackedSeries(bottom: DoubleArray, top: DoubleArray, startMs: Long, stepMs: Long) {
+        this.seriesValues = bottom
+        this.seriesValuesTop = top
+        this.seriesStartMs = startMs
+        this.seriesStepMs = stepMs
+        invalidate()
+    }
+
+    fun setStackedTopColor(color: Int) {
+        stackedTopColor = color
         invalidate()
     }
 
@@ -79,7 +100,9 @@ class MiniLineChart @JvmOverloads constructor(
         val plotH = h - padT - padB
 
         // Empty state.
-        if (seriesValues.isEmpty() || seriesValues.all { it <= 0.0 }) {
+        val emptyBottom = seriesValues.isEmpty() || seriesValues.all { it <= 0.0 }
+        val emptyTop = seriesValuesTop.isEmpty() || seriesValuesTop.all { it <= 0.0 }
+        if (emptyBottom && emptyTop) {
             paintLabel.color = labelColor
             paintLabel.textAlign = Paint.Align.CENTER
             canvas.drawText(emptyText, w / 2f, h / 2f, paintLabel)
@@ -87,7 +110,18 @@ class MiniLineChart @JvmOverloads constructor(
         }
 
         var maxV = 0.0
-        for (v in seriesValues) if (v > maxV) maxV = v
+        if (chartStyle == Style.STACKED_BARS) {
+            // Ceiling must accommodate the sum at each X.
+            val n = minOf(seriesValues.size, if (seriesValuesTop.isEmpty()) seriesValues.size else seriesValuesTop.size)
+            for (i in 0 until n) {
+                val b = if (i < seriesValues.size) seriesValues[i] else 0.0
+                val t = if (i < seriesValuesTop.size) seriesValuesTop[i] else 0.0
+                val sum = b + t
+                if (sum > maxV) maxV = sum
+            }
+        } else {
+            for (v in seriesValues) if (v > maxV) maxV = v
+        }
         if (maxV <= 0) maxV = 1.0
         val ceiling = niceCeiling(maxV)
 
@@ -121,7 +155,7 @@ class MiniLineChart @JvmOverloads constructor(
             canvas.drawPath(pathFill, paintFill)
             paintLine.color = lineColor
             canvas.drawPath(pathLine, paintLine)
-        } else {
+        } else if (chartStyle == Style.BARS) {
             // Bars: each bucket is one slim column with a 1px gap.
             paintBar.color = lineColor
             val barW = (plotW / n.toFloat()).coerceAtLeast(1f)
@@ -133,6 +167,29 @@ class MiniLineChart @JvmOverloads constructor(
                 val x1 = (x0 + barW - gap).coerceAtMost(padL + plotW)
                 val y = padT + plotH - (plotH * (v / ceiling)).toFloat()
                 canvas.drawRect(x0, y, x1, padT + plotH, paintBar)
+            }
+        } else {
+            // STACKED_BARS: bottom (lineColor) drawn first, top (stackedTopColor)
+            // stacked on it. Same column geometry as BARS.
+            val barW = (plotW / n.toFloat()).coerceAtLeast(1f)
+            val gap = if (barW > 3f) 1f else 0f
+            for (i in 0 until n) {
+                val b = if (i < seriesValues.size) seriesValues[i].coerceAtLeast(0.0) else 0.0
+                val t = if (i < seriesValuesTop.size) seriesValuesTop[i].coerceAtLeast(0.0) else 0.0
+                if (b <= 0 && t <= 0) continue
+                val x0 = padL + plotW * (i.toFloat() / n.toFloat())
+                val x1 = (x0 + barW - gap).coerceAtMost(padL + plotW)
+                val baseY = padT + plotH
+                val bH = (plotH * (b / ceiling)).toFloat()
+                val tH = (plotH * (t / ceiling)).toFloat()
+                if (b > 0) {
+                    paintBar.color = lineColor
+                    canvas.drawRect(x0, baseY - bH, x1, baseY, paintBar)
+                }
+                if (t > 0) {
+                    paintBar.color = stackedTopColor
+                    canvas.drawRect(x0, baseY - bH - tH, x1, baseY - bH, paintBar)
+                }
             }
         }
 
