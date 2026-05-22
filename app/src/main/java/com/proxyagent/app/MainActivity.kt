@@ -1153,6 +1153,11 @@ class MainActivity : AppCompatActivity() {
         // "TCP+yamux", "WebSocket") was added in v2.0.14-quic. Stay forward-
         // compatible with older conn_info files that only have 6 fields.
         val uplinkTransport = connInfo.getOrNull(6).orEmpty()
+        // 8th field (cycle stage) is non-empty only during REBOOT auto-cycle.
+        // When set, it overrides the normal status badge with "ROTATING · …"
+        // so users see the rotation in progress instead of a misleading
+        // RECONNECTING… that comes from the WS read error mid-cycle.
+        val cycleStage = connInfo.getOrNull(7).orEmpty()
 
         val running = proxyState == "running" || proxyState == "starting"
         val configured = hasConnectionConfig()
@@ -1195,6 +1200,12 @@ class MainActivity : AppCompatActivity() {
 
         if (!cyclingIp) {
             val (label, color) = when {
+                // REBOOT auto-cycle in flight — show the live stage. Beats
+                // RECONNECTING…, which is technically what connStatus shows
+                // (the WS dropped when we killed cellular), but tells the
+                // user nothing about the rotation that's actually happening.
+                cycleStage.isNotEmpty() ->
+                    "ROTATING · $cycleStage".take(64) to 0xFFFFAA00.toInt()
                 pendingAction == "stop" -> "STOPPING…" to 0xFFFFAA00.toInt()
                 !running && !configured ->
                     "NOT CONFIGURED · TAP START TO IMPORT" to 0xFFFFAA00.toInt()

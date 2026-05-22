@@ -4,6 +4,12 @@ These binaries are built from upstream `proxy-agent` and are embedded into the
 APK at build time. The files at the repository root are staging copies kept
 there for easy refresh; the actual build consumes the copies under `app/`.
 
+For app-level architecture (service lifecycle, `conn_info` schema, settings,
+IP rotation algorithm, watchdog) see [ARCHITECTURE.md]. This file stays
+strictly about the bundled binary and how it's integrated.
+
+[ARCHITECTURE.md]: ./ARCHITECTURE.md
+
 ## Version: v2.0.18 (updated 2026-05-21)
 
 TCP-first uplink with a QUIC fallback and a sticky transport cache
@@ -227,8 +233,9 @@ Intent extra (`MainActivity.kt:827`) and dispatched at
   `setExecutable(true, false)` defensively at 533.
 - **No CLI args.** Env on `pb.environment()` (542-563): always
   `agent_key`, `enable_netagent=true`, `HOME=filesDir`,
-  `TMPDIR=cacheDir`, `dns_servers`; plus mode keys (§8). `HOME=filesDir`
-  is where the SDK writes `.proxyagent_transport` (sticky TCP/QUIC).
+  `TMPDIR=cacheDir`, `dns_servers`; plus mode-specific keys
+  ([ARCHITECTURE.md] §"Connection modes"). `HOME=filesDir` is where
+  the SDK writes `.proxyagent_transport` (sticky TCP/QUIC).
 - stderr merged into stdout; cwd is the service default. stdout drained
   line-by-line on `AgentRunner` into `parseAgentLine` + `agent.log` (569-574).
 - Lifecycle (537-604): exp backoff capped at 30s on non-stop exit.
@@ -258,65 +265,33 @@ All in `runAarEngine` (`ProxyService.kt:622-738`):
 
 ### 5. Log parsing — `parseAgentLine` (`ProxyService.kt:177-276`)
 
-- `tunnel opened` / `opening tunnel` (179) → `activeTunnels++`;
-  `tunnel closed` (183) → `activeTunnels--` clamped.
-- `ws connected` / `uplink connected` (187) → `CONNECTED`,
-  `connectedSinceMs=now`. Transport detection (195-204):
-  `transport=quic` → `"QUIC"`, `transport=tcp` → `"TCP (splice)"`,
-  `uplink connected` with no key → `"TCP+yamux"` (v2.0.10–v2.0.13),
-  `ws connected` → `"WebSocket"` (pre-v2.0.10). Old WS line's
-  `url=wss://host` also fills `currentRegistrator`.
+We tail the binary's stdout line-by-line and recognise these patterns
+to drive app-side state. The reactions (state machine, `conn_info`
+schema, status surface) live in [ARCHITECTURE.md]; this section only
+catalogues which binary lines we look at and what they signal.
+
+- `tunnel opened` / `opening tunnel` (179) — tunnel counter +1;
+  `tunnel closed` (183) — counter -1, clamped at 0.
+- `ws connected` / `uplink connected` (187) — uplink up. Transport
+  detection (195-204): `transport=quic` → `"QUIC"`, `transport=tcp` →
+  `"TCP (splice)"`, `uplink connected` with no key →
+  `"TCP+yamux"` (v2.0.10–v2.0.13), `ws connected` → `"WebSocket"`
+  (pre-v2.0.10). The old WS line's `url=wss://host` also fills the
+  registrator field.
 - `selected … registrator host=… port=…` (214) and
-  `direct registrator configured …` (220) → fill registrator.
-- Reconnect triggers (226-244): any of `ws read error`, `close 1006`,
+  `direct registrator configured …` (220) — fills registrator label.
+- Reconnect signals (226-244): any of `ws read error`, `close 1006`,
   `ws close frame`, `uplink dial failed`, `uplink yamux init failed`,
   `uplink control stream open failed`, `uplink AUTH send/reply/denied`,
   `uplink accept loop ended`, `uplink control loop ended`,
-  `balancer selection failed`, `no registrator available` →
-  `RECONNECTING` + clear registrator/tunnels/since/transport.
+  `balancer selection failed`, `no registrator available` — flips
+  the state machine to RECONNECTING and clears
+  registrator/tunnels/since/transport.
 - `ws dialing` / `uplink dialing` / `balancer request` (253) →
-  `CONNECTING` (unless already CONNECTED); `endpoint=host:port` on
-  `uplink dialing` fills registrator pre-AUTH.
-- `REBOOT received from registrator` (271) →
-  `triggerAutoIpCycle(reason)` (cellular toggle + reconnect, 278-316).
-
-### 6. Status surface
-
-`conn_info` at `filesDir/conn_info`, written every 1s by `StatusUpdater`
-via `writeConnInfo` (`ProxyService.kt:126-135`). One pipe-delimited
-line: `${connStatus.name}|$rxRate|$txRate|$currentRegistrator|$activeTunnels|$connectedSinceMs|$currentUplinkTransport`.
-Fields (0-indexed): 0=status enum, 1=rxRate B/s, 2=txRate B/s,
-3=`host:port`, 4=tunnels, 5=connectedSinceMs (epoch ms), 6=uplink
-transport label (added v2.0.14-quic). `MainActivity.refresh()` polls
-every 3s (`MainActivity.kt:1076-1086`) using `getOrNull(N)` for
-forward-compat with 6-field downgrades.
-
-Sibling files in `filesDir`: `proxy_state` (`starting`/`running`/
-`stopped`/`auto_stopped`/`error`), `stop_reason`, `agent.log` (rotated
-30→25 MiB), `nat_ip`, `battery_threshold`, `speed_units`. No
-Binder/broadcasts — service→UI is file-based; UI→service is
-`startService` Intent extras + `action=STOP`.
-
-### 7. App → agent commands
-
-None. No writes to `proc.outputStream` (only `readLine()`,
-`ProxyService.kt:569-574`). No local WebSocket client — the SDK's
-`LocalBroadcaster` REBOOT relay is **not** consumed; REBOOT is handled
-by parsing the agent's log line (271-274) and cycling locally. Reconfig
-= stop-and-restart (`MainActivity.kt:374-379`).
-
-### 8. Connection modes
-
-Settings dialog (`MainActivity.kt:278-408`): one host/port/key/id/dns
-block + `rgMode` radio (`rbModeModem`/`rbModeBalancer`). Pref `mode`
-(`"modem"`|`"balancer"`) → Intent extra (`MainActivity.kt:828`) →
-`Mode` enum at `ProxyService.kt:439`. QR import force-selects Modem
-(`MainActivity.kt:430, 438`).
-
-- **Modem (direct):** env `registrator_host`, `registrator_port`,
-  optional `agent_uuid` in both engines; AAR has no Java setter, env-only.
-- **Balancer:** env `balancer_host`, `balancer_port`, `fallback_file_url`;
-  AAR also calls `Agent.setBalancer(host, port)` + `Agent.setFallbackURL`.
-
-Fallback URL hard-coded in both engines (`ProxyService.kt:560`/`654`):
-`https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json`.
+  CONNECTING (unless already CONNECTED); `endpoint=host:port` on
+  `uplink dialing` also fills registrator pre-AUTH.
+- **`REBOOT received from registrator` (271)** — kicks off the
+  IP-rotation flow (`triggerAutoIpCycle` → `IpCycle.cycleAndVerify`
+  → `forceReconnect`). What the binary outputs is "REBOOT with this
+  reason"; what the app does about it is the full
+  [ARCHITECTURE.md] §"IP rotation".

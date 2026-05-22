@@ -58,6 +58,11 @@ class ProxyService : Service() {
     // (v2.0.14-quic+); older builds without the key default to "TCP+yamux"
     // or "WebSocket" depending on which "connected" line variant we saw.
     @Volatile private var currentUplinkTransport: String = ""
+    // Short human-readable description of the current REBOOT auto-cycle step,
+    // pushed into conn_info field 7 so MainActivity can show "ROTATING · …"
+    // instead of "RECONNECTING…" while the radio is intentionally bouncing.
+    // Empty when no cycle is in flight.
+    @Volatile private var cycleStage: String = ""
     private var lastRx = 0L
     private var lastTx = 0L
     private var lastStatsAt = 0L
@@ -125,11 +130,15 @@ class ProxyService : Service() {
 
     private fun writeConnInfo() {
         try {
-            // 7th field (currentUplinkTransport) was added in v2.0.14-quic.
+            // Field 6 (currentUplinkTransport) was added in v2.0.14-quic;
+            // field 7 (cycleStage) was added with the IP-rotation UI surface.
             // Readers must use getOrNull(N) for forward compatibility so the
-            // field stays optional if a downgrade ever writes a 6-field file.
+            // tail fields stay optional if a downgrade ever writes shorter rows.
+            // `|` is escaped in cycleStage so a stray pipe in a log line can't
+            // shift the field count.
+            val safeStage = cycleStage.replace('|', '/')
             File(filesDir, "conn_info").writeText(
-                "${connStatus.name}|$rxRate|$txRate|$currentRegistrator|$activeTunnels|$connectedSinceMs|$currentUplinkTransport"
+                "${connStatus.name}|$rxRate|$txRate|$currentRegistrator|$activeTunnels|$connectedSinceMs|$currentUplinkTransport|$safeStage"
             )
         } catch (_: Exception) {}
     }
@@ -282,13 +291,16 @@ class ProxyService : Service() {
         }
         if (stopRequested) return
         autoCycling = true
+        cycleStage = "starting"
+        writeConnInfo()   // push the new stage into UI within 1s of the trigger
         Thread {
             try {
                 log("REBOOT auto-cycle: starting (reason=\"$reason\", engine=${engine.name})")
-                // cycleAndVerify drives the 10/20/40s ladder under a 120s budget.
-                // The subprocess will see its WS read error during airplane-on
-                // and enter the SDK's internal backoff loop on its own; we
-                // don't kill it pre-emptively because that would race our own
+                // cycleAndVerify drives the 10s+60s nuclear ladder under a 180s
+                // budget, plus optional APN swap / IMEI rotation fallbacks. The
+                // subprocess will see its WS read error during airplane-on and
+                // enter the SDK's internal backoff loop on its own; we don't
+                // kill it pre-emptively because that would race our own
                 // runner's backoff sleep, restarting it mid-toggle.
                 val baseline = try {
                     File(filesDir, "nat_ip").readText().trim()
@@ -303,7 +315,12 @@ class ProxyService : Service() {
                 val result = IpCycle.cycleAndVerify(
                     context = this,
                     knownIp = baseline,
-                    log = { msg -> log("REBOOT auto-cycle: $msg") },
+                    log = { msg ->
+                        // UI surface: latest stage line shows up as
+                        // "ROTATING · <stage>" in MainActivity within ~1s.
+                        cycleStage = msg
+                        log("REBOOT auto-cycle: $msg")
+                    },
                     config = cfg,
                 )
                 val secs = result.totalMs / 1000
@@ -332,6 +349,8 @@ class ProxyService : Service() {
                 log("REBOOT auto-cycle error: ${e.message}")
             } finally {
                 autoCycling = false
+                cycleStage = ""
+                writeConnInfo()   // clear "ROTATING · …" badge immediately
             }
         }.apply { name = "AutoIpCycler"; isDaemon = true; start() }
     }
