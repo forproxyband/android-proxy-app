@@ -305,13 +305,11 @@ class ProxyService : Service() {
                 val baseline = try {
                     File(filesDir, "nat_ip").readText().trim()
                 } catch (_: Throwable) { "" }
-                val cyclePrefs = getSharedPreferences("cfg", 0)
-                val cfg = IpCycle.CycleConfig(
-                    apnSwap = cyclePrefs.getBoolean("apn_swap", false),
-                    imeiRotation = cyclePrefs.getBoolean("imei_rotate", false),
-                    imeiMethod = cyclePrefs.getString("imei_method", "custom") ?: "custom",
-                    imeiCustomCmd = cyclePrefs.getString("imei_cmd", "") ?: "",
-                )
+                // Read cycle config from the cross-process file written by
+                // MainActivity on settings save. SharedPreferences won't work
+                // here: this service runs in the :proxy process and its prefs
+                // in-memory cache wouldn't see changes made in :main.
+                val cfg = IpCycle.loadConfigFromFile(this)
                 val result = IpCycle.cycleAndVerify(
                     context = this,
                     knownIp = baseline,

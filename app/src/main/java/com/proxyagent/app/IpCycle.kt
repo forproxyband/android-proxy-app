@@ -5,6 +5,8 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.provider.Settings
+import org.json.JSONObject
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.TimeUnit
@@ -52,6 +54,43 @@ object IpCycle {
         val imeiMethod: String = "custom",
         val imeiCustomCmd: String = "",
     )
+
+    // ── Cross-process config storage ────────────────────────────────────
+    // SharedPreferences are NOT multi-process safe — each process keeps its
+    // own in-memory cache, and writes in :main aren't visible in :proxy
+    // until that process restarts (MODE_MULTI_PROCESS is deprecated and
+    // unreliable). For settings the ProxyService needs to see when it acts
+    // on a REBOOT log line, we round-trip through a JSON file in filesDir
+    // that both processes touch directly. MainActivity writes it on every
+    // settings save (and on app launch as a back-fill); callers from both
+    // processes read it via loadConfigFromFile.
+
+    private const val CFG_FILE_NAME = "cycle_cfg.json"
+
+    fun loadConfigFromFile(context: Context): CycleConfig {
+        return try {
+            val f = File(context.filesDir, CFG_FILE_NAME)
+            if (!f.exists()) return CycleConfig()
+            val o = JSONObject(f.readText())
+            CycleConfig(
+                apnSwap = o.optBoolean("apn_swap", false),
+                imeiRotation = o.optBoolean("imei_rotate", false),
+                imeiMethod = o.optString("imei_method", "custom").ifEmpty { "custom" },
+                imeiCustomCmd = o.optString("imei_cmd", ""),
+            )
+        } catch (_: Throwable) { CycleConfig() }
+    }
+
+    fun saveConfigToFile(context: Context, config: CycleConfig) {
+        try {
+            val o = JSONObject()
+            o.put("apn_swap", config.apnSwap)
+            o.put("imei_rotate", config.imeiRotation)
+            o.put("imei_method", config.imeiMethod)
+            o.put("imei_cmd", config.imeiCustomCmd)
+            File(context.filesDir, CFG_FILE_NAME).writeText(o.toString())
+        } catch (_: Throwable) {}
+    }
 
     private data class ApnInfo(val id: Int, val name: String, val apn: String)
 

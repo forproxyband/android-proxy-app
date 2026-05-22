@@ -178,6 +178,21 @@ class MainActivity : AppCompatActivity() {
         Thread { try { AnalyticsStore.pruneToRetention(this) } catch (_: Throwable) {} }
             .apply { isDaemon = true; name = "AnalyticsPrune"; start() }
 
+        // Mirror current cycle config from SharedPreferences into the
+        // cross-process file. Back-fill for users who upgraded but haven't
+        // opened Settings again, and a no-op refresh for everyone else.
+        // Without this, :proxy reads default CycleConfig (all-false) until
+        // the user explicitly re-saves the settings dialog.
+        IpCycle.saveConfigToFile(
+            this,
+            IpCycle.CycleConfig(
+                apnSwap = prefs.getBoolean("apn_swap", false),
+                imeiRotation = prefs.getBoolean("imei_rotate", false),
+                imeiMethod = prefs.getString("imei_method", "custom") ?: "custom",
+                imeiCustomCmd = prefs.getString("imei_cmd", "") ?: "",
+            ),
+        )
+
         setLogsExpanded(prefs.getBoolean("logs_expanded", false))
         logsHeader.setOnClickListener {
             val expanded = svLogs.visibility != View.VISIBLE
@@ -412,6 +427,18 @@ class MainActivity : AppCompatActivity() {
                     .putString("imei_method", imeiMethodKey)
                     .putString("imei_cmd", etImeiCustomCmd.text.toString().trim())
                     .apply()
+                // Mirror cycle config into the cross-process file so
+                // ProxyService (:proxy) can see the toggle changes — its
+                // SharedPreferences in-memory cache otherwise stays stale.
+                IpCycle.saveConfigToFile(
+                    this,
+                    IpCycle.CycleConfig(
+                        apnSwap = cbApnSwap.isChecked,
+                        imeiRotation = cbImeiRotate.isChecked,
+                        imeiMethod = imeiMethodKey,
+                        imeiCustomCmd = etImeiCustomCmd.text.toString().trim(),
+                    ),
+                )
                 if (retentionChanged) {
                     Thread { try { AnalyticsStore.pruneToRetention(this) } catch (_: Throwable) {} }
                         .apply { isDaemon = true; name = "AnalyticsPruneOnSave"; start() }
@@ -803,13 +830,11 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread { tvStatus.text = "CYCLING NETWORK…"; tvStatus.setTextColor(0xFFFFAA00.toInt()) }
 
                 val baselineIp = publicIp
-                val cyclePrefs = getSharedPreferences("cfg", 0)
-                val cfg = IpCycle.CycleConfig(
-                    apnSwap = cyclePrefs.getBoolean("apn_swap", false),
-                    imeiRotation = cyclePrefs.getBoolean("imei_rotate", false),
-                    imeiMethod = cyclePrefs.getString("imei_method", "custom") ?: "custom",
-                    imeiCustomCmd = cyclePrefs.getString("imei_cmd", "") ?: "",
-                )
+                // Read from the cross-process file so manual ↻ and the
+                // REBOOT auto-cycle behave identically — same source of
+                // truth, no chance of the two paths drifting if SharedPrefs
+                // caching ever gets stale within :main itself.
+                val cfg = IpCycle.loadConfigFromFile(this)
                 val result = IpCycle.cycleAndVerify(
                     context = this,
                     knownIp = baselineIp,

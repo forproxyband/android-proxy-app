@@ -33,6 +33,8 @@ APK, and which of its stdout lines we react to.
 | `nat_ip` | service | text | Last-known public IP (best-effort, refreshed every 5 min and after successful rotation). |
 | `battery_threshold` | UI | int | Auto-stop threshold in percent (0 disables). |
 | `speed_units` | UI | text | `bits`/`bytes` for rate display. |
+| `cycle_cfg.json` | UI writes, both read | JSON | Cross-process mirror of the cycle settings (`apn_swap`, `imei_rotate`, `imei_method`, `imei_cmd`). SharedPreferences are per-process — the REBOOT auto-cycle in `:proxy` would otherwise miss toggle changes made in `:main`. Rewritten on every settings save and re-mirrored on app launch as a back-fill. |
+| `analytics/cycle_events.jsonl` | both write | JSONL | One row per rotation attempt with old/new IP, success flag, attempts and duration. Read by the swipe-panel chart, the analytics screen, and the CSV export. Pruned by the same retention policy as bucket files. |
 
 ## `conn_info` schema
 
@@ -141,12 +143,18 @@ IP at the IMSI level — see "What doesn't work" below).
   surfaced via `runOnUiThread { tvStatus.text = … }` directly from
   the log callback.
 
-Both paths read `CycleConfig` from SharedPreferences `cfg` (`apn_swap`,
-`imei_rotate`, `imei_method`, `imei_cmd`) and call
-`IpCycle.cycleAndVerify(context, knownIp, log, config)`. Returns
-`CycleResult(oldIp, newIp, changed, attempts, totalMs, reason)` —
-`reason` is one of `ok` / `ok_no_baseline` / `ip_unchanged` /
-`no_toggle_method` / `interrupted`.
+Both paths read `CycleConfig` via `IpCycle.loadConfigFromFile`, which
+parses `filesDir/cycle_cfg.json` (written by `MainActivity` on every
+settings save and on launch back-fill). The file exists specifically
+because SharedPreferences are not multi-process safe — the REBOOT
+auto-cycle runs in `:proxy` and `SharedPreferences("cfg")` there sees
+a stale in-memory cache that doesn't reflect toggle changes made in
+`:main`. Manual ↻ reads the same file too so both paths are
+guaranteed to behave identically. `IpCycle.cycleAndVerify(context,
+knownIp, log, config)` returns `CycleResult(oldIp, newIp, changed,
+attempts, totalMs, reason)` — `reason` is one of `ok` /
+`ok_no_baseline` / `ip_unchanged` / `no_toggle_method` /
+`interrupted`.
 
 ### Algorithm
 
