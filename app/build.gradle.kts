@@ -46,6 +46,8 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+        // java.time desugaring for kwik on minSdk 21..25.
+        isCoreLibraryDesugaringEnabled = true
     }
 
     kotlinOptions {
@@ -81,4 +83,12 @@ dependencies {
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     // Swipeable status panel: status / 24h-traffic / 24h-connections.
     implementation("androidx.viewpager2:viewpager2:1.1.0")
+    // QUIC client used by the NATIVE engine (com.proxyagent.app.nativeagent.*).
+    // Pure-Java QUIC v1 implementation; uses java.time.Duration so core library
+    // desugaring is enabled below to support minSdk 21. When this dependency is
+    // removed (e.g. third-party integrators using only the NativeProxyAgent.kt
+    // drop-in), the NATIVE engine silently falls back to TCP-only.
+    implementation("tech.kwik:kwik:0.10.10")
+    // Desugaring for java.time.* on API < 26 (needed by kwik).
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
 }

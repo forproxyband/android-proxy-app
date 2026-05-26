@@ -306,6 +306,7 @@ class MainActivity : AppCompatActivity() {
         val cbSpeedBytes = view.findViewById<CheckBox>(R.id.cbSpeedBytes)
         val spRetention = view.findViewById<Spinner>(R.id.spRetention)
         val rgEngine = view.findViewById<RadioGroup>(R.id.rgEngine)
+        val rbEngineNative = view.findViewById<RadioButton>(R.id.rbEngineNative)
         val rbEngineBinary = view.findViewById<RadioButton>(R.id.rbEngineBinary)
         val rbEngineAar = view.findViewById<RadioButton>(R.id.rbEngineAar)
         val rgMode = view.findViewById<RadioGroup>(R.id.rgMode)
@@ -340,23 +341,24 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Wi-Fi return requires AAR engine — bindProcessToNetwork(cellular)
-        // sets a per-process default route that doesn't survive
-        // ProcessBuilder fork+exec, so a BINARY subprocess wouldn't
-        // inherit it and target dials would leak through Wi-Fi (default
-        // route on dual-transport devices). We gate the engine radio
-        // accordingly: when the Wi-Fi return checkbox is on, BINARY is
-        // disabled and AAR is auto-selected.
+        // Wi-Fi return requires an in-process engine (NATIVE or AAR) —
+        // bindProcessToNetwork(cellular) sets a per-process default
+        // route that doesn't survive ProcessBuilder fork+exec, so a
+        // BINARY subprocess wouldn't inherit it and target dials would
+        // leak through Wi-Fi (default route on dual-transport devices).
+        // We gate the engine radio accordingly: when the Wi-Fi return
+        // checkbox is on, BINARY is disabled and NATIVE is auto-
+        // selected if no in-process engine is currently picked.
         fun applyEngineGateForWifiReturn() {
             val wifiOn = cbWifiReturn.isChecked && cbWifiReturn.isEnabled
             rbEngineBinary.isEnabled = !wifiOn
-            if (wifiOn && !rbEngineAar.isChecked) {
-                rbEngineAar.isChecked = true
+            if (wifiOn && !rbEngineNative.isChecked && !rbEngineAar.isChecked) {
+                rbEngineNative.isChecked = true
             }
             rbEngineBinary.text = if (wifiOn) {
-                "Binary subprocess  (disabled — needs AAR for Wi-Fi return)"
+                "Binary subprocess  (disabled — needs in-process engine for Wi-Fi return)"
             } else {
-                "Binary subprocess (default)"
+                "Binary subprocess  (testing — no Wi-Fi return)"
             }
         }
 
@@ -405,8 +407,11 @@ class MainActivity : AppCompatActivity() {
             val savedRet = prefs.getInt("analytics_retention_days", 30)
             val rIdx = retentionDays.indexOf(savedRet).let { if (it < 0) 2 else it }
             spRetention.setSelection(rIdx)
-            if (prefs.getString("engine", "binary") == "aar") rbEngineAar.isChecked = true
-            else rbEngineBinary.isChecked = true
+            when (prefs.getString("engine", "native")) {
+                "aar" -> rbEngineAar.isChecked = true
+                "binary" -> rbEngineBinary.isChecked = true
+                else -> rbEngineNative.isChecked = true     // "native" or unset
+            }
             val modemMode = prefs.getString("mode", "modem") == "modem"
             if (modemMode) rbModeModem.isChecked = true else rbModeBalancer.isChecked = true
             applyModeVisibility(modemMode)
@@ -482,7 +487,11 @@ class MainActivity : AppCompatActivity() {
                 val newRetention = retentionDays[
                     spRetention.selectedItemPosition.coerceIn(0, retentionDays.size - 1)]
                 val retentionChanged = prefs.getInt("analytics_retention_days", 30) != newRetention
-                val newEngine = if (rgEngine.checkedRadioButtonId == R.id.rbEngineAar) "aar" else "binary"
+                val newEngine = when (rgEngine.checkedRadioButtonId) {
+                    R.id.rbEngineAar -> "aar"
+                    R.id.rbEngineBinary -> "binary"
+                    else -> "native"   // rbEngineNative or nothing checked
+                }
                 val newMode = if (rgMode.checkedRadioButtonId == R.id.rbModeBalancer) "balancer" else "modem"
                 val imeiMethodKey = imeiMethodKeys[
                     spImeiMethod.selectedItemPosition.coerceIn(0, imeiMethodKeys.size - 1)]
@@ -493,19 +502,20 @@ class MainActivity : AppCompatActivity() {
                 // a relay that can't intercept the balancer-discovered
                 // registrator.
                 val effectiveWifiReturn = cbWifiReturn.isChecked && newMode == "modem"
-                // Wi-Fi return REQUIRES AAR (see runBinaryEngine guard +
-                // bindProcessToNetwork comment in ProxyService). If we
-                // somehow end up saving with wifi_return=true and engine=
-                // binary (e.g. stale dialog state or pref tampering), the
-                // ProxyService guard would silently disable the relay,
-                // leaving the user confused. Clamp it here to AAR.
-                val effectiveEngine = if (effectiveWifiReturn) "aar" else newEngine
-                val engineForcedToAar = effectiveWifiReturn && newEngine != "aar"
+                // Wi-Fi return REQUIRES an in-process engine (NATIVE or
+                // AAR) — see runBinaryEngine guard + bindProcessToNetwork
+                // comment in ProxyService. If we somehow end up saving
+                // with wifi_return=true and engine=binary (e.g. stale
+                // dialog state or pref tampering), the ProxyService
+                // guard would silently disable the relay, leaving the
+                // user confused. Clamp it here to NATIVE.
+                val effectiveEngine = if (effectiveWifiReturn && newEngine == "binary") "native" else newEngine
+                val engineClampedForWifiReturn = effectiveWifiReturn && newEngine == "binary"
                 // engineChanged tracks what actually goes into prefs — i.e.
                 // effectiveEngine, not the radio's nominal newEngine. That
                 // way the "stop & restart to apply" hint fires even when
-                // engine was clamped to AAR by the Wi-Fi return gate.
-                val engineChanged = prefs.getString("engine", "binary") != effectiveEngine
+                // engine was clamped by the Wi-Fi return gate.
+                val engineChanged = prefs.getString("engine", "native") != effectiveEngine
                 val modeChanged = prefs.getString("mode", "modem") != newMode
                 prefs.edit()
                     .putString("h", h).putString("p", p).putString("k", k)
@@ -520,10 +530,10 @@ class MainActivity : AppCompatActivity() {
                     .putString("imei_cmd", etImeiCustomCmd.text.toString().trim())
                     .putBoolean("wifi_return", effectiveWifiReturn)
                     .apply()
-                if (engineForcedToAar) {
+                if (engineClampedForWifiReturn) {
                     Toast.makeText(
                         this,
-                        "Wi-Fi return requires AAR engine — switched automatically",
+                        "Wi-Fi return requires an in-process engine — switched to Native",
                         Toast.LENGTH_LONG,
                     ).show()
                 }
@@ -1034,7 +1044,7 @@ class MainActivity : AppCompatActivity() {
         File(filesDir, "proxy_state").delete()
         File(filesDir, "conn_info").delete()
 
-        val engine = prefs.getString("engine", "binary") ?: "binary"
+        val engine = prefs.getString("engine", "native") ?: "native"
         val mode = prefs.getString("mode", "modem") ?: "modem"
         return try {
             val svc = Intent(this, ProxyService::class.java).apply {
@@ -1710,6 +1720,24 @@ class MainActivity : AppCompatActivity() {
                 viaView.setTextColor(0xFFFFCC66.toInt())
                 viaView.text = "↺ uplink via cellular · Wi-Fi return enabled but no Wi-Fi held"
                 detailView.visibility = View.GONE
+            }
+            "leak_known" -> {
+                // BINARY engine: uplink savings work (relay forwards via
+                // Wi-Fi), but target dials inside the subprocess leak the
+                // Wi-Fi IP. Show the line in amber with the caveat, plus
+                // the two-IP block so the user can see exactly which IP
+                // each side is exposing.
+                viaView.visibility = View.VISIBLE
+                viaView.setTextColor(0xFFFFCC66.toInt())
+                viaView.text = formatWifiLinkLine(info, prefix = "⚠ uplink: Wi-Fi (target dials leak Wi-Fi IP)")
+                val ipBlock = formatTwoIpBlock(info)
+                if (ipBlock != null) {
+                    detailView.visibility = View.VISIBLE
+                    detailView.setTextColor(0xFFFFCC66.toInt())
+                    detailView.text = "$ipBlock\n  ⚠ BINARY engine — target sees Wi-Fi IP, not cellular"
+                } else {
+                    detailView.visibility = View.GONE
+                }
             }
             "split_failed" -> {
                 viaView.visibility = View.VISIBLE

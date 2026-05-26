@@ -342,6 +342,19 @@ Wi-Fi (склады, офисы, фермы модемов с роутером �
 - **Жёлтым** — `↺ uplink via cellular · Wi-Fi return enabled but no
   Wi-Fi held`. Релей включён, но Wi-Fi сейчас недоступен/не
   валидирован, аплинк идёт через сотовую. Экономии нет, агент работает.
+- **Жёлтым с предупреждением** — `⚠ uplink: Wi-Fi (target dials leak
+  Wi-Fi IP)`, ниже два IP + строка `⚠ BINARY engine — target sees
+  Wi-Fi IP, not cellular`. Это происходит на **BINARY engine** + Wi-Fi
+  return: subprocess не наследует процессный bind на cellular,
+  поэтому исходящие к таргетам уходят через Wi-Fi (default route).
+  Uplink-savings работают (трафик к регистратору экономится), но
+  таргет видит Wi-Fi IP вместо мобильного. Это **известное
+  ограничение архитектуры** — единственный путь к настоящему split-
+  routing'у с in-process управлением сокетами это **NATIVE engine**
+  (находится в разработке отдельным треком). AAR engine **не
+  функционален** в текущей сборке SDK независимо от режима, не
+  рассчитывайте на него.
+
 - **Красным** — `✗ Wi-Fi return DISABLED · split routing not
   confirmed`, ниже:
   ```
@@ -703,3 +716,4 @@ root, потом возвращаться к ротации.
 | На виджете в `Connected to registrator` пишет `127.0.0.1:<port>` вместо реального хоста | Старая сборка без `applyCurrentRegistrator`. Обновите приложение до версии с Wi-Fi return v3+ — там SDK логирует loopback (это правильно для сетевого стека), но виджет автоматически подменяет на реальный регистратор. |
 | Красный warning `split routing not confirmed` появился — что делать | Устройство не умеет держать оба интерфейса разделённо. Включите `mobile_data_always_on=1` (диалог при ставке галки уже предлагает это, см. §3.8). Перезапустите сервис — self-test пройдёт заново. |
 | `AAR engine` — `AUTO-STOPPED · Wi-Fi return: split routing not confirmed` | Self-test упал в AAR-режиме, релей не может быть откатан in-process. Уберите галку `Return traffic … over Wi-Fi` или включите `mobile_data_always_on`, запустите снова. |
+| AAR engine — `no registrator available; backing off` бесконечно | AAR engine **не функционален** в текущей сборке SDK. Переключитесь на BINARY engine (или NATIVE когда он будет доступен). |

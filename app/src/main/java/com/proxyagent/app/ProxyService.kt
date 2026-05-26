@@ -35,14 +35,19 @@ import java.util.concurrent.TimeUnit
 class ProxyService : Service() {
 
     enum class ConnStatus { STARTING, CONNECTING, CONNECTED, RECONNECTING, ERROR, STOPPED }
-    enum class Engine { BINARY, AAR }
+    // NATIVE: pure-Kotlin port of the Go SDK, runs in-process. Default for
+    // new installs. BINARY: ProcessBuilder fork of libproxyagent.so (legacy).
+    // AAR: gomobile-built SDK (.so) loaded via Class.forName.
+    enum class Engine { NATIVE, BINARY, AAR }
     enum class Mode { MODEM, BALANCER }
 
     private var wakeLock: PowerManager.WakeLock? = null
     @Volatile private var stopRequested = false
     @Volatile private var agentProcess: Process? = null
     @Volatile private var runnerThread: Thread? = null
-    @Volatile private var engine: Engine = Engine.BINARY
+    @Volatile private var engine: Engine = Engine.NATIVE
+    // Live native agent — only set when engine=NATIVE.
+    @Volatile private var nativeAgent: com.proxyagent.app.nativeagent.NativeProxyAgent? = null
     @Volatile private var mode: Mode = Mode.MODEM
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var analytics: AnalyticsRecorder? = null
@@ -119,6 +124,12 @@ class ProxyService : Service() {
     // wifiReturnStatus="split_failed" instead of clearing it back to "".
     // Reset only in doStop / next service start.
     @Volatile private var wifiReturnSplitFailed: Boolean = false
+    // Sticky flag: BINARY engine + LEAK_DETECTED is an expected outcome
+    // (subprocess doesn't inherit bindProcessToNetwork), but the user
+    // should still see the warning in the widget. The relay stays alive
+    // for mobile-data savings on the uplink; this just stops the status
+    // updater clobbering "leak_known" back to "wifi" on the next tick.
+    @Volatile private var wifiReturnLeakKnown: Boolean = false
     private var lastRx = 0L
     private var lastTx = 0L
     private var lastStatsAt = 0L
@@ -579,7 +590,11 @@ class ProxyService : Service() {
         val agentId = intent.getStringExtra("id")?.trim().orEmpty()
         val dnsRaw = intent.getStringExtra("dns")?.trim().orEmpty()
         val dns = dnsRaw.ifEmpty { "1.1.1.1,8.8.8.8" }
-        engine = if (intent.getStringExtra("engine") == "aar") Engine.AAR else Engine.BINARY
+        engine = when (intent.getStringExtra("engine")) {
+            "aar" -> Engine.AAR
+            "binary" -> Engine.BINARY
+            else -> Engine.NATIVE   // "native" or unset → default to native
+        }
         mode = if (intent.getStringExtra("mode") == "balancer") Mode.BALANCER else Mode.MODEM
         if (host.isEmpty()) { stopSelf(); return START_NOT_STICKY }
 
@@ -620,11 +635,13 @@ class ProxyService : Service() {
                     // Refresh Wi-Fi return status before writeConnInfo() so
                     // the UI sees state transitions within ~1s of Wi-Fi
                     // appearing/disappearing. Cheap: just a @Volatile read.
-                    // The split_failed sticky state takes precedence over
-                    // anything else — it's the worst-case signal and must
-                    // not get clobbered by the relay-disabled path.
+                    // Priority: split_failed (relay disabled, worst case)
+                    // > leak_known (relay alive but target dials leak —
+                    // BINARY engine expected case) > the wifi/fallback
+                    // transient signals.
                     wifiReturnStatus = when {
                         wifiReturnSplitFailed -> "split_failed"
+                        wifiReturnLeakKnown -> "leak_known"
                         wifiRelay != null -> if (wifiRelay!!.isUsingWifi()) "wifi" else "wifi_fallback"
                         else -> ""
                     }
@@ -675,6 +692,7 @@ class ProxyService : Service() {
 
         log("Engine: ${engine.name}  Mode: ${mode.name}")
         val runner = when (engine) {
+            Engine.NATIVE -> Thread { runNativeEngine(host, port, key, agentId, dns) }
             Engine.BINARY -> Thread { runBinaryEngine(host, port, key, agentId, dns) }
             Engine.AAR -> Thread { runAarEngine(host, port, key, agentId, dns) }
         }
@@ -719,37 +737,38 @@ class ProxyService : Service() {
             log("wifi_return enabled with unsupported method=\"${cfg.wifiReturnMethod}\" — bypassing relay")
             return host to port
         }
-        // Engine gate — last line of defence. bindProcessToNetwork only
-        // affects the current Linux process; a BINARY subprocess (separate
-        // PID from ProcessBuilder.start) DOES NOT inherit it. With BINARY
-        // engine, SDK target dials inside the subprocess would always go
-        // through Android's default route (= Wi-Fi when both transports
-        // up), leaking the Wi-Fi public IP to targets. The UI already
-        // forces engine=AAR when wifi_return is checked, but a stale
-        // pref / direct file edit / engine-switched-while-running could
-        // still land us here — bail safely instead of producing leaky
-        // traffic.
-        if (engine != Engine.AAR) {
-            log("wifi_return: BINARY engine doesn't inherit bindProcessToNetwork; " +
-                "target dials would leak to Wi-Fi. Skipping relay and falling " +
-                "back to direct dial.")
-            return host to port
-        }
         val portInt = port.toIntOrNull()
         if (portInt == null || portInt !in 1..65535) {
             log("wifi_return: invalid upstream port \"$port\"; bypassing relay")
             return host to port
         }
-        // Bind :proxy to cellular BEFORE the relay starts so SDK target
-        // dials (in-process Go via AAR) inherit cellular as their default
-        // route. Per-socket Wi-Fi binding inside the relay is then an
-        // explicit override for the agent↔registrator uplink only.
-        // If cellular isn't reachable, we can't safely run the relay
-        // (target dials would leak), so we bail.
-        if (!bindProcessToCellularBlocking()) {
-            log("wifi_return: cellular network unavailable within budget; " +
-                "skipping relay to avoid leaking Wi-Fi IP to targets.")
-            return host to port
+        // Engine-specific behaviour for the cellular process bind:
+        //   - In-process engines (NATIVE, AAR): bindProcessToNetwork(cellular)
+        //     so target dials default-route through cellular. Per-socket
+        //     wifiNet.bindSocket() in the relay overrides this for the
+        //     uplink only. Skip the relay if cellular isn't reachable —
+        //     no point running with a guaranteed target-dial leak.
+        //   - BINARY (forked subprocess): bindProcessToNetwork doesn't
+        //     survive fork+exec, so the subprocess's target dials WILL
+        //     egress through the default route (typically Wi-Fi). The
+        //     UI normally prevents this combination (BINARY radio is
+        //     disabled while the Wi-Fi return box is on — see
+        //     applyEngineGateForWifiReturn). If a stale pref / direct
+        //     file edit still lands us here, we keep the relay running:
+        //     uplink savings work, target dials leak Wi-Fi. The self-test
+        //     reports LEAK_DETECTED and the widget surfaces a warning
+        //     status ("leak_known") rather than a hard failure.
+        if (engine != Engine.BINARY) {
+            if (!bindProcessToCellularBlocking()) {
+                log("wifi_return: cellular network unavailable within budget; " +
+                    "skipping relay to avoid leaking Wi-Fi IP to targets.")
+                return host to port
+            }
+        } else {
+            log("wifi_return: BINARY engine — relay will save mobile data on " +
+                "uplink, but target dials inside the subprocess will egress " +
+                "through Wi-Fi (default route). Self-test will report " +
+                "LEAK_DETECTED; widget shows 'leak_known' status.")
         }
         try {
             val relay = WifiReturnRelay(
@@ -760,8 +779,9 @@ class ProxyService : Service() {
             )
             val localPort = relay.start()
             wifiRelay = relay
-            log("wifi_return: relay up on 127.0.0.1:$localPort → $host:$portInt " +
-                "(process bound to cellular $cellularNet)")
+            val bindInfo = if (cellularNet != null) "process bound to cellular $cellularNet"
+                else "no process bind (BINARY engine — target dials may leak)"
+            log("wifi_return: relay up on 127.0.0.1:$localPort → $host:$portInt ($bindInfo)")
             return "127.0.0.1" to localPort.toString()
         } catch (t: Throwable) {
             log("wifi_return: relay start failed (${t.message}) — unbinding and falling back to direct dial")
@@ -890,6 +910,20 @@ class ProxyService : Service() {
             Engine.AAR -> {
                 log("wifi_return: AAR engine can't roll back in-process; auto-stopping")
                 doStop("Wi-Fi return: split routing not confirmed — disable the checkbox to use cellular directly")
+            }
+            Engine.NATIVE -> {
+                // Same posture as BINARY — the native agent reads
+                // effectiveHost/Port on every dial loop iteration via
+                // NativeProxyAgent.Config, so we just stop the current
+                // agent and let the runner respawn with the rolled-back
+                // (host, port). No subprocess to kill — stop the in-
+                // process supervisor instead.
+                log("wifi_return: rolling back NATIVE engine to direct dial " +
+                    "($originalHost:$originalPort)")
+                effectiveHost = originalHost
+                effectivePort = originalPort
+                try { nativeAgent?.stop() } catch (_: Throwable) {}
+                runnerThread?.interrupt()
             }
         }
     }
@@ -1035,20 +1069,45 @@ class ProxyService : Service() {
                     handleSplitFailureForCurrentEngine()
                 }
                 SplitRoutingSelfTest.Result.LEAK_DETECTED -> {
-                    // The split-routing test caught the SDK target dial
-                    // going through Wi-Fi (default route) instead of
-                    // cellular. Target hosts would see the Wi-Fi public IP,
-                    // not the mobile exit IP — catastrophic for anti-fraud.
-                    // Treat exactly like SAME_IP: disable the relay,
-                    // sticky-set the status, roll back the engine.
-                    log("wifi_return: LEAK DETECTED — default route=${report.defaultPublicIp} " +
-                        "(== wifi ${report.wifiPublicIp}), expected cellular ${report.cellPublicIp}. " +
-                        "Disabling relay to prevent target IP exposure.")
-                    wifiReturnSplitFailed = true
-                    wifiReturnStatus = "split_failed"
-                    stopWifiRelayIfRunning()
-                    writeConnInfo()
-                    handleSplitFailureForCurrentEngine()
+                    // The default-route probe came back with the Wi-Fi IP
+                    // instead of cellular. Two scenarios with different
+                    // remediation:
+                    //
+                    //   - In-process engine (NATIVE / AAR): this is
+                    //     UNEXPECTED — bindProcessToNetwork(cellular) was
+                    //     supposed to route target dials through cellular.
+                    //     Something failed silently (ROM quirk, race with
+                    //     network state). Disable the relay to avoid
+                    //     exposing the Wi-Fi IP to targets.
+                    //
+                    //   - BINARY engine: this is EXPECTED. Subprocess
+                    //     doesn't inherit bindProcessToNetwork, so target
+                    //     dials go through the default route (Wi-Fi). The
+                    //     user accepted this trade-off (UI normally
+                    //     forces an in-process engine; getting here means
+                    //     they explicitly chose BINARY). Keep the relay
+                    //     running for the mobile-data savings on the
+                    //     uplink, but flag the leak in the widget so
+                    //     they're not surprised when targets see Wi-Fi IP.
+                    if (engine == Engine.BINARY) {
+                        log("wifi_return: LEAK detected on BINARY engine " +
+                            "(default=${report.defaultPublicIp} == wifi). " +
+                            "Known limitation — keeping relay for uplink savings, " +
+                            "widget will show 'leak_known'.")
+                        wifiReturnLeakKnown = true
+                        wifiReturnStatus = "leak_known"
+                        writeConnInfo()
+                    } else {
+                        log("wifi_return: LEAK DETECTED on in-process engine — " +
+                            "default route=${report.defaultPublicIp} (== wifi ${report.wifiPublicIp}), " +
+                            "expected cellular ${report.cellPublicIp}. " +
+                            "Disabling relay to prevent target IP exposure.")
+                        wifiReturnSplitFailed = true
+                        wifiReturnStatus = "split_failed"
+                        stopWifiRelayIfRunning()
+                        writeConnInfo()
+                        handleSplitFailureForCurrentEngine()
+                    }
                 }
                 SplitRoutingSelfTest.Result.WIFI_PROBE_FAILED -> {
                     // Wi-Fi probe didn't get back; could be momentary
@@ -1162,6 +1221,138 @@ class ProxyService : Service() {
             File(filesDir, "wifi_info.json").writeText(o.toString())
         } catch (t: Throwable) {
             log("wifi_return: wifi_info.json write failed: ${t.message}")
+        }
+    }
+
+    // In-process engine using the pure-Kotlin port of the SDK (see
+    // com.proxyagent.app.nativeagent.NativeProxyAgent). Default engine
+    // for new installs — no subprocess, no Go runtime, no JNI. Speaks
+    // the same TCP/QUIC wire protocol as the binary and AAR engines, so
+    // it pairs with the same registrator infrastructure.
+    //
+    // Logging is bridged into parseAgentLine() via a LogSink that emits
+    // the same line vocabulary the binary/AAR engines write to stdout —
+    // "uplink connected ... transport=tcp", "opening tunnel target=...",
+    // "REBOOT received from registrator reason=...", etc. — so the
+    // existing status parser keeps working without changes.
+    private fun runNativeEngine(host: String, port: String, key: String, agentId: String, dns: String) {
+        try {
+            // Same Wi-Fi return wiring as the AAR engine — see
+            // maybeStartWifiRelay() for the conditions. NATIVE also
+            // runs in-process so bindProcessToNetwork(cellular) sticks.
+            originalHost = host
+            originalPort = port
+            val initialEffective = maybeStartWifiRelay(host, port)
+            effectiveHost = initialEffective.first
+            effectivePort = initialEffective.second
+            val relayActive = effectiveHost != host
+            val hostLog = if (relayActive) "$effectiveHost:$effectivePort→$host:$port" else host
+            log("Native engine: host=$hostLog port=$port key=${mask(key)} " +
+                "id=${if (agentId.isEmpty()) "<empty>" else mask(agentId)} dns=$dns")
+            if (wifiRelay != null) scheduleWifiReturnSelfTest()
+
+            // Outer respawn loop. The native supervisor handles its own
+            // dial/reconnect/backoff internally; we wrap that in a
+            // BINARY-style outer loop so any external stop+restart
+            // (forceReconnect on network change, wifi_return split-
+            // routing rollback) picks up the latest effectiveHost/Port.
+            var outerBackoffMs = 1_000L
+            while (!stopRequested) {
+                val effHost = effectiveHost
+                val effPort = effectivePort
+                val portInt = effPort.toIntOrNull()
+                if (portInt == null || portInt !in 1..65535) {
+                    log("Native engine: invalid port \"$effPort\"")
+                    connStatus = ConnStatus.ERROR; state("error"); writeConnInfo()
+                    return
+                }
+
+                val agent = com.proxyagent.app.nativeagent.NativeProxyAgent()
+                nativeAgent = agent
+
+                // Bridge native log lines into parseAgentLine() so the UI
+                // (currentRegistrator, transport badge, tunnel counter,
+                // REBOOT auto-cycle) keeps working unchanged. Format
+                // mirrors the Go SDK's structured log line.
+                agent.setLogSink { level, msg, fields ->
+                    val sb = StringBuilder()
+                    sb.append("level=").append(level).append(" msg=\"").append(msg).append('"')
+                    for ((k, v) in fields) {
+                        if (v == null) continue
+                        sb.append(' ').append(k).append('=').append(v.toString())
+                    }
+                    val line = sb.toString()
+                    parseAgentLine(line)
+                    log("[native] $line")
+                }
+
+                // REBOOT path matches the binary/AAR engines, where
+                // parseAgentLine hooks the "REBOOT received from
+                // registrator" log line. The listener is a belt-and-
+                // braces second path so this still acts if the log sink
+                // is ever swapped out.
+                agent.setRebootListener { reason -> triggerAutoIpCycle(reason) }
+
+                val cfg = com.proxyagent.app.nativeagent.NativeProxyAgent.Config(
+                    registratorHost = if (mode == Mode.MODEM) effHost else null,
+                    registratorPort = if (mode == Mode.MODEM) portInt else 0,
+                    balancerHost = if (mode == Mode.BALANCER) host else null,
+                    balancerPort = if (mode == Mode.BALANCER) port.toIntOrNull() ?: 0 else 0,
+                    fallbackFileUrl = if (mode == Mode.BALANCER)
+                        "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json"
+                    else null,
+                    agentKey = key,
+                    agentUuid = agentId.ifBlank { null },
+                    dnsServers = dns,
+                    workDir = filesDir,
+                    httpTimeoutMs = 5000,
+                    dialTimeoutMs = 5000,
+                    heartbeatIntervalSec = 60,
+                    enableHeartbeat = true,
+                    // Hard kwik dep — see app/build.gradle.kts. Tries
+                    // QUIC first if cached, otherwise TCP first.
+                    quicTransportFactory = com.proxyagent.app.nativeagent.KwikQuicTransport.Factory(),
+                )
+
+                connStatus = ConnStatus.CONNECTING
+                if (!agent.start(cfg)) {
+                    log("Native engine: agent.start returned false")
+                    return
+                }
+                state("running")
+
+                // Block until the agent's supervisor exits (forceReconnect
+                // / split-rollback / fatal error) or the user requests
+                // stop. The supervisor handles disconnect/reconnect by
+                // itself between these events.
+                while (!stopRequested && agent.getStatus().running) {
+                    try { Thread.sleep(500) }
+                    catch (_: InterruptedException) { break }
+                }
+                nativeAgent = null
+                try { agent.stop(timeoutMs = 2_000L) } catch (_: Throwable) {}
+                if (stopRequested) break
+
+                connStatus = ConnStatus.RECONNECTING
+                currentRegistrator = ""
+                activeTunnels = 0
+                connectedSinceMs = 0L
+                currentUplinkTransport = ""
+                log("Native engine: respawning in ${outerBackoffMs}ms")
+                try { Thread.sleep(outerBackoffMs) }
+                catch (_: InterruptedException) {
+                    log("Native engine: respawn backoff interrupted; retrying now")
+                    outerBackoffMs = 1_000L
+                    continue
+                }
+                outerBackoffMs = (outerBackoffMs * 2).coerceAtMost(30_000L)
+            }
+            log("Native runner loop exited")
+        } catch (e: Throwable) {
+            val sw = StringWriter(); e.printStackTrace(PrintWriter(sw))
+            log("Native engine error: $sw")
+            connStatus = ConnStatus.ERROR
+            state("error"); writeConnInfo()
         }
     }
 
@@ -1532,6 +1723,14 @@ class ProxyService : Service() {
                 // AAR engine handles network changes internally via the Go-side
                 // dial loop; nothing to tear down here.
             }
+            Engine.NATIVE -> {
+                // Same model as AAR: the native supervisor's dial loop
+                // re-resolves and re-dials each iteration. Stopping the
+                // current uplink wakes the loop without tearing down the
+                // supervisor, so it reconnects on the new interface.
+                try { nativeAgent?.stop() } catch (_: Throwable) {}
+                runnerThread?.interrupt()
+            }
         }
     }
 
@@ -1548,10 +1747,11 @@ class ProxyService : Service() {
         // Clear the conn_info field 8 indicator so the UI doesn't keep
         // showing "via Wi-Fi" after we've stopped. The status updater
         // thread is also about to exit, so we can't rely on its 1Hz tick
-        // to do this for us. Also clear the sticky split_failed flag so
-        // a subsequent start gets a fresh test.
+        // to do this for us. Also clear the sticky flags so a subsequent
+        // start gets a fresh test verdict.
         wifiReturnStatus = ""
         wifiReturnSplitFailed = false
+        wifiReturnLeakKnown = false
         when (engine) {
             Engine.BINARY -> try {
                 agentProcess?.let { p ->
@@ -1570,6 +1770,11 @@ class ProxyService : Service() {
                 Class.forName("proxyagent.sdk.agent.Agent")
                     .getMethod("stopAgent").invoke(null)
             } catch (t: Throwable) { log("Agent.stopAgent error: ${t.message}") }
+            Engine.NATIVE -> try {
+                log("Stopping native agent")
+                nativeAgent?.stop(timeoutMs = 3_000L)
+                nativeAgent = null
+            } catch (t: Throwable) { log("Native stop error: ${t.message}") }
         }
         agentProcess = null
         connStatus = ConnStatus.STOPPED

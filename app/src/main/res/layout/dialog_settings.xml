@@ -192,16 +192,22 @@
         android:layout_height="wrap_content"
         android:orientation="vertical">
         <RadioButton
+            android:id="@+id/rbEngineNative"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Native Kotlin (recommended)"
+            android:textSize="13sp" />
+        <RadioButton
             android:id="@+id/rbEngineBinary"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Binary subprocess (default)"
+            android:text="Binary subprocess  (testing — no Wi-Fi return)"
             android:textSize="13sp" />
         <RadioButton
             android:id="@+id/rbEngineAar"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="In-process AAR (gomobile)"
+            android:text="In-process AAR  (testing — known broken)"
             android:textSize="13sp" />
     </RadioGroup>
 
