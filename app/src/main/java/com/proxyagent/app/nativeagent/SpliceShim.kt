@@ -1,6 +1,5 @@
 package com.proxyagent.app.nativeagent
 
-import java.io.FileDescriptor
 import java.nio.channels.SocketChannel
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -24,11 +23,19 @@ import java.util.concurrent.atomic.AtomicReference
  *    when it succeeds and an exception storm when it doesn't.
  */
 internal class SpliceShim {
-    // Instance method — Kotlin objects don't generate JNI-friendly
+    // Instance methods — Kotlin objects don't generate JNI-friendly
     // static externals without @JvmStatic on each function (and even
     // then the binding maps to instance methods on the singleton).
     // Using a class with a single shared instance is simpler.
     external fun spliceLoop(fdSrc: Int, fdDst: Int, chunkSize: Int): Long
+
+    /** JNI-level fd extraction. Bypasses Android's non-SDK API
+     *  restrictions (API 28+) by reading the FileDescriptor field of
+     *  SocketChannelImpl via JNI's GetFieldID/GetIntField instead of
+     *  Java reflection — those are explicitly excluded from the
+     *  hidden-API enforcement. Returns -1 if the field layout is
+     *  unrecognised, in which case copy() falls back to NIO. */
+    external fun extractFd(channel: Any): Int
 
     /** Telemetry hook so the host (NativeProxyAgent) can route
      *  splice/fallback events into its log sink. Calls are infrequent
@@ -69,7 +76,8 @@ internal class SpliceShim {
          * Returns true if the splice loop ran to completion (caller can
          * treat the bridge as done). Returns false on:
          *  - library load failure (e.g. ABI mismatch, stripped APK)
-         *  - file descriptor extraction failure (reflection broke)
+         *  - file descriptor extraction failure (hidden-API blocklist
+         *    on a future Android changed the field layout)
          *  - the initial splice() syscall couldn't transfer any bytes
          *
          * On false the caller MUST fall back to a userspace copy. Once
@@ -81,11 +89,13 @@ internal class SpliceShim {
                 logFallbackOnce("library_not_loaded")
                 return false
             }
-            val fdSrc = fdOf(src) ?: run {
+            val fdSrc = fdOf(src)
+            if (fdSrc < 0) {
                 logFallbackOnce("fd_extraction_failed_src")
                 return false
             }
-            val fdDst = fdOf(dst) ?: run {
+            val fdDst = fdOf(dst)
+            if (fdDst < 0) {
                 logFallbackOnce("fd_extraction_failed_dst")
                 return false
             }
@@ -118,32 +128,42 @@ internal class SpliceShim {
         }
 
         /** Sticky probe — load the library at most once per process.
-         *  Also emits a one-shot log line announcing the outcome. */
+         *  Logs the outcome exactly once via the compareAndSet on
+         *  [available]: only the thread that wins the race actually
+         *  emits a log line, even though multiple bridge threads can
+         *  hit ensureLoaded concurrently. */
         private fun ensureLoaded(): Boolean {
             available.get()?.let { return it }
             val ok = try {
                 System.loadLibrary("agentsplice")
-                logger?.invoke(
-                    "INFO",
-                    "splice: libagentsplice.so loaded",
-                    emptyMap(),
-                )
                 true
-            } catch (t: Throwable) {
-                // ABI mismatch (e.g. APK stripped to a single ABI and
-                // the device's ABI isn't covered) or some other linker
-                // failure. NIO fallback handles it transparently; we
-                // log so the user can tell from the log file whether
-                // the optimisation is engaged.
-                logger?.invoke(
-                    "WARN",
-                    "splice: libagentsplice.so unavailable, NIO fallback only",
-                    mapOf("error" to (t.message ?: t.javaClass.simpleName)),
-                )
+            } catch (_: Throwable) {
                 false
             }
-            available.compareAndSet(null, ok)
-            return ok
+            // Race-safe one-shot logging: whoever flips null→ok wins
+            // and emits. Loaders that arrive late see the existing
+            // value and skip the log. System.loadLibrary itself is
+            // idempotent on the JVM side, so racing the load itself
+            // is harmless — only the log line needed protection.
+            val firstSet = available.compareAndSet(null, ok)
+            if (firstSet) {
+                if (ok) {
+                    logger?.invoke(
+                        "INFO",
+                        "splice: libagentsplice.so loaded",
+                        emptyMap(),
+                    )
+                } else {
+                    logger?.invoke(
+                        "WARN",
+                        "splice: libagentsplice.so unavailable, NIO fallback only",
+                        emptyMap(),
+                    )
+                }
+            }
+            // Return whichever value ended up in the AtomicReference
+            // (ours if we won, the other thread's if we lost).
+            return available.get() ?: ok
         }
 
         /** Emit one line per process the first time we fall back, with
@@ -161,37 +181,28 @@ internal class SpliceShim {
 
         /**
          * Extract the raw POSIX file descriptor from a connected
-         * [SocketChannel]. Uses two Android-internal but stable
-         * reflection points:
-         *  - `sun.nio.ch.SocketChannelImpl.fd` (a [FileDescriptor])
-         *  - `FileDescriptor.getInt$()` returning the int fd
+         * [SocketChannel] via the JNI shim. We delegate to native
+         * code instead of Java reflection because Android 28+
+         * "non-SDK API restrictions" blocklist both
+         *  - `sun.nio.ch.SocketChannelImpl.fd` (private + hidden), and
+         *  - `FileDescriptor.getInt$()` (hidden, suffix indicates
+         *    Dalvik/ART internal),
+         * with the block becoming hard (no exemption) for apps
+         * targeting API 30+. JNI's `GetFieldID` and `GetIntField`
+         * are explicitly excluded from this enforcement — they
+         * operate at the JVM level and can read private fields of
+         * system classes the same way they read fields of user
+         * classes. See the JNI extractFd implementation for details.
          *
-         * Both have been present and stable on Android since at least
-         * API 21 and on plain OpenJDK; we still wrap them in defensive
-         * try/catch so a future runtime change degrades to NIO fallback
-         * instead of crashing the bridge.
+         * Returns -1 on any failure (channel was null, field layout
+         * unrecognised, JNI lookup threw) — the bridge falls back to
+         * NIO without data loss.
          */
-        private fun fdOf(channel: SocketChannel): Int? {
+        private fun fdOf(channel: SocketChannel): Int {
             return try {
-                var cls: Class<*>? = channel.javaClass
-                var fdObj: Any? = null
-                while (cls != null && fdObj == null) {
-                    try {
-                        val f = cls.getDeclaredField("fd")
-                        f.isAccessible = true
-                        fdObj = f.get(channel)
-                    } catch (_: NoSuchFieldException) {
-                        cls = cls.superclass
-                    }
-                }
-                val fd = fdObj as? FileDescriptor ?: return null
-                val getInt = FileDescriptor::class.java
-                    .getDeclaredMethod("getInt\$")
-                getInt.isAccessible = true
-                val raw = getInt.invoke(fd) as Int
-                if (raw < 0) null else raw
+                singleton.extractFd(channel)
             } catch (_: Throwable) {
-                null
+                -1
             }
         }
 

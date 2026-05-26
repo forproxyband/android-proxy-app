@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <string.h>
 
 // Per-iteration ceiling. splice() may return less (in practice
 // limited by pipe buffer capacity, ~64 KiB default, expandable to
@@ -93,4 +94,81 @@ done:
     close(pipefd[0]);
     close(pipefd[1]);
     return total;
+}
+
+// Extract the raw POSIX file descriptor from a Java SocketChannel.
+//
+// Why this lives in JNI and not in Kotlin reflection:
+//
+// On Android targeting API 28+ ("non-SDK API restrictions"), reflective
+// access to `sun.nio.ch.SocketChannelImpl.fd` and `FileDescriptor.fd` /
+// `FileDescriptor.getInt$()` is restricted. Apps targeting API 30+
+// hit a hard block (LinkageError / NoSuchMethodException) on these
+// for any app that's not part of the platform.
+//
+// JNI's GetFieldID / GetIntField run at the JVM level and are not
+// subject to the Java-reflection-layer non-SDK enforcement — they
+// can read private fields of system classes the same way they read
+// fields of user classes. This is the documented escape hatch
+// (see Google's "Restrictions on non-SDK interfaces" doc, "JNI
+// access" exclusion).
+//
+// We walk the channel's class hierarchy looking for a field named
+// "fd" of type `Ljava/io/FileDescriptor;` — sun.nio.ch.SocketChannelImpl
+// has it on every Android version we care about. Then we dereference
+// the FileDescriptor's int member — tries "descriptor" first (the
+// AOSP libcore convention) then "fd" (OpenJDK convention) for forward/
+// backward compat.
+//
+// Returns the raw int fd on success, or -1 if any reflection step
+// failed. Caller (SpliceShim.fdOf) treats -1 as "fall back to NIO".
+JNIEXPORT jint JNICALL
+Java_com_proxyagent_app_nativeagent_SpliceShim_extractFd(
+    JNIEnv *env, jobject thiz, jobject channel) {
+
+    (void)thiz;
+    if (channel == NULL) return -1;
+
+    // Find the FileDescriptor-typed "fd" field by walking up
+    // the class hierarchy. SocketChannelImpl declares it directly.
+    jclass searchCls = (*env)->GetObjectClass(env, channel);
+    jfieldID fdField = NULL;
+
+    while (searchCls != NULL) {
+        fdField = (*env)->GetFieldID(env, searchCls,
+                                     "fd", "Ljava/io/FileDescriptor;");
+        if (fdField != NULL) break;
+        // GetFieldID throws NoSuchFieldError on miss; clear it.
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        jclass parent = (*env)->GetSuperclass(env, searchCls);
+        (*env)->DeleteLocalRef(env, searchCls);
+        searchCls = parent;
+    }
+    if (fdField == NULL) {
+        if (searchCls != NULL) (*env)->DeleteLocalRef(env, searchCls);
+        return -1;
+    }
+
+    jobject fdObj = (*env)->GetObjectField(env, channel, fdField);
+    (*env)->DeleteLocalRef(env, searchCls);
+    if (fdObj == NULL) return -1;
+
+    // Now extract the int from FileDescriptor. AOSP libcore names the
+    // field "descriptor"; OpenJDK names it "fd". Try both.
+    jclass fdCls = (*env)->GetObjectClass(env, fdObj);
+    jfieldID intField = (*env)->GetFieldID(env, fdCls, "descriptor", "I");
+    if (intField == NULL) {
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        intField = (*env)->GetFieldID(env, fdCls, "fd", "I");
+    }
+    (*env)->DeleteLocalRef(env, fdCls);
+    if (intField == NULL) {
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        (*env)->DeleteLocalRef(env, fdObj);
+        return -1;
+    }
+
+    jint result = (*env)->GetIntField(env, fdObj, intField);
+    (*env)->DeleteLocalRef(env, fdObj);
+    return result < 0 ? -1 : result;
 }
