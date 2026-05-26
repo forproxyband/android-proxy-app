@@ -45,6 +45,32 @@ class ProxyService : Service() {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var analytics: AnalyticsRecorder? = null
     @Volatile private var lastNatRefreshMs = 0L
+    // Loopback relay that puts the agent↔registrator uplink on Wi-Fi while
+    // outbound target dials stay on cellular. Lifecycle owned by the runX
+    // engine call sites — see runBinaryEngine / runAarEngine. Lives only
+    // when wifi_return=true && mode=MODEM (see WifiReturnRelay top-of-file).
+    @Volatile private var wifiRelay: WifiReturnRelay? = null
+    // Real upstream (host, port) the agent should ultimately talk to —
+    // either directly or through the Wi-Fi return relay. originalHost/Port
+    // stay constant for the engine's lifetime; effectiveHost/Port are
+    // what we actually feed to the SDK (loopback when the relay is up,
+    // original otherwise). The split-routing self-test may flip
+    // effective→original mid-flight on a SAME_IP failure — see
+    // handleSplitFailureForCurrentEngine. Fields instead of locals so the
+    // runner loop and helpers all share the same source of truth.
+    @Volatile private var originalHost: String = ""
+    @Volatile private var originalPort: String = ""
+    @Volatile private var effectiveHost: String = ""
+    @Volatile private var effectivePort: String = ""
+    // NetworkCallback dedicated to re-running the split-routing self-test
+    // whenever a new Wi-Fi network attaches. Separate from the one in
+    // WifiReturnRelay (that one drives socket binding; this one drives
+    // re-verification). Both reference the same ConnectivityManager but
+    // their lifecycles are coupled — we unregister both in doStop.
+    private var wifiReturnRetestCallback: ConnectivityManager.NetworkCallback? = null
+    // Single in-flight self-test thread guard. Re-test triggers (network
+    // change, manual button) coalesce while a previous run is still going.
+    @Volatile private var selfTestInFlight = false
 
     @Volatile private var connStatus: ConnStatus = ConnStatus.STARTING
     @Volatile private var rxRate = 0L
@@ -63,6 +89,24 @@ class ProxyService : Service() {
     // instead of "RECONNECTING…" while the radio is intentionally bouncing.
     // Empty when no cycle is in flight.
     @Volatile private var cycleStage: String = ""
+    // Wi-Fi return relay status — written into conn_info field 8 so the UI
+    // can show whether the uplink is actually flowing over Wi-Fi or fell
+    // back to cellular. One of:
+    //   ""              — relay disabled (never enabled, or auto-stopped clean)
+    //   "wifi"          — relay up AND currently bound to a validated Wi-Fi
+    //   "wifi_fallback" — relay up but no Wi-Fi network held; new sockets go
+    //                     through the default route (cellular)
+    //   "split_failed"  — self-test detected that Wi-Fi and cellular share
+    //                     the same public IP (OS suppressing one transport),
+    //                     relay was force-disabled. Sticky until next start.
+    // Refreshed every 1s by the status updater thread (see onStartCommand),
+    // except the split_failed sticky state which the updater preserves.
+    @Volatile private var wifiReturnStatus: String = ""
+    // Sticky flag: when the split-routing self-test fails with SAME_IP, we
+    // disable the relay and set this to true so the status updater leaves
+    // wifiReturnStatus="split_failed" instead of clearing it back to "".
+    // Reset only in doStop / next service start.
+    @Volatile private var wifiReturnSplitFailed: Boolean = false
     private var lastRx = 0L
     private var lastTx = 0L
     private var lastStatsAt = 0L
@@ -131,14 +175,15 @@ class ProxyService : Service() {
     private fun writeConnInfo() {
         try {
             // Field 6 (currentUplinkTransport) was added in v2.0.14-quic;
-            // field 7 (cycleStage) was added with the IP-rotation UI surface.
-            // Readers must use getOrNull(N) for forward compatibility so the
-            // tail fields stay optional if a downgrade ever writes shorter rows.
-            // `|` is escaped in cycleStage so a stray pipe in a log line can't
-            // shift the field count.
+            // field 7 (cycleStage) was added with the IP-rotation UI surface;
+            // field 8 (wifiReturnStatus) was added with the Wi-Fi return
+            // relay feature. Readers must use getOrNull(N) for forward
+            // compatibility so the tail fields stay optional if a downgrade
+            // ever writes shorter rows. `|` is escaped in cycleStage so a
+            // stray pipe in a log line can't shift the field count.
             val safeStage = cycleStage.replace('|', '/')
             File(filesDir, "conn_info").writeText(
-                "${connStatus.name}|$rxRate|$txRate|$currentRegistrator|$activeTunnels|$connectedSinceMs|$currentUplinkTransport|$safeStage"
+                "${connStatus.name}|$rxRate|$txRate|$currentRegistrator|$activeTunnels|$connectedSinceMs|$currentUplinkTransport|$safeStage|$wifiReturnStatus"
             )
         } catch (_: Exception) {}
     }
@@ -366,6 +411,18 @@ class ProxyService : Service() {
                 autoCycling = false
                 cycleStage = ""
                 writeConnInfo()   // clear "ROTATING · …" badge immediately
+                // If the Wi-Fi return relay is active, the cellular probe
+                // result we cached in wifi_info.json now reflects the OLD
+                // cellular IP — the whole point of rotation is to change it.
+                // Schedule ONE self-test ~5s after the cycle settles so the
+                // widget shows the fresh cellular exit IP. We deliberately
+                // suppress per-Wi-Fi-onAvailable retests during autoCycling
+                // (see registerWifiReturnRetestCallback) so this is the only
+                // retest that fires per rotation — no double-firing, no
+                // wasted cellular data.
+                if (wifiRelay != null && !stopRequested && !wifiReturnSplitFailed) {
+                    schedulePostRotationSelfTest()
+                }
             }
         }.apply { name = "AutoIpCycler"; isDaemon = true; start() }
     }
@@ -528,6 +585,17 @@ class ProxyService : Service() {
             while (!stopRequested) {
                 try {
                     refreshTrafficStats()
+                    // Refresh Wi-Fi return status before writeConnInfo() so
+                    // the UI sees state transitions within ~1s of Wi-Fi
+                    // appearing/disappearing. Cheap: just a @Volatile read.
+                    // The split_failed sticky state takes precedence over
+                    // anything else — it's the worst-case signal and must
+                    // not get clobbered by the relay-disabled path.
+                    wifiReturnStatus = when {
+                        wifiReturnSplitFailed -> "split_failed"
+                        wifiRelay != null -> if (wifiRelay!!.isUsingWifi()) "wifi" else "wifi_fallback"
+                        else -> ""
+                    }
                     nm.notify(1, buildNotification(statusText()))
                     writeConnInfo()
                     analytics?.tick()
@@ -587,6 +655,303 @@ class ProxyService : Service() {
         return START_REDELIVER_INTENT
     }
 
+    // Resolves the host/port the SDK should dial. Normally it's the user-
+    // configured (host, port). When the Wi-Fi return relay is enabled
+    // (wifi_return=true, Modem mode), we spin the relay up here and return
+    // a loopback (host, port) so the SDK connects to 127.0.0.1:<localPort>
+    // — the relay then forwards each session to the real upstream with the
+    // outgoing socket bound to a Wi-Fi Network when one is available, or
+    // through the default route (cellular) when it isn't.
+    //
+    // Returns null host on failure to start the relay — caller falls back
+    // to dialing the original (host, port) directly so a relay bug never
+    // bricks the agent.
+    private fun maybeStartWifiRelay(host: String, port: String): Pair<String, String> {
+        // Balancer mode bypass: the SDK gets the real registrator (host,
+        // port) from the balancer's JSON response and dials that directly,
+        // so a loopback relay on (balancer_host, balancer_port) would only
+        // see the GET /getRegistrator and miss the actual uplink. The UI
+        // already greys out the checkbox in Balancer mode (MainActivity),
+        // and the save handler stores wifi_return=false in that case, but
+        // this is a second guard in case a stale cycle_cfg.json from a
+        // previous Modem-mode save sticks around.
+        if (mode != Mode.MODEM) return host to port
+        val cfg = IpCycle.loadConfigFromFile(this)
+        if (!cfg.wifiReturn) return host to port
+
+        // Only "local_relay" is implemented. Future methods would dispatch
+        // here on cfg.wifiReturnMethod; for now anything else logs + falls
+        // back to direct dial so an unknown method doesn't silently disable
+        // the agent.
+        if (cfg.wifiReturnMethod != "local_relay") {
+            log("wifi_return enabled with unsupported method=\"${cfg.wifiReturnMethod}\" — bypassing relay")
+            return host to port
+        }
+        val portInt = port.toIntOrNull()
+        if (portInt == null || portInt !in 1..65535) {
+            log("wifi_return: invalid upstream port \"$port\"; bypassing relay")
+            return host to port
+        }
+        try {
+            val relay = WifiReturnRelay(
+                context = this,
+                upstreamHost = host,
+                upstreamPort = portInt,
+                log = { msg -> log("wifi-relay: $msg") },
+            )
+            val localPort = relay.start()
+            wifiRelay = relay
+            log("wifi_return: relay up on 127.0.0.1:$localPort → $host:$portInt")
+            return "127.0.0.1" to localPort.toString()
+        } catch (t: Throwable) {
+            log("wifi_return: relay start failed (${t.message}) — falling back to direct dial")
+            return host to port
+        }
+    }
+
+    private fun stopWifiRelayIfRunning() {
+        val r = wifiRelay ?: return
+        wifiRelay = null
+        try { r.stop() } catch (t: Throwable) {
+            log("wifi_return: relay stop error: ${t.message}")
+        }
+        unregisterWifiReturnRetestCallback()
+    }
+
+    // Shared split-routing failure handler. Both the initial self-test and
+    // the post-rotation retest call this when SAME_IP comes back, instead
+    // of each route capturing its own onSplitFail lambda. BINARY rolls back
+    // the effective env vars and respawns the subprocess; AAR stops the
+    // whole service (in-process Go env can't be re-initialised cleanly).
+    private fun handleSplitFailureForCurrentEngine() {
+        when (engine) {
+            Engine.BINARY -> {
+                log("wifi_return: rolling back BINARY engine to direct dial " +
+                    "($originalHost:$originalPort)")
+                effectiveHost = originalHost
+                effectivePort = originalPort
+                try { agentProcess?.destroy() } catch (_: Throwable) {}
+                runnerThread?.interrupt()
+            }
+            Engine.AAR -> {
+                log("wifi_return: AAR engine can't roll back in-process; auto-stopping")
+                doStop("Wi-Fi return: split routing not confirmed — disable the checkbox to use cellular directly")
+            }
+        }
+    }
+
+    // Schedules the split-routing self-test after a short delay (lets the
+    // Wi-Fi Network in WifiReturnRelay actually attach before we probe),
+    // then re-arms on subsequent Wi-Fi changes for the lifetime of the
+    // relay. Engine-specific rollback on SAME_IP is dispatched through
+    // handleSplitFailureForCurrentEngine() — no per-call callback needed.
+    private fun scheduleWifiReturnSelfTest() {
+        // First run on a delayed thread. We don't tie this to a network
+        // callback because we want a test to fire even if Wi-Fi was
+        // already attached when the relay started.
+        Thread {
+            try { Thread.sleep(5_000L) } catch (_: InterruptedException) { return@Thread }
+            if (stopRequested) return@Thread
+            runWifiReturnSelfTestNow()
+        }.apply { name = "WifiReturnSelfTest"; isDaemon = true; start() }
+
+        registerWifiReturnRetestCallback()
+    }
+
+    private fun registerWifiReturnRetestCallback() {
+        if (wifiReturnRetestCallback != null) return
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return
+        val req = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            // Latch onto network change events: a new Wi-Fi SSID, a
+            // disconnect/reconnect, an IP change due to DHCP renewal — any
+            // of those invalidates the previous test's assumptions. We
+            // debounce by 2s because Android often fires onAvailable
+            // multiple times in quick succession during handover.
+            @Volatile private var lastFireMs = 0L
+            override fun onAvailable(network: Network) {
+                val now = System.currentTimeMillis()
+                if (now - lastFireMs < 2_000L) return
+                lastFireMs = now
+                if (stopRequested || wifiRelay == null) return
+                // Skip retests during a REBOOT auto-cycle: airplane mode
+                // toggling kills Wi-Fi too, and when it comes back this
+                // callback fires, but it's NOT a genuine network change —
+                // the underlying split-routing property hasn't changed,
+                // only the cellular public IP has. We schedule exactly
+                // one deliberate retest from triggerAutoIpCycle.finally
+                // instead. Without this guard, every rotation triggers a
+                // self-test that burns mobile data on the cellular probe
+                // for no diagnostic value.
+                if (autoCycling) {
+                    log("wifi_return: skipping retest — IP rotation in flight")
+                    return
+                }
+                log("wifi_return: Wi-Fi changed — re-running self-test")
+                Thread {
+                    // Give the new network ~3s to actually become usable
+                    // (validation, captive-portal check, etc.) before
+                    // hitting ipify on it.
+                    try { Thread.sleep(3_000L) } catch (_: InterruptedException) { return@Thread }
+                    // Re-check after the sleep — autoCycling might have
+                    // started in the gap (manual REBOOT race).
+                    if (stopRequested || autoCycling) return@Thread
+                    runWifiReturnSelfTestNow()
+                }.apply { name = "WifiReturnReTest"; isDaemon = true; start() }
+            }
+        }
+        try {
+            cm.registerNetworkCallback(req, cb)
+            wifiReturnRetestCallback = cb
+        } catch (t: Throwable) {
+            log("wifi_return: re-test callback register failed: ${t.message}")
+        }
+    }
+
+    private fun unregisterWifiReturnRetestCallback() {
+        val cb = wifiReturnRetestCallback ?: return
+        wifiReturnRetestCallback = null
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            cm?.unregisterNetworkCallback(cb)
+        } catch (_: Throwable) {}
+    }
+
+    // Runs the actual test + persists wifi_info.json + dispatches result.
+    // Guarded so re-trigger fires while a test is still in flight coalesce
+    // into a no-op instead of stacking. Engine-specific rollback on
+    // SAME_IP failure runs via handleSplitFailureForCurrentEngine().
+    private fun runWifiReturnSelfTestNow() {
+        if (selfTestInFlight) {
+            log("wifi_return: self-test already in flight; skipping retrigger")
+            return
+        }
+        // Belt-and-braces: never burn the cellular probe while the radio
+        // is mid-rotation. Callers already gate on autoCycling but this
+        // covers any direct caller we add later.
+        if (autoCycling) {
+            log("wifi_return: refusing to self-test during IP rotation")
+            return
+        }
+        selfTestInFlight = true
+        try {
+            // Snapshot the Wi-Fi link characteristics — these stay in
+            // wifi_info.json even if the split-routing probe fails, so
+            // the UI can still show what Wi-Fi network is attached.
+            val wifiNet = wifiRelay?.currentWifiNetwork()
+            val wifiSnap = WifiInfoProbe.snapshot(this, wifiNet)
+
+            val report = SplitRoutingSelfTest.runTest(this)
+            log("wifi_return: self-test result=${report.result} " +
+                "wifi_ip=${report.wifiPublicIp} cell_ip=${report.cellPublicIp} " +
+                "took=${report.durationMs}ms detail=\"${report.detail}\"")
+            writeWifiInfoJson(report, wifiSnap)
+
+            when (report.result) {
+                SplitRoutingSelfTest.Result.SUCCESS -> {
+                    log("wifi_return: split routing VERIFIED (wifi=${report.wifiPublicIp}, cell=${report.cellPublicIp})")
+                }
+                SplitRoutingSelfTest.Result.SAME_IP -> {
+                    log("wifi_return: SAME IP on both transports — relay would be ineffective and target's exit IP " +
+                        "would be Wi-Fi, not cellular. Disabling relay per policy.")
+                    // Flip the sticky flag BEFORE stopping the relay so
+                    // the status updater (which polls 1Hz) never sees a
+                    // transient "" state between relay-stop and our explicit
+                    // status write. wifiReturnStatus itself is also primed
+                    // so the very next conn_info write carries it even if
+                    // the status thread hasn't ticked yet.
+                    wifiReturnSplitFailed = true
+                    wifiReturnStatus = "split_failed"
+                    stopWifiRelayIfRunning()
+                    writeConnInfo()
+                    handleSplitFailureForCurrentEngine()
+                }
+                SplitRoutingSelfTest.Result.WIFI_PROBE_FAILED -> {
+                    // Wi-Fi probe didn't get back; could be momentary
+                    // captive portal flap. Don't disable — let the next
+                    // re-test fire on the next network change.
+                    log("wifi_return: Wi-Fi probe failed — keeping relay (may retest on next network change)")
+                }
+                SplitRoutingSelfTest.Result.CELL_PROBE_FAILED -> {
+                    // Same logic — cellular momentarily unavailable. Worst
+                    // case the relay falls back to the default route on
+                    // its own and we re-test later.
+                    log("wifi_return: cellular probe failed — keeping relay")
+                }
+                SplitRoutingSelfTest.Result.BOTH_FAILED -> {
+                    log("wifi_return: both probes failed — keeping relay, will retest later")
+                }
+            }
+        } catch (t: Throwable) {
+            log("wifi_return: self-test crashed: ${t.message}")
+        } finally {
+            selfTestInFlight = false
+        }
+    }
+
+    // Fires exactly one self-test after a REBOOT auto-cycle completes,
+    // delayed enough for cellular + Wi-Fi to fully reattach. Idempotent
+    // via runWifiReturnSelfTestNow's selfTestInFlight guard.
+    //
+    // Why we don't just rely on the Wi-Fi onAvailable retest callback
+    // ────────────────────────────────────────────────────────────────
+    // During rotation, airplane mode kills Wi-Fi too (default Android
+    // behaviour). When Wi-Fi comes back, onAvailable fires — and on its
+    // own that WOULD trigger a retest. We suppress those retests
+    // explicitly (see registerWifiReturnRetestCallback) because:
+    //   1. Every retest spends ~6s and one cellular HTTP request, which
+    //      during a rotation storm (REBOOTs every few minutes) adds up.
+    //   2. The split-routing property hasn't actually changed — only the
+    //      cellular public IP has. We just need to refresh the cached
+    //      value, not re-verify the routing.
+    //   3. If we don't suppress, onAvailable might fire mid-cycle (some
+    //      ROMs reattach Wi-Fi before cellular), the test fires, the
+    //      cellular probe fails because radio is still bouncing, we cache
+    //      a CELL_PROBE_FAILED result — and the UI panics for no reason.
+    // So we run exactly one post-cycle test from here.
+    private fun schedulePostRotationSelfTest() {
+        Thread {
+            // 5s settle: longer than the basic post-airplane-off reattach
+            // wait (3s) so cellular is fully up and the new public IP is
+            // reachable through ipify.
+            try { Thread.sleep(5_000L) } catch (_: InterruptedException) { return@Thread }
+            if (stopRequested || autoCycling || wifiRelay == null) return@Thread
+            log("wifi_return: post-rotation self-test — refreshing cached IPs")
+            runWifiReturnSelfTestNow()
+        }.apply { name = "WifiReturnPostCycleTest"; isDaemon = true; start() }
+    }
+
+    // Persists the latest split-routing test result + Wi-Fi link info to
+    // wifi_info.json. MainActivity reads this to render the widget's
+    // two-IP display and feed the log-export header. Schema is
+    // additive-only; older readers ignore unknown keys via JSONObject.opt*.
+    private fun writeWifiInfoJson(
+        report: SplitRoutingSelfTest.Report,
+        wifi: WifiInfoProbe.Snapshot,
+    ) {
+        try {
+            val o = org.json.JSONObject()
+            o.put("public_ip_wifi", report.wifiPublicIp)
+            o.put("public_ip_cell", report.cellPublicIp)
+            o.put("link_speed_mbps", wifi.linkSpeedMbps)
+            o.put("frequency_mhz", wifi.frequencyMhz)
+            o.put("band", wifi.band)
+            o.put("standard", wifi.standard)
+            o.put("wifi_attached", wifi.attached)
+            o.put("test_result", report.result.name)
+            o.put("test_detail", report.detail)
+            o.put("test_duration_ms", report.durationMs)
+            o.put("tested_at_ms", System.currentTimeMillis())
+            File(filesDir, "wifi_info.json").writeText(o.toString())
+        } catch (t: Throwable) {
+            log("wifi_return: wifi_info.json write failed: ${t.message}")
+        }
+    }
+
     private fun runBinaryEngine(host: String, port: String, key: String, agentId: String, dns: String) {
         val binary = File(applicationInfo.nativeLibraryDir, "libproxyagent.so")
         if (!binary.exists()) {
@@ -597,11 +962,33 @@ class ProxyService : Service() {
         }
         try { binary.setExecutable(true, false) } catch (_: Throwable) {}
         log("Binary: ${binary.absolutePath} size=${binary.length()}")
+        // Spin up the Wi-Fi return relay (if enabled) BEFORE the runner loop
+        // so the very first dial of the subprocess uses the loopback address.
+        // The relay lives across subprocess respawns (the agent reconnect /
+        // SDK backoff loop dials repeatedly); we only tear it down in doStop.
+        //
+        // originalHost/Port + effectiveHost/Port are fields on the service so
+        // handleSplitFailureForCurrentEngine() can mutate effective→original
+        // mid-flight on a SAME_IP self-test failure. The runner loop reads
+        // the @Volatile effective* fields each iteration, so a destroy()
+        // from the failure handler trips readLine EOF and the next pb.start
+        // picks up the new values automatically.
+        originalHost = host
+        originalPort = port
+        val initialEffective = maybeStartWifiRelay(host, port)
+        effectiveHost = initialEffective.first
+        effectivePort = initialEffective.second
+        if (wifiRelay != null) scheduleWifiReturnSelfTest()
 
         var backoffMs = 1000L
         while (!stopRequested) {
             try {
-                log("Launching subprocess: mode=${mode.name} host=$host port=$port key=${mask(key)} id=${if (agentId.isEmpty()) "<empty>" else mask(agentId)} dns=$dns")
+                // effectiveHost/effectivePort may point at the loopback relay
+                // (Wi-Fi return) instead of the real registrator. Log the real
+                // upstream too so debugging stays sane.
+                val relayActive = effectiveHost != host
+                val hostLog = if (relayActive) "$effectiveHost:$effectivePort→$host:$port" else host
+                log("Launching subprocess: mode=${mode.name} host=$hostLog port=$port key=${mask(key)} id=${if (agentId.isEmpty()) "<empty>" else mask(agentId)} dns=$dns")
                 connStatus = ConnStatus.CONNECTING
                 val pb = ProcessBuilder(binary.absolutePath).redirectErrorStream(true)
                 pb.environment().apply {
@@ -614,11 +1001,14 @@ class ProxyService : Service() {
                         Mode.MODEM -> {
                             // Direct registrator: SDK skips balancer/fallback when both
                             // registrator_host AND registrator_port are set.
-                            put("registrator_host", host)
-                            put("registrator_port", port)
+                            put("registrator_host", effectiveHost)
+                            put("registrator_port", effectivePort)
                             if (agentId.isNotEmpty()) put("agent_uuid", agentId)
                         }
                         Mode.BALANCER -> {
+                            // Balancer path is never routed through the Wi-Fi
+                            // relay (see maybeStartWifiRelay) — these always
+                            // get the real (host, port).
                             put("balancer_host", host)
                             put("balancer_port", port)
                             put("fallback_file_url",
@@ -689,7 +1079,26 @@ class ProxyService : Service() {
             log("Capturing native stdout/stderr…")
             captureNativeOutput()
 
-            log("Setting environment: mode=${mode.name} host=$host port=$port key=${mask(key)} id=${if (agentId.isEmpty()) "<empty>" else mask(agentId)} dns=$dns")
+            // Same Wi-Fi return wiring as the binary engine — see
+            // maybeStartWifiRelay() for the conditions. The AAR's in-process
+            // Go runtime also dials whatever (host, port) we set in env, so
+            // the loopback substitution works identically. Note: the relay
+            // lives in the :proxy process alongside the Go runtime, so it
+            // dies with the AAR's process kill in doStop (no separate
+            // teardown ordering needed beyond stopWifiRelayIfRunning()).
+            originalHost = host
+            originalPort = port
+            val initialEffective = maybeStartWifiRelay(host, port)
+            effectiveHost = initialEffective.first
+            effectivePort = initialEffective.second
+            val relayActive = effectiveHost != host
+            val hostLog = if (relayActive) "$effectiveHost:$effectivePort→$host:$port" else host
+            log("Setting environment: mode=${mode.name} host=$hostLog port=$port key=${mask(key)} id=${if (agentId.isEmpty()) "<empty>" else mask(agentId)} dns=$dns")
+
+            // Self-test for AAR: can't roll back in-process (Go env is
+            // cached at JNI_OnLoad), so on split-routing failure we must
+            // auto-stop the whole service (see handleSplitFailureForCurrentEngine).
+            if (wifiRelay != null) scheduleWifiReturnSelfTest()
             // The SDK's Go config helper checks both lowercase ("balancer_host")
             // and SCREAMING_SNAKE ("BALANCER_HOST") names — set both so we
             // don't depend on the SDK's casing convention.
@@ -709,11 +1118,16 @@ class ProxyService : Service() {
                     // so we rely on env vars (config.FromEnvAndFlags reads
                     // registrator_host/REGISTRATOR_HOST). Set BEFORE Go runtime
                     // initializes via Class.forName("go.Seq") below.
-                    setBoth("registrator_host", host)
-                    setBoth("registrator_port", port)
+                    // effectiveHost/effectivePort point at the Wi-Fi return
+                    // relay's loopback address when that feature is enabled;
+                    // otherwise they're identical to host/port.
+                    setBoth("registrator_host", effectiveHost)
+                    setBoth("registrator_port", effectivePort)
                     if (agentId.isNotEmpty()) setBoth("agent_uuid", agentId)
                 }
                 Mode.BALANCER -> {
+                    // Balancer never goes through the Wi-Fi relay — see
+                    // maybeStartWifiRelay() for the reason.
                     setBoth("balancer_host", host)
                     setBoth("balancer_port", port)
                     setBoth("fallback_file_url",
@@ -913,6 +1327,18 @@ class ProxyService : Service() {
         stopRequested = true
         unregisterNetworkCallback()
         try { analytics?.flush() } catch (_: Throwable) {}
+        // Tear down the Wi-Fi return relay before we stop the engine so the
+        // SDK's last reconnect attempt (if any) sees a dead loopback port
+        // and gives up cleanly instead of trying to dial through a relay
+        // that's about to lose its accept thread mid-handshake.
+        stopWifiRelayIfRunning()
+        // Clear the conn_info field 8 indicator so the UI doesn't keep
+        // showing "via Wi-Fi" after we've stopped. The status updater
+        // thread is also about to exit, so we can't rely on its 1Hz tick
+        // to do this for us. Also clear the sticky split_failed flag so
+        // a subsequent start gets a fresh test.
+        wifiReturnStatus = ""
+        wifiReturnSplitFailed = false
         when (engine) {
             Engine.BINARY -> try {
                 agentProcess?.let { p ->

@@ -52,6 +52,39 @@
         android:fontFamily="monospace"
         android:layout_marginTop="6dp" />
 
+    <!-- Wi-Fi return relay indicator. Populated by MainActivity.refresh()
+         from conn_info field 8 — empty (GONE) when the relay is disabled,
+         green when the uplink is actually riding Wi-Fi, amber when the
+         relay is up but currently fell back to cellular (no Wi-Fi held),
+         red when the split-routing self-test rejected the relay. Holds
+         the primary line (link speed / band / standard, or fallback /
+         warning). -->
+    <TextView
+        android:id="@+id/tvUplinkVia"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text=""
+        android:textColor="#88ffaa"
+        android:textSize="11sp"
+        android:fontFamily="monospace"
+        android:layout_marginTop="2dp"
+        android:visibility="gone" />
+
+    <!-- Detailed two-IP block populated from wifi_info.json — only visible
+         on a successful self-test. Multiline (max 3 short lines): cellular
+         exit IP that targets see, Wi-Fi public IP that the registrator
+         sees, and a verification line confirming the two are different. -->
+    <TextView
+        android:id="@+id/tvUplinkDetail"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text=""
+        android:textColor="#88ffaa"
+        android:textSize="10sp"
+        android:fontFamily="monospace"
+        android:layout_marginTop="2dp"
+        android:visibility="gone" />
+
     <TextView
         android:id="@+id/tvSwipeHint"
         android:layout_width="wrap_content"

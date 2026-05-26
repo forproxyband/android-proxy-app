@@ -53,6 +53,22 @@ object IpCycle {
         // "magisk-imei" → magisk-imei --random (needs the module)
         val imeiMethod: String = "custom",
         val imeiCustomCmd: String = "",
+        // Wi-Fi return relay (Modem mode only): when true, ProxyService spins
+        // up a loopback TCP relay and points the SDK at it; the relay binds
+        // its outgoing sockets to a Wi-Fi Network so the agent↔registrator
+        // uplink rides Wi-Fi while the agent↔target dial still goes through
+        // cellular (preserving the mobile exit IP). Falls back transparently
+        // to the default network (cellular) when Wi-Fi is unavailable, so
+        // losing Wi-Fi never drops the agent — it just stops the savings.
+        // See ARCHITECTURE.md §"Wi-Fi return relay" for the full flow.
+        val wifiReturn: Boolean = false,
+        // Method selector for the wifi_return feature. Currently only
+        // "local_relay" is implemented (a loopback bridge in :proxy). The
+        // field is stored even though there's no UI for it yet — kept as a
+        // forward-compat slot so future methods (e.g. SO_MARK + iproute,
+        // VpnService-based split tunnel) can be added without re-shaping the
+        // JSON schema.
+        val wifiReturnMethod: String = "local_relay",
     )
 
     // ── Cross-process config storage ────────────────────────────────────
@@ -77,6 +93,9 @@ object IpCycle {
                 imeiRotation = o.optBoolean("imei_rotate", false),
                 imeiMethod = o.optString("imei_method", "custom").ifEmpty { "custom" },
                 imeiCustomCmd = o.optString("imei_cmd", ""),
+                wifiReturn = o.optBoolean("wifi_return", false),
+                wifiReturnMethod = o.optString("wifi_return_method", "local_relay")
+                    .ifEmpty { "local_relay" },
             )
         } catch (_: Throwable) { CycleConfig() }
     }
@@ -88,6 +107,8 @@ object IpCycle {
             o.put("imei_rotate", config.imeiRotation)
             o.put("imei_method", config.imeiMethod)
             o.put("imei_cmd", config.imeiCustomCmd)
+            o.put("wifi_return", config.wifiReturn)
+            o.put("wifi_return_method", config.wifiReturnMethod)
             File(context.filesDir, CFG_FILE_NAME).writeText(o.toString())
         } catch (_: Throwable) {}
     }

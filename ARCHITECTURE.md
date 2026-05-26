@@ -35,11 +35,12 @@ APK, and which of its stdout lines we react to.
 | `speed_units` | UI | text | `bits`/`bytes` for rate display. |
 | `cycle_cfg.json` | UI writes, both read | JSON | Cross-process mirror of the cycle settings (`apn_swap`, `imei_rotate`, `imei_method`, `imei_cmd`). SharedPreferences are per-process — the REBOOT auto-cycle in `:proxy` would otherwise miss toggle changes made in `:main`. Rewritten on every settings save and re-mirrored on app launch as a back-fill. |
 | `analytics/cycle_events.jsonl` | both write | JSONL | One row per rotation attempt with old/new IP, success flag, attempts and duration. Read by the swipe-panel chart, the analytics screen, and the CSV export. Pruned by the same retention policy as bucket files. |
+| `wifi_info.json` | service | JSON | Latest Wi-Fi return split-routing self-test result + Wi-Fi link snapshot. Keys: `public_ip_wifi`, `public_ip_cell`, `link_speed_mbps`, `frequency_mhz`, `band` (`"2.4 GHz"`/`"5 GHz"`/`"6 GHz"`), `standard` (`"Wi-Fi 5 (802.11ac)"` etc.), `wifi_attached`, `test_result` (`SUCCESS`/`SAME_IP`/`WIFI_PROBE_FAILED`/`CELL_PROBE_FAILED`/`BOTH_FAILED`), `test_detail`, `test_duration_ms`, `tested_at_ms`. Written by ProxyService after each self-test; read by MainActivity for the widget two-IP block and the log-export header. |
 
 ## `conn_info` schema
 
 One pipe-delimited line written by `writeConnInfo`
-(`ProxyService.kt:126-138`). Eight fields (0-indexed):
+(`ProxyService.kt:126-138`). Nine fields (0-indexed):
 
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
@@ -51,6 +52,7 @@ One pipe-delimited line written by `writeConnInfo`
 | 5 | `connectedSinceMs` | long | Epoch ms of last successful AUTH; 0 when not CONNECTED. |
 | 6 | `currentUplinkTransport` | string | `QUIC` / `TCP (splice)` / `TCP+yamux` / `WebSocket`. Added v2.0.14-quic. |
 | 7 | `cycleStage` | string | Non-empty only during REBOOT auto-cycle. UI shows `ROTATING · <stage>`. Added with `IpCycle.cycleAndVerify` rework. |
+| 8 | `wifiReturnStatus` | string | `""` (relay off) / `"wifi"` (uplink on Wi-Fi) / `"wifi_fallback"` (relay up, no Wi-Fi held — flowing through cellular). UI shows "↺ uplink via Wi-Fi" / "↺ uplink via cellular (Wi-Fi return enabled, no Wi-Fi held)". Added with Wi-Fi return relay. |
 
 `MainActivity.refresh()` polls every 3s, reads with `getOrNull(N)` so
 forward-compat survives older downgrades that write fewer fields. `|`
@@ -91,6 +93,8 @@ Backed by the dialog at `MainActivity.kt:278-408` (XML
 | `imei_rotate` | bool | false | Enable IMEI rotation fallback. |
 | `imei_method` | string | `"custom"` | `"custom"` / `"props"` / `"magisk-imei"`. |
 | `imei_cmd` | string | — | Root shell command when `imei_method="custom"`. |
+| `wifi_return` | bool | false | Route the agent↔registrator uplink over Wi-Fi via a loopback relay; target dials still ride cellular. Modem mode only — auto-clamped to false on save when `mode="balancer"`. See "Wi-Fi return relay" below. |
+| `wifi_return_method` | string | `"local_relay"` | Slot for future methods (SO_MARK, VpnService split tunnel). No UI yet — only `local_relay` is implemented; anything else falls back to direct dial with a log line. |
 
 ## Connection modes
 
@@ -245,6 +249,269 @@ straight from the `IpCycle` log callback — e.g. `attempt 1: airplane
 on + restart ril + RAT→GSM, sleeping 10s`, `attempt 3 (APN swap):
 preferapn 724 → 725 (life:) MMS/mms)`. The manual ↻ path writes the
 same callback output to `tvStatus` directly via `runOnUiThread`.
+
+## Wi-Fi return relay — `WifiReturnRelay`
+
+Optional split-routing layer added when `cycle_cfg.json.wifi_return=true`
+and the connection mode is Modem. Lets the agent↔registrator uplink ride
+Wi-Fi while the agent→target dial keeps using cellular — preserving the
+mobile exit IP that clients see at the target, while removing the uplink
+relay traffic from the mobile data bill.
+
+### Why it's not a one-liner
+
+The agent has two distinct connection types:
+
+1. **Uplink** (agent ↔ registrator): a control TCP/QUIC socket plus a
+   pool of data sockets. *All* tunneled client bytes traverse this, in
+   both directions.
+2. **Outbound dial** (agent → target): the actual TCP connection to the
+   end host. *This is the one that must use cellular* — the IP the
+   target observes is the local-bound IP of that socket.
+
+A process-wide `ConnectivityManager.bindProcessToNetwork` would push (2)
+onto Wi-Fi too and lose the mobile exit IP. Per-socket binding via
+`Network.bindSocket(fd)` is a Java-only API, unreachable from the Go
+binary (which is a plain Linux ELF with no JNI). So we put a loopback
+relay in the middle:
+
+```
+SDK ── connect(127.0.0.1:<localPort>) ──► WifiReturnRelay
+                                              │
+                                              ├─► dial(realRegistrator)
+                                              │   socket bound to Wi-Fi
+                                              │   when Wi-Fi is up
+                                              │   (else default route)
+                                              │
+                                              └─► io.Copy in both directions
+```
+
+The SDK still dials the target directly (untouched by the relay) — those
+sockets ride the default route, which is cellular when both transports
+are up *and the proxy's UID isn't bound to a specific network*.
+
+### Lifecycle
+
+- **Construction**: `maybeStartWifiRelay(host, port)` in `ProxyService`
+  reads `cycle_cfg.json`, returns either `(realHost, realPort)` (relay
+  disabled) or `("127.0.0.1", localPort)` (relay up). Called once per
+  engine launch from `runBinaryEngine` and `runAarEngine` before env
+  is composed.
+- **Per-session**: a single `accept()` thread spawns two daemon pipe
+  threads per accepted connection. Each session captures the current
+  `wifiNet` at dial time — a later network change doesn't disturb the
+  existing socket (TCP can't be moved between interfaces). New sessions
+  pick up the new `wifiNet`.
+- **Wi-Fi acquisition**: `requestNetwork` with
+  `TRANSPORT_WIFI + NET_CAPABILITY_INTERNET + NET_CAPABILITY_VALIDATED`.
+  `VALIDATED` skips captive-portal Wi-Fi that would silently funnel
+  uplink into a dead network. `onAvailable` / `onLost` /
+  `onCapabilitiesChanged` keep `wifiNet` in sync.
+- **DNS**: resolved through `wifiNet.getAllByName(host)` when a Wi-Fi
+  network is held, otherwise plain `InetAddress.getAllByName`. Stops
+  the relay from accidentally leaking lookups to the cellular resolver
+  while the socket itself is bound to Wi-Fi (manifests as "host
+  unknown" on some captive Wi-Fi).
+- **Teardown**: `stopWifiRelayIfRunning` in `doStop` closes the
+  `ServerSocket` (kills `accept`), unregisters the network callback,
+  and lets in-flight pipe threads drain naturally on EOF. On the AAR
+  path the subsequent process kill cleans up anything wedged.
+
+### Fallback behaviour
+
+When `wifiNet == null` (Wi-Fi gone, validation pending, captive
+portal), the relay still accepts the local connection and dials the
+upstream **without** `bindSocket` — the resulting socket rides the
+default route, which is cellular. The agent stays up; bandwidth
+savings stop until Wi-Fi recovers. We deliberately don't kill existing
+sessions on `onLost` — TCP can't be moved between interfaces anyway,
+and re-establishing on every Wi-Fi flap would just thrash the
+registrator's connection counter.
+
+### Split-routing self-test — `SplitRoutingSelfTest`
+
+After the relay starts (and every time Wi-Fi changes via a dedicated
+NetworkCallback in ProxyService), we run a hard verification that the
+OS is actually segregating the two transports — otherwise the relay's
+`bindSocket(wifiNet)` calls would silently fail to split traffic and
+the target would see the Wi-Fi public IP instead of the mobile exit IP.
+
+Test procedure (`SplitRoutingSelfTest.runTest`, overall budget 15s):
+
+1. `requestNetwork(TRANSPORT_WIFI + INTERNET)`, await onAvailable
+   (≤6s). Call `wifiNet.openConnection("https://api.ipify.org")` and
+   read the public IP.
+2. Same for `TRANSPORT_CELLULAR`. Returns `cellPublicIp`.
+3. Compare:
+   - Both ok, IPs differ → `SUCCESS`. Split routing confirmed.
+   - Both ok, IPs equal → `SAME_IP`. OS suppresses one transport
+     (cellular gets released when Wi-Fi is up). Relay can't help.
+   - Either probe times out → `WIFI_PROBE_FAILED` / `CELL_PROBE_FAILED`.
+     Keep the relay running — could be a transient captive-portal flap.
+     Re-test fires on the next network change.
+   - Both timeout → `BOTH_FAILED`. Same — wait for the next retest.
+
+Result is persisted to `wifi_info.json` along with a
+`WifiInfoProbe.snapshot` of the Wi-Fi link (speed, frequency, band,
+standard — no SSID, so no `ACCESS_FINE_LOCATION` needed).
+
+### On SAME_IP failure — relay rollback
+
+The user explicitly chose "fail loud" over "claim to work when it
+doesn't". Behaviour:
+
+- `wifiReturnSplitFailed` flag set (sticky until next service start).
+- `wifiReturnStatus = "split_failed"` written to `conn_info` field 8;
+  the status updater preserves this (doesn't clobber to `""`).
+- `stopWifiRelayIfRunning` closes the ServerSocket and unregisters
+  network callbacks.
+- **BINARY engine**: in-place rollback. `effectiveHost`/`effectivePort`
+  (declared as `var` for this purpose) flip back to the real upstream;
+  `agentProcess.destroy()` trips the runner's readLine EOF, which
+  loops back to `ProcessBuilder` with the updated env. Subprocess
+  reconnects directly to the registrator, no service restart needed.
+- **AAR engine**: can't roll back in-process (Go env is cached at
+  JNI_OnLoad). Calls `doStop("Wi-Fi return: split routing not
+  confirmed — disable the checkbox to use cellular directly")`. User
+  sees an auto-stopped notification with the reason, unticks the
+  checkbox, and starts again.
+
+The flag clears on next `doStop` / new service start — a fresh test
+runs on the new session.
+
+### Re-test triggers
+
+A second `NetworkCallback` (`wifiReturnRetestCallback`) is registered
+in ProxyService for `TRANSPORT_WIFI + INTERNET` requests. On
+`onAvailable` of a new Wi-Fi network (debounced 2s — Android often
+fires multiple times in quick handover), the self-test reruns after a
+3s settle delay. `selfTestInFlight` guards against stacking when
+events fire while a previous test is still running.
+
+This callback is separate from the one in `WifiReturnRelay` itself:
+the relay's callback drives socket binding (`onAvailable` →
+`wifiNet = network`), while this one drives re-verification. Both
+are unregistered in `stopWifiRelayIfRunning`.
+
+### Interaction with IP rotation
+
+Default Android airplane-mode behaviour kills **both** Wi-Fi and
+cellular, which means every REBOOT auto-cycle would naturally fire a
+`wifiReturnRetestCallback.onAvailable` when Wi-Fi reattaches at the
+end of the cycle. Per-rotation retests are wasteful:
+
+- The split-routing property hasn't changed — same physical interfaces,
+  same OS behaviour. Only the cellular public IP has changed (that's
+  the rotation's whole purpose).
+- Each retest burns ~6s and one cellular HTTP request to ipify.
+- On ROMs where Wi-Fi reattaches before cellular settles, the
+  cellular probe fails mid-rotation and we'd cache a misleading
+  `CELL_PROBE_FAILED` result.
+
+Two guards keep this clean:
+
+1. **Suppress retests while `autoCycling=true`.** Both
+   `wifiReturnRetestCallback.onAvailable` and `runWifiReturnSelfTestNow`
+   early-return when the flag is set. The auto-cycle thread holds
+   `autoCycling=true` from the moment `triggerAutoIpCycle` starts
+   until the `finally` block clears it.
+2. **Schedule one deliberate post-rotation test.** In the
+   `triggerAutoIpCycle` `finally` block, after `autoCycling=false`,
+   `schedulePostRotationSelfTest()` queues a single self-test 5s
+   later. That refreshes the cached cellular IP in `wifi_info.json`
+   so the widget shows the new exit IP. Skipped when
+   `wifiReturnSplitFailed` is true (relay already disabled — no point
+   re-probing) or `stopRequested` (service is going away).
+
+The relay object itself is **not** recreated by rotation. ServerSocket
+stays open, `wifiNet` inside the relay updates via its own
+NetworkCallback when Wi-Fi reattaches, and the SDK reconnects through
+the existing loopback port automatically. The only state that has to
+be refreshed externally is the cached IP pair in `wifi_info.json`,
+which is exactly what the single post-rotation test does.
+
+Manual `↻` rotation (`MainActivity.cycleMobileIp`) doesn't need this
+treatment — it stops the service entirely, runs the cycle, then
+starts the service again, so the whole `wifi_return` lifecycle goes
+through `onStartCommand` and gets a fresh initial self-test for free.
+
+### UI surfaces
+
+- **Status widget (page 0)** — two TextViews:
+  - `tvUplinkVia` (primary line): shows current state with link
+    characteristics from `wifi_info.json`:
+    - `wifi` (cyan): `↺ uplink: Wi-Fi · 433 Mbps · 5 GHz · Wi-Fi 5`
+    - `wifi_fallback` (amber): `↺ uplink via cellular · Wi-Fi return
+      enabled but no Wi-Fi held`
+    - `split_failed` (red): `✗ Wi-Fi return DISABLED · split routing
+      not confirmed`
+    - `""` (relay off): GONE.
+  - `tvUplinkDetail` (two-line IP block): shown only when
+    `wifi_info.json` has either IP. Format:
+    ```
+      ↓ exit:   203.0.113.10 (cellular)
+      ↑ uplink: 198.51.100.20 (Wi-Fi)
+    ```
+    On `split_failed` an extra warning line appears beneath:
+    `  ⚠ both IPs equal — OS suppresses cellular while Wi-Fi up`.
+- **Log export header** (`MainActivity.buildDeviceInfoHeader`):
+  - `Wi-Fi-Return: <state>` in `[CONNECTION STATE]` section
+    (`disabled` / `enabled (uplink via Wi-Fi)` / `enabled (fallback to
+    cellular — no Wi-Fi held)` / `enabled (proxy not running)`).
+  - Full `[WI-FI RETURN]` section when `wifi_info.json` exists:
+    cellular & Wi-Fi public IPs, link speed, frequency, band,
+    standard, split-routing verdict, self-test timestamp.
+
+### Preflight — `MobileDataAlwaysOnCheck`
+
+When the user ticks `cbWifiReturn` in the settings dialog,
+`MainActivity.runMobileDataAlwaysOnPreflight` fires an async probe
+(`Thread`, ~5s budget) that determines whether the device will keep
+cellular attached alongside Wi-Fi. Without that, the relay is
+basically useless: every time Wi-Fi connects, the OS would release the
+cellular Network, and the relay's "Wi-Fi for uplink, cellular for
+target dial" promise breaks.
+
+Probe logic (`MobileDataAlwaysOnCheck.check`):
+
+1. No cellular hardware (`TelephonyManager.phoneType == PHONE_TYPE_NONE`)
+   → `UNKNOWN`. Silent — Wi-Fi-only tablets don't need a warning.
+2. Read `Settings.Global.mobile_data_always_on`:
+   - `1` → `SUPPORTED`. Silent.
+   - `0` → `BLOCKED`. Dialog fires.
+   - missing/exception → fall through to active probe.
+3. Active probe: `requestNetwork(TRANSPORT_CELLULAR + INTERNET)` with
+   a 5s `CountDownLatch`. `onAvailable` within budget → `SUPPORTED`;
+   timeout → `BLOCKED`; systemic failure → `UNKNOWN`.
+
+`canAutoFix` is true when `WRITE_SECURE_SETTINGS` was granted (same
+permission already used for IP-rotation airplane toggle). When true,
+the dialog offers an `Enable` button that calls
+`Settings.Global.putInt("mobile_data_always_on", 1)` and read-backs
+the value. When false (or when the write didn't stick), the dialog
+falls back to manual instructions: developer-options toggle,
+`adb shell settings put global mobile_data_always_on 1`, or
+`adb shell pm grant <pkg> WRITE_SECURE_SETTINGS` to unlock the auto-fix.
+
+The user can dismiss the dialog and save with the box ticked anyway —
+the warning is informational, not blocking. If cellular ends up
+genuinely unavailable while Wi-Fi is up, the relay still works in
+fallback mode (everything via Wi-Fi), it just doesn't give us the
+mobile exit IP we wanted.
+
+### What's NOT supported in this iteration
+
+- **Balancer mode**: the SDK GETs a JSON descriptor from the balancer
+  and then dials the chosen registrator directly, bypassing the env
+  override. Only the balancer GET would go through the relay; the
+  actual uplink wouldn't. UI disables the checkbox when `mode=balancer`
+  and the save handler clamps `wifi_return=false` regardless of the
+  in-memory checkbox state, so flipping the mode toggle in either
+  direction lands in a sane place.
+- **Traffic-stats split**: `TrafficStats.getUidRxBytes/TxBytes` lumps
+  Wi-Fi and cellular together by UID. The status card's "↓ ↑" rates
+  thus include both. Switch to `NetworkStatsManager` if per-transport
+  accounting is needed later.
 
 ## Auto-stop watchdog (`ProxyService.kt:486-528`)
 

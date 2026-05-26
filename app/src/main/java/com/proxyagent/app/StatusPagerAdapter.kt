@@ -24,6 +24,14 @@ class StatusPagerAdapter(
         var tvRegistrator: TextView? = null
         var tvUptime: TextView? = null
         var tvActivity: TextView? = null
+        // Wi-Fi return indicator. Stays GONE unless the proxy's
+        // wifi_return relay is active. See MainActivity.refresh() for the
+        // text/visibility logic.
+        var tvUplinkVia: TextView? = null
+        // Two-IP detail block (cellular exit + Wi-Fi uplink). Only visible
+        // after a successful split-routing self-test (wifi_info.json
+        // present with test_result=SUCCESS).
+        var tvUplinkDetail: TextView? = null
 
         var trafficRoot: View? = null
         var trafficTitle: TextView? = null
@@ -54,6 +62,8 @@ class StatusPagerAdapter(
                 refs.tvRegistrator = v.findViewById(R.id.tvRegistrator)
                 refs.tvUptime = v.findViewById(R.id.tvUptime)
                 refs.tvActivity = v.findViewById(R.id.tvActivity)
+                refs.tvUplinkVia = v.findViewById(R.id.tvUplinkVia)
+                refs.tvUplinkDetail = v.findViewById(R.id.tvUplinkDetail)
                 VH(v)
             }
             1 -> {

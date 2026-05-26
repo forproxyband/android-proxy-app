@@ -190,6 +190,9 @@ class MainActivity : AppCompatActivity() {
                 imeiRotation = prefs.getBoolean("imei_rotate", false),
                 imeiMethod = prefs.getString("imei_method", "custom") ?: "custom",
                 imeiCustomCmd = prefs.getString("imei_cmd", "") ?: "",
+                wifiReturn = prefs.getBoolean("wifi_return", false),
+                wifiReturnMethod = prefs.getString("wifi_return_method", "local_relay")
+                    ?: "local_relay",
             ),
         )
 
@@ -316,12 +319,32 @@ class MainActivity : AppCompatActivity() {
         val cbImeiRotate = view.findViewById<CheckBox>(R.id.cbImeiRotate)
         val spImeiMethod = view.findViewById<Spinner>(R.id.spImeiMethod)
         val etImeiCustomCmd = view.findViewById<EditText>(R.id.etImeiCustomCmd)
+        val cbWifiReturn = view.findViewById<CheckBox>(R.id.cbWifiReturn)
+        val tvWifiReturnHint = view.findViewById<TextView>(R.id.tvWifiReturnHint)
         val prefs = getSharedPreferences("cfg", 0)
+
+        // Wi-Fi return is Modem-only on this iteration: the Balancer path
+        // dials the registrator picked from the JSON balancer reply *after*
+        // env was set, so a loopback relay that only sees the balancer GET
+        // wouldn't catch the real uplink. Disable the checkbox + grey out
+        // the hint when Balancer is selected; checkbox state is preserved
+        // in SharedPreferences either way so toggling back to Modem brings
+        // it back.
+        fun applyWifiReturnEnabled(modemMode: Boolean) {
+            cbWifiReturn.isEnabled = modemMode
+            tvWifiReturnHint.alpha = if (modemMode) 1f else 0.5f
+            cbWifiReturn.text = if (modemMode) {
+                "Return traffic to client over Wi-Fi"
+            } else {
+                "Return traffic to client over Wi-Fi  (Modem mode only)"
+            }
+        }
 
         fun applyModeVisibility(modemMode: Boolean) {
             etId.visibility = if (modemMode) View.VISIBLE else View.GONE
             btnScanQr.visibility = if (modemMode) View.VISIBLE else View.GONE
             tvScanQrHint.visibility = if (modemMode) View.VISIBLE else View.GONE
+            applyWifiReturnEnabled(modemMode)
         }
 
         val retentionLabels = arrayOf("Day (1)", "Week (7)", "Month (30)")
@@ -374,11 +397,23 @@ class MainActivity : AppCompatActivity() {
             spImeiMethod.setSelection(mIdx)
             etImeiCustomCmd.setText(prefs.getString("imei_cmd", ""))
             applyImeiVisibility()
+            cbWifiReturn.isChecked = prefs.getBoolean("wifi_return", false)
         }
         loadFromPrefs()
 
         rgMode.setOnCheckedChangeListener { _, checkedId ->
             applyModeVisibility(checkedId == R.id.rbModeModem)
+        }
+        // Wi-Fi return preflight: when the user ticks the box (transition
+        // to checked), kick off an async check that mobile data can stay
+        // alive alongside Wi-Fi. If it can't, surface a dialog with auto-
+        // fix or manual instructions. Doesn't block save — the user can
+        // still go ahead and ignore the warning; the relay will just fall
+        // through to cellular when the OS blocks parallel transports.
+        cbWifiReturn.setOnCheckedChangeListener { _, isChecked ->
+            if (isChecked && cbWifiReturn.isEnabled) {
+                runMobileDataAlwaysOnPreflight()
+            }
         }
         cbImeiRotate.setOnCheckedChangeListener { _, _ -> applyImeiVisibility() }
         spImeiMethod.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
@@ -415,6 +450,13 @@ class MainActivity : AppCompatActivity() {
                 val modeChanged = prefs.getString("mode", "modem") != newMode
                 val imeiMethodKey = imeiMethodKeys[
                     spImeiMethod.selectedItemPosition.coerceIn(0, imeiMethodKeys.size - 1)]
+                // wifi_return is gated to Modem mode — if the user flipped
+                // to Balancer while the box was ticked (the box gets
+                // disabled but its in-memory state is still "checked"), we
+                // store false anyway so ProxyService doesn't try to spin up
+                // a relay that can't intercept the balancer-discovered
+                // registrator.
+                val effectiveWifiReturn = cbWifiReturn.isChecked && newMode == "modem"
                 prefs.edit()
                     .putString("h", h).putString("p", p).putString("k", k)
                     .putString("id", id).putString("dns", d)
@@ -426,6 +468,7 @@ class MainActivity : AppCompatActivity() {
                     .putBoolean("imei_rotate", cbImeiRotate.isChecked)
                     .putString("imei_method", imeiMethodKey)
                     .putString("imei_cmd", etImeiCustomCmd.text.toString().trim())
+                    .putBoolean("wifi_return", effectiveWifiReturn)
                     .apply()
                 // Mirror cycle config into the cross-process file so
                 // ProxyService (:proxy) can see the toggle changes — its
@@ -437,6 +480,9 @@ class MainActivity : AppCompatActivity() {
                         imeiRotation = cbImeiRotate.isChecked,
                         imeiMethod = imeiMethodKey,
                         imeiCustomCmd = etImeiCustomCmd.text.toString().trim(),
+                        wifiReturn = effectiveWifiReturn,
+                        wifiReturnMethod = prefs.getString("wifi_return_method", "local_relay")
+                            ?: "local_relay",
                     ),
                 )
                 if (retentionChanged) {
@@ -950,6 +996,105 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Wi-Fi return relay only saves data if cellular stays attached while
+    // Wi-Fi is connected. This async preflight checks the system setting
+    // (and probes if the setting isn't available) and surfaces a dialog
+    // when the OS would shut cellular off — with an auto-fix path when
+    // WRITE_SECURE_SETTINGS is granted, and an instruction string when
+    // it isn't. Doesn't block the user from saving with the box ticked;
+    // the warning is informational.
+    private fun runMobileDataAlwaysOnPreflight() {
+        Thread {
+            val report = try {
+                MobileDataAlwaysOnCheck.check(this)
+            } catch (t: Throwable) {
+                MobileDataAlwaysOnCheck.Report(
+                    MobileDataAlwaysOnCheck.Result.UNKNOWN,
+                    canAutoFix = false,
+                    detail = "check threw: ${t.message}",
+                )
+            }
+            // Only act on BLOCKED. SUPPORTED is silent (the common case);
+            // UNKNOWN means we couldn't tell (no SIM, Wi-Fi-only device) —
+            // surfacing a warning there would be more confusing than helpful.
+            if (report.result != MobileDataAlwaysOnCheck.Result.BLOCKED) return@Thread
+            runOnUiThread { showMobileDataAlwaysOnDialog(report) }
+        }.apply { name = "MobileDataPreflight"; isDaemon = true; start() }
+    }
+
+    private fun showMobileDataAlwaysOnDialog(report: MobileDataAlwaysOnCheck.Report) {
+        val baseMsg =
+            "Wi-Fi return saves mobile data only when cellular stays attached " +
+            "while Wi-Fi is connected. This device currently shuts cellular " +
+            "down once Wi-Fi is validated, which means the relay will fall " +
+            "back to cellular every time Wi-Fi is up — no savings.\n\n" +
+            "Diagnostic: ${report.detail}"
+
+        val builder = AlertDialog.Builder(this)
+            .setTitle("Cellular may drop while on Wi-Fi")
+            .setNegativeButton("Ignore", null)
+
+        if (report.canAutoFix) {
+            builder.setMessage(
+                "$baseMsg\n\nWRITE_SECURE_SETTINGS is granted — we can flip " +
+                "the system toggle for you. Continue?"
+            )
+            builder.setPositiveButton("Enable") { _, _ ->
+                // Off the UI thread because Settings.Global.putInt can do
+                // a bit of cross-process IPC, and some ROMs are sluggish.
+                Thread {
+                    val ok = try { MobileDataAlwaysOnCheck.tryEnable(this) }
+                    catch (_: Throwable) { false }
+                    runOnUiThread {
+                        Toast.makeText(
+                            this,
+                            if (ok) "Enabled mobile_data_always_on=1"
+                            else "Couldn't enable — ROM rejected the write. See manual instructions.",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        if (!ok) showMobileDataAlwaysOnInstructions()
+                    }
+                }.apply { name = "MobileDataEnable"; isDaemon = true; start() }
+            }
+            builder.setNeutralButton("Show instructions") { _, _ ->
+                showMobileDataAlwaysOnInstructions()
+            }
+        } else {
+            builder.setMessage(
+                "$baseMsg\n\nWe can't change this automatically " +
+                "(WRITE_SECURE_SETTINGS not granted)."
+            )
+            builder.setPositiveButton("Show instructions") { _, _ ->
+                showMobileDataAlwaysOnInstructions()
+            }
+        }
+        builder.show()
+    }
+
+    private fun showMobileDataAlwaysOnInstructions() {
+        val text =
+            "Pick whichever path works on your device:\n\n" +
+            "A) Developer options toggle (no root, no adb):\n" +
+            "   Settings → System → Developer options → " +
+            "Mobile data always active → ON\n" +
+            "   (Enable developer options first via Settings → About " +
+            "phone → tap Build number 7 times.)\n\n" +
+            "B) adb command (one-time, persists across reboots):\n" +
+            "   adb shell settings put global mobile_data_always_on 1\n\n" +
+            "C) Grant this app the permission to do it itself:\n" +
+            "   adb shell pm grant ${packageName} android.permission.WRITE_SECURE_SETTINGS\n" +
+            "   Then re-tick the Wi-Fi return checkbox.\n\n" +
+            "Verify it stuck by running:\n" +
+            "   adb shell settings get global mobile_data_always_on\n" +
+            "Expected output: 1"
+
+        AlertDialog.Builder(this)
+            .setTitle("Keep cellular alive on Wi-Fi")
+            .setMessage(text)
+            .setPositiveButton("Close", null)
+            .show()
+    }
+
     private fun saveLog() {
         val src = File(filesDir, "agent.log")
         if (!src.exists() || src.length() == 0L) {
@@ -1058,6 +1203,69 @@ class MainActivity : AppCompatActivity() {
         }
         kv("Transport", currentTransport())
         if (publicIp.isNotEmpty()) kv("Public-IP", publicIp)
+        // Wi-Fi return relay state — surfaced here so saved logs make the
+        // routing topology obvious to whoever reviews them. Three flavours:
+        //   1. disabled — feature off in settings
+        //   2. enabled (uplink via Wi-Fi) — relay up and actively on Wi-Fi
+        //   3. enabled (fallback to cellular) — relay up, no Wi-Fi held
+        // The conn_info field 8 only carries (2)/(3); SP gives us (1).
+        val cfgPrefs = getSharedPreferences("cfg", 0)
+        val wifiReturnPref = cfgPrefs.getBoolean("wifi_return", false)
+        val wifiReturnLabel = when {
+            !wifiReturnPref -> "disabled"
+            info.getOrNull(8).orEmpty() == "wifi" -> "enabled (uplink via Wi-Fi)"
+            info.getOrNull(8).orEmpty() == "wifi_fallback" -> "enabled (fallback to cellular — no Wi-Fi held)"
+            // Setting is on but proxy isn't running (or conn_info hasn't been
+            // updated yet) — surface the configured state without implying
+            // a current routing decision.
+            else -> "enabled (proxy not running)"
+        }
+        kv("Wi-Fi-Return", wifiReturnLabel)
+
+        // Detailed Wi-Fi return diagnostics — only emitted when there's
+        // actual data to show (wifi_info.json present from a recent self-
+        // test). Lets reviewers see both public IPs + the physical Wi-Fi
+        // link characteristics without needing access to the device.
+        if (wifiReturnPref) {
+            val info = readWifiInfoJson()
+            if (info != null) {
+                section("WI-FI RETURN")
+                val cellIp = info.optString("public_ip_cell", "")
+                val wifiIp = info.optString("public_ip_wifi", "")
+                if (cellIp.isNotEmpty()) kv("Cellular-Public-IP", cellIp)
+                if (wifiIp.isNotEmpty()) kv("Wi-Fi-Public-IP", wifiIp)
+                val speed = info.optInt("link_speed_mbps", -1)
+                if (speed > 0) kv("Wi-Fi-Link-Speed", "$speed Mbps")
+                val freq = info.optInt("frequency_mhz", -1)
+                if (freq > 0) kv("Wi-Fi-Frequency", "$freq MHz")
+                val band = info.optString("band", "")
+                if (band.isNotEmpty()) kv("Wi-Fi-Band", band)
+                val std = info.optString("standard", "")
+                if (std.isNotEmpty()) kv("Wi-Fi-Standard", std)
+                val testResult = info.optString("test_result", "")
+                if (testResult.isNotEmpty()) {
+                    val verdict = when (testResult) {
+                        "SUCCESS" -> "VERIFIED (Wi-Fi IP ≠ cellular IP)"
+                        "SAME_IP" -> "FAILED (both transports share IP — OS suppresses cellular)"
+                        "WIFI_PROBE_FAILED" -> "PARTIAL (Wi-Fi probe failed; cellular probe ok)"
+                        "CELL_PROBE_FAILED" -> "PARTIAL (cellular probe failed; Wi-Fi probe ok)"
+                        "BOTH_FAILED" -> "INCONCLUSIVE (both probes failed)"
+                        else -> testResult
+                    }
+                    kv("Split-Routing", verdict)
+                }
+                val testedAt = info.optLong("tested_at_ms", 0L)
+                if (testedAt > 0L) {
+                    kv(
+                        "Self-Test-At",
+                        SimpleDateFormat("yyyy-MM-dd HH:mm:ssZ", Locale.US)
+                            .format(Date(testedAt)),
+                    )
+                }
+                val testDetail = info.optString("test_detail", "")
+                if (testDetail.isNotEmpty()) kv("Self-Test-Detail", testDetail)
+            }
+        }
 
         section("APP")
         kv("Package", packageName)
@@ -1202,6 +1410,11 @@ class MainActivity : AppCompatActivity() {
         // so users see the rotation in progress instead of a misleading
         // RECONNECTING… that comes from the WS read error mid-cycle.
         val cycleStage = connInfo.getOrNull(7).orEmpty()
+        // 9th field — Wi-Fi return relay status. Empty when relay disabled,
+        // "wifi" when uplink is actively bound to a Wi-Fi Network,
+        // "wifi_fallback" when the relay is up but no Wi-Fi held (sockets
+        // fall through to cellular). See ProxyService.writeConnInfo.
+        val wifiReturnStatus = connInfo.getOrNull(8).orEmpty()
 
         val running = proxyState == "running" || proxyState == "starting"
         val configured = hasConnectionConfig()
@@ -1291,6 +1504,13 @@ class MainActivity : AppCompatActivity() {
                     else -> "⚡ $transportPrefix$tunnels ${if (tunnels == 1) "connection" else "connections"} · " +
                         "↓${humanRate(rxRate)} ↑${humanRate(txRate)}"
                 }
+                // Wi-Fi return indicator + two-IP detail block. The primary
+                // line (tvUplinkVia) summarises state and link characteristics;
+                // the detail line (tvUplinkDetail) shows the two public IPs
+                // proving split routing works. Both populate from
+                // conn_info field 8 + wifi_info.json (cached on disk by
+                // ProxyService).
+                updateWifiReturnPanel(wifiReturnStatus)
                 // Refresh charts at most every 30s — they cover 24h, sub-minute updates
                 // are visually pointless and re-reading the JSONL on every tick wastes IO.
                 val nowMs = System.currentTimeMillis()
@@ -1321,6 +1541,121 @@ class MainActivity : AppCompatActivity() {
         for (i in dots.indices) {
             dots[i].setBackgroundColor(if (i == active) 0xFF88FFAA.toInt() else 0x33FFFFFF.toInt())
         }
+    }
+
+    // Renders the Wi-Fi return widget block based on conn_info field 8
+    // (current relay state) and wifi_info.json (cached self-test result +
+    // link info). Pure UI; called from refresh() on each tick.
+    //
+    // States:
+    //   ""              — relay disabled in settings, both views GONE.
+    //   "wifi"          — relay up and on Wi-Fi. Primary line shows speed/
+    //                     band/standard; detail block shows the two IPs.
+    //   "wifi_fallback" — relay up but no Wi-Fi held. Amber. Detail block
+    //                     hidden because there's nothing useful to show
+    //                     (cellular-only flow).
+    //   "split_failed"  — self-test rejected the relay. Red, sticky.
+    //                     Detail shows last known IPs from wifi_info.json
+    //                     when available, with a clear "ignored" note.
+    private fun updateWifiReturnPanel(status: String) {
+        val viaView = pagerRefs.tvUplinkVia ?: return
+        val detailView = pagerRefs.tvUplinkDetail ?: return
+
+        if (status.isEmpty()) {
+            viaView.visibility = View.GONE
+            detailView.visibility = View.GONE
+            return
+        }
+
+        val info = readWifiInfoJson()
+        when (status) {
+            "wifi" -> {
+                viaView.visibility = View.VISIBLE
+                viaView.setTextColor(0xFF66E0FF.toInt())
+                viaView.text = formatWifiLinkLine(info, prefix = "↺ uplink: Wi-Fi")
+                val ipBlock = formatTwoIpBlock(info)
+                if (ipBlock != null) {
+                    detailView.visibility = View.VISIBLE
+                    detailView.setTextColor(0xFF88FFAA.toInt())
+                    detailView.text = ipBlock
+                } else {
+                    detailView.visibility = View.GONE
+                }
+            }
+            "wifi_fallback" -> {
+                viaView.visibility = View.VISIBLE
+                viaView.setTextColor(0xFFFFCC66.toInt())
+                viaView.text = "↺ uplink via cellular · Wi-Fi return enabled but no Wi-Fi held"
+                detailView.visibility = View.GONE
+            }
+            "split_failed" -> {
+                viaView.visibility = View.VISIBLE
+                viaView.setTextColor(0xFFFF6666.toInt())
+                viaView.text = "✗ Wi-Fi return DISABLED · split routing not confirmed"
+                val ipBlock = formatTwoIpBlock(info)
+                if (ipBlock != null) {
+                    detailView.visibility = View.VISIBLE
+                    detailView.setTextColor(0xFFFF9999.toInt())
+                    detailView.text =
+                        "$ipBlock\n  ⚠ both IPs equal — OS suppresses cellular while Wi-Fi up"
+                } else {
+                    detailView.visibility = View.VISIBLE
+                    detailView.setTextColor(0xFFFF9999.toInt())
+                    detailView.text =
+                        "  ⚠ OS suppresses cellular while Wi-Fi up — relay can't split traffic"
+                }
+            }
+            else -> {
+                viaView.visibility = View.GONE
+                detailView.visibility = View.GONE
+            }
+        }
+    }
+
+    // Builds the headline link description: "↺ uplink: Wi-Fi · 433 Mbps ·
+    // 5 GHz · Wi-Fi 5". Missing fields are dropped gracefully so the line
+    // never has empty segments. Returns the prefix alone if no Wi-Fi info
+    // is on disk yet (e.g. self-test still running).
+    private fun formatWifiLinkLine(info: org.json.JSONObject?, prefix: String): String {
+        if (info == null) return prefix
+        val parts = mutableListOf(prefix)
+        val speed = info.optInt("link_speed_mbps", -1)
+        if (speed > 0) parts.add("$speed Mbps")
+        val band = info.optString("band", "")
+        if (band.isNotEmpty() && band != "unknown") parts.add(band)
+        val std = info.optString("standard", "")
+        if (std.isNotEmpty() && std != "unknown") parts.add(std)
+        return parts.joinToString(" · ")
+    }
+
+    // Two-line block showing cellular exit IP (what targets see) + Wi-Fi
+    // public IP (what the registrator sees). Null when wifi_info.json is
+    // missing or has neither IP — caller decides whether to hide the
+    // detail view or substitute a status-specific message.
+    private fun formatTwoIpBlock(info: org.json.JSONObject?): String? {
+        if (info == null) return null
+        val cellIp = info.optString("public_ip_cell", "").ifEmpty {
+            // Fallback to the long-lived nat_ip file — that's what targets
+            // observe and the IP doesn't change unless we cycle.
+            readFile("nat_ip").trim()
+        }
+        val wifiIp = info.optString("public_ip_wifi", "")
+        if (cellIp.isEmpty() && wifiIp.isEmpty()) return null
+        val sb = StringBuilder()
+        if (cellIp.isNotEmpty()) sb.append("  ↓ exit:   $cellIp (cellular)")
+        if (wifiIp.isNotEmpty()) {
+            if (sb.isNotEmpty()) sb.append('\n')
+            sb.append("  ↑ uplink: $wifiIp (Wi-Fi)")
+        }
+        return sb.toString()
+    }
+
+    private fun readWifiInfoJson(): org.json.JSONObject? {
+        return try {
+            val f = File(filesDir, "wifi_info.json")
+            if (!f.exists()) return null
+            org.json.JSONObject(f.readText())
+        } catch (_: Throwable) { null }
     }
 
     // Reads the last 24h of buckets and feeds them to the three mini charts
