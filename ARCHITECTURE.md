@@ -35,7 +35,7 @@ APK, and which of its stdout lines we react to.
 | `speed_units` | UI | text | `bits`/`bytes` for rate display. |
 | `cycle_cfg.json` | UI writes, both read | JSON | Cross-process mirror of the cycle settings (`apn_swap`, `imei_rotate`, `imei_method`, `imei_cmd`). SharedPreferences are per-process — the REBOOT auto-cycle in `:proxy` would otherwise miss toggle changes made in `:main`. Rewritten on every settings save and re-mirrored on app launch as a back-fill. |
 | `analytics/cycle_events.jsonl` | both write | JSONL | One row per rotation attempt with old/new IP, success flag, attempts and duration. Read by the swipe-panel chart, the analytics screen, and the CSV export. Pruned by the same retention policy as bucket files. |
-| `wifi_info.json` | service | JSON | Latest Wi-Fi return split-routing self-test result + Wi-Fi link snapshot. Keys: `public_ip_wifi`, `public_ip_cell`, `link_speed_mbps`, `frequency_mhz`, `band` (`"2.4 GHz"`/`"5 GHz"`/`"6 GHz"`), `standard` (`"Wi-Fi 5 (802.11ac)"` etc.), `wifi_attached`, `test_result` (`SUCCESS`/`SAME_IP`/`WIFI_PROBE_FAILED`/`CELL_PROBE_FAILED`/`BOTH_FAILED`), `test_detail`, `test_duration_ms`, `tested_at_ms`. Written by ProxyService after each self-test; read by MainActivity for the widget two-IP block and the log-export header. |
+| `wifi_info.json` | service | JSON | Latest Wi-Fi return split-routing self-test result + Wi-Fi link snapshot. Keys: `public_ip_wifi`, `public_ip_cell`, `public_ip_default` (process default route, used to detect target-dial leak), `link_speed_mbps`, `frequency_mhz`, `band` (`"2.4 GHz"`/`"5 GHz"`/`"6 GHz"`), `standard` (`"Wi-Fi 5 (802.11ac)"` etc.), `wifi_attached`, `test_result` (`SUCCESS`/`SAME_IP`/`LEAK_DETECTED`/`WIFI_PROBE_FAILED`/`CELL_PROBE_FAILED`/`BOTH_FAILED`), `test_detail`, `test_duration_ms`, `tested_at_ms`. Written by ProxyService after each self-test; read by MainActivity for the widget two-IP block and the log-export header. |
 
 ## `conn_info` schema
 
@@ -252,11 +252,60 @@ same callback output to `tvStatus` directly via `runOnUiThread`.
 
 ## Wi-Fi return relay — `WifiReturnRelay`
 
-Optional split-routing layer added when `cycle_cfg.json.wifi_return=true`
-and the connection mode is Modem. Lets the agent↔registrator uplink ride
-Wi-Fi while the agent→target dial keeps using cellular — preserving the
-mobile exit IP that clients see at the target, while removing the uplink
-relay traffic from the mobile data bill.
+Optional split-routing layer added when `cycle_cfg.json.wifi_return=true`,
+the connection mode is Modem, **and the engine is AAR**. Lets the
+agent↔registrator uplink ride Wi-Fi while the agent→target dial keeps
+using cellular — preserving the mobile exit IP that clients see at the
+target, while removing the uplink relay traffic from the mobile data bill.
+
+### Why process binding is required (and why AAR-only)
+
+The original v1 design relied on Android's default routing for "target
+dials should use cellular", with explicit `wifiNet.bindSocket` only for
+the relay's upstream. **This is broken**: on a dual-transport device,
+Android's default route is Wi-Fi (priority Wi-Fi > Ethernet > Cellular).
+So SDK target dials — which never call `bindSocket` — leaked through
+Wi-Fi, exposing the Wi-Fi public IP to targets instead of the mobile
+exit IP. Catastrophic for anti-fraud.
+
+The fix is to force the process default to cellular via
+`ConnectivityManager.bindProcessToNetwork(cellularNet)` before starting
+the relay. After that:
+
+- All new sockets in `:proxy` default to cellular (target dials → cell).
+- The relay's outbound upstream sockets override per-socket via
+  `wifiNet.bindSocket(socket)` (uplink → Wi-Fi).
+- Loopback sockets (SDK → 127.0.0.1 → relay) don't egress the device
+  and ignore network binding entirely.
+
+`bindProcessToNetwork` only affects the current Linux process —
+**subprocesses started via `ProcessBuilder.start()` do NOT inherit it**
+(Android-level state, not propagated through `fork+exec`). That's why
+BINARY engine cannot safely use Wi-Fi return: its subprocess would
+always egress through Wi-Fi for target dials. UI auto-switches to AAR
+when the user ticks the box (`rbEngineBinary` disabled +
+`rbEngineAar` auto-selected), the save handler clamps `engine="aar"`
+regardless of the radio state, and `maybeStartWifiRelay` has a final
+guard that bails out if it ever sees `engine != AAR && wifi_return`.
+
+### Lifecycle
+
+- **Construction**: `maybeStartWifiRelay(host, port)` in `ProxyService`
+  reads `cycle_cfg.json`, returns either `(realHost, realPort)` (relay
+  disabled) or `("127.0.0.1", localPort)` (relay up). Engine + cellular-
+  availability checks happen before relay startup:
+  1. `mode == Modem` (Balancer not supported).
+  2. `cfg.wifi_return && cfg.wifi_return_method == "local_relay"`.
+  3. `engine == AAR` (process binding doesn't reach subprocesses).
+  4. `bindProcessToCellularBlocking()` — requests
+     `TRANSPORT_CELLULAR + INTERNET` Network, awaits with 10s
+     `CountDownLatch`, calls `cm.bindProcessToNetwork(cellular)` on
+     success. Keeps the NetworkCallback alive for re-bind on cellular
+     reattach. On timeout / failure → bails (no relay) so target dials
+     don't silently leak.
+  5. Start the actual relay listener.
+
+- **Per-session**: a single `accept()` thread spawns two daemon pipe
 
 ### Why it's not a one-liner
 
@@ -313,9 +362,35 @@ are up *and the proxy's UID isn't bound to a specific network*.
   while the socket itself is bound to Wi-Fi (manifests as "host
   unknown" on some captive Wi-Fi).
 - **Teardown**: `stopWifiRelayIfRunning` in `doStop` closes the
-  `ServerSocket` (kills `accept`), unregisters the network callback,
-  and lets in-flight pipe threads drain naturally on EOF. On the AAR
-  path the subsequent process kill cleans up anything wedged.
+  `ServerSocket` (kills `accept`), unregisters the relay's Wi-Fi
+  callback, unregisters the cellular callback registered for process
+  binding, calls `bindProcessToNetwork(null)` to restore default
+  routing, and lets in-flight pipe threads drain naturally on EOF. On
+  the AAR path the subsequent process kill cleans up anything wedged.
+
+### Cellular network lifecycle — `bindProcessToCellularBlocking`
+
+Registered via `cm.requestNetwork(TRANSPORT_CELLULAR + INTERNET, cb)`.
+Two events drive its behaviour:
+
+- **`onAvailable(network)`** — saves the Network in `cellularNet` and
+  calls `cm.bindProcessToNetwork(network)`. Fires once at startup (the
+  blocking call's `CountDownLatch` unblocks here) and again on every
+  reattach — e.g. after an IP-rotation airplane cycle, the OS hands us
+  a fresh Network object with the new cellular interface, and we
+  re-bind to it automatically.
+- **`onLost(network)`** — deliberately does NOT call
+  `bindProcessToNetwork(null)`. Leaving the process bound to a dead
+  Network makes new sockets fail with `ENETUNREACH`, which is the
+  correct behaviour: we'd rather have SDK target dials fail loudly
+  during a cellular outage than silently leak Wi-Fi IPs to targets.
+  When cellular reattaches, `onAvailable` re-binds to the fresh
+  Network and dials resume.
+
+This pattern is what makes the relay safe across IP rotations: airplane
+mode kills cellular, target dials fail (correct), airplane off brings
+cellular back, `onAvailable` re-binds, dials resume — all without ever
+silently dropping to Wi-Fi.
 
 ### Fallback behaviour
 
@@ -336,29 +411,48 @@ OS is actually segregating the two transports — otherwise the relay's
 `bindSocket(wifiNet)` calls would silently fail to split traffic and
 the target would see the Wi-Fi public IP instead of the mobile exit IP.
 
-Test procedure (`SplitRoutingSelfTest.runTest`, overall budget 15s):
+Test procedure (`SplitRoutingSelfTest.runTest`, overall budget 18s):
 
-1. `requestNetwork(TRANSPORT_WIFI + INTERNET)`, await onAvailable
-   (≤6s). Call `wifiNet.openConnection("https://api.ipify.org")` and
-   read the public IP.
-2. Same for `TRANSPORT_CELLULAR`. Returns `cellPublicIp`.
-3. Compare:
-   - Both ok, IPs differ → `SUCCESS`. Split routing confirmed.
-   - Both ok, IPs equal → `SAME_IP`. OS suppresses one transport
-     (cellular gets released when Wi-Fi is up). Relay can't help.
-   - Either probe times out → `WIFI_PROBE_FAILED` / `CELL_PROBE_FAILED`.
-     Keep the relay running — could be a transient captive-portal flap.
-     Re-test fires on the next network change.
-   - Both timeout → `BOTH_FAILED`. Same — wait for the next retest.
+1. **Wi-Fi probe**: `requestNetwork(TRANSPORT_WIFI + INTERNET)`, await
+   onAvailable (≤6s). Call `wifiNet.openConnection("https://api.ipify.org")`
+   and read the public IP.
+2. **Cellular probe**: same via `TRANSPORT_CELLULAR`.
+3. **Default-route probe**: plain `URL.openConnection()` with no
+   `Network` binding. This is what an unprotected outbound dial — SDK
+   target dial, NAT IP fetch — actually uses. With process bound to
+   cellular this equals the cellular IP; without binding (or in a
+   BINARY subprocess that doesn't inherit) it equals the default
+   route IP, typically Wi-Fi.
+
+Verdict:
+- `wifi != cell && default == cell` → `SUCCESS`. Split routing
+  confirmed AND target dials really go through cellular.
+- `wifi != cell && default == wifi` → `LEAK_DETECTED`. The OS splits
+  transports but the process isn't routing target dials through
+  cellular — clients would see Wi-Fi IP. Relay must be disabled
+  (same treatment as SAME_IP).
+- `wifi != cell && default mismatched both` → `LEAK_DETECTED` as well
+  (safer default — something unusual is going on, don't trust it).
+- `wifi != cell && default probe failed` → `SUCCESS` (can't verify
+  leak; next retest will catch it).
+- `wifi == cell` → `SAME_IP`. OS suppresses one transport entirely.
+- Either WIFI/CELL probe times out → `WIFI_PROBE_FAILED` /
+  `CELL_PROBE_FAILED`. Keep the relay running; retest fires on next
+  network change.
+- Both timeout → `BOTH_FAILED`. Same.
 
 Result is persisted to `wifi_info.json` along with a
 `WifiInfoProbe.snapshot` of the Wi-Fi link (speed, frequency, band,
 standard — no SSID, so no `ACCESS_FINE_LOCATION` needed).
 
-### On SAME_IP failure — relay rollback
+### On SAME_IP / LEAK_DETECTED failure — relay rollback
 
-The user explicitly chose "fail loud" over "claim to work when it
-doesn't". Behaviour:
+Both verdicts mean "do not let traffic flow through this relay" — the
+user explicitly chose "fail loud" over "claim to work when it
+doesn't". `LEAK_DETECTED` is treated identically to `SAME_IP`
+(originally introduced for the case OS suppresses transports; now also
+catches the bindProcessToNetwork-doesn't-cover-subprocess case for any
+future engine experiments). Behaviour:
 
 - `wifiReturnSplitFailed` flag set (sticky until next service start).
 - `wifiReturnStatus = "split_failed"` written to `conn_info` field 8;
@@ -461,6 +555,48 @@ through `onStartCommand` and gets a fresh initial self-test for free.
   - Full `[WI-FI RETURN]` section when `wifi_info.json` exists:
     cellular & Wi-Fi public IPs, link speed, frequency, band,
     standard, split-routing verdict, self-test timestamp.
+
+### Widget registrator display
+
+The SDK logs whatever it actually dials, which when the Wi-Fi return
+relay is active is `127.0.0.1:<localPort>` — true on the wire, useless
+in the UI. `ProxyService.applyCurrentRegistrator` is the single setter
+for `currentRegistrator` (conn_info field 3) and rewrites any value
+starting with `127.0.0.1:` / `localhost:` / `[::1]:` / `::1:` to
+`originalHost:originalPort` when the relay is active. All four parse
+branches (`wsUrlRe`, `regSelectedRe`, `directRegRe`, `endpointRe`)
+funnel through it. Clear-to-empty assignments in reconnect signals
+stay as direct `currentRegistrator = ""` because the setter is a
+no-op on empty values.
+
+### Hard gate — refuseDueToCachedSplitFail
+
+The checkbox in the settings dialog won't stay on if the device can't
+actually split traffic. Three rejection paths in `MainActivity`:
+
+1. **Cached fail**. Before running preflight,
+   `refuseDueToCachedSplitFail` reads `wifi_info.json` and rejects the
+   tick if `test_result=SAME_IP` within the last 24h. Dialog explains
+   the cause and links to instructions; checkbox flips off
+   immediately so a double-tap can't race.
+2. **Preflight `BLOCKED`, no auto-fix**. The dialog offers only "Show
+   instructions" / "Ignore"; both uncheck the box and surface a Toast
+   explaining why.
+3. **Preflight `BLOCKED`, auto-fix tried but failed**. ROM rejected
+   `Settings.Global.putInt` despite WRITE_SECURE_SETTINGS being
+   granted (some MIUI / EMUI builds). Box flips off + instructions
+   open.
+
+Only path that keeps the checkbox on: successful `tryEnable()` with a
+read-back of `mobile_data_always_on=1`. Preflight `SUPPORTED` /
+`UNKNOWN` results don't touch the checkbox (UNKNOWN includes Wi-Fi-only
+tablets where the user may legitimately want to pre-configure the
+toggle for a future SIM insertion).
+
+The 24h freshness window on the cached fail check lets the user
+re-test after fixing the system setting without a manual override:
+beyond 24h we run preflight again rather than holding a permanent
+grudge.
 
 ### Preflight — `MobileDataAlwaysOnCheck`
 

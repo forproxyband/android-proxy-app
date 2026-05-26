@@ -29,6 +29,8 @@ import java.io.StringWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 class ProxyService : Service() {
 
@@ -68,6 +70,16 @@ class ProxyService : Service() {
     // re-verification). Both reference the same ConnectivityManager but
     // their lifecycles are coupled — we unregister both in doStop.
     private var wifiReturnRetestCallback: ConnectivityManager.NetworkCallback? = null
+    // Cellular Network we hold via requestNetwork. Required because we
+    // call bindProcessToNetwork(cellularNet) before starting the relay so
+    // SDK target dials inherit cellular as the process default route. If
+    // we don't do this, the default route is Wi-Fi (priority on dual-
+    // transport devices), and target dials leak the Wi-Fi public IP to
+    // targets instead of the mobile exit IP. The relay's own outbound
+    // sockets stay on Wi-Fi via per-socket bindSocket (overrides the
+    // process default).
+    @Volatile private var cellularNet: Network? = null
+    private var cellularNetworkCallback: ConnectivityManager.NetworkCallback? = null
     // Single in-flight self-test thread guard. Re-test triggers (network
     // change, manual button) coalesce while a previous run is still going.
     @Volatile private var selfTestInFlight = false
@@ -228,6 +240,26 @@ class ProxyService : Service() {
     //                                   "uplink dial failed" /
     //                                   "uplink yamux init failed" /
     //                                   "uplink AUTH …"
+    // Centralised setter for currentRegistrator. When the Wi-Fi return relay
+    // is active, the SDK dials and logs the loopback address (127.0.0.1:
+    // <localPort>), not the real registrator — that's correct on the wire
+    // but useless in the UI. Substitute the real upstream so the widget
+    // shows the actual host:port. Empty values fall through unchanged so
+    // reconnect/clear paths still work via direct assignment.
+    private fun applyCurrentRegistrator(value: String) {
+        val sanitized = if (value.isNotEmpty() && originalHost.isNotEmpty() && (
+                value.startsWith("127.0.0.1:") ||
+                value.startsWith("localhost:") ||
+                value.startsWith("[::1]:") ||
+                value.startsWith("::1:")
+            )
+        ) {
+            "$originalHost:$originalPort"
+        } else value
+        currentRegistrator = sanitized
+        if (sanitized.isNotEmpty()) analytics?.setRegistrator(sanitized)
+    }
+
     private fun parseAgentLine(line: String) {
         when {
             line.contains("tunnel opened") || line.contains("opening tunnel") -> {
@@ -260,21 +292,21 @@ class ProxyService : Service() {
                 // has only `uuid=…`. currentRegistrator on the new path is
                 // filled earlier by "selected registrator …", "direct
                 // registrator configured", or the "uplink dialing" branch.
+                // All goes through applyCurrentRegistrator so the Wi-Fi
+                // return loopback (127.0.0.1:<localPort>) gets rewritten
+                // to the real upstream before it reaches the widget.
                 wsUrlRe.find(line)?.let {
-                    currentRegistrator = it.groupValues[1]
-                    analytics?.setRegistrator(currentRegistrator)
+                    applyCurrentRegistrator(it.groupValues[1])
                 }
             }
             line.contains("selected") && line.contains("registrator") -> {
                 regSelectedRe.find(line)?.let {
-                    currentRegistrator = "${it.groupValues[1]}:${it.groupValues[2]}"
-                    analytics?.setRegistrator(currentRegistrator)
+                    applyCurrentRegistrator("${it.groupValues[1]}:${it.groupValues[2]}")
                 }
             }
             line.contains("direct registrator configured") -> {
                 directRegRe.find(line)?.let {
-                    currentRegistrator = "${it.groupValues[1]}:${it.groupValues[2]}"
-                    analytics?.setRegistrator(currentRegistrator)
+                    applyCurrentRegistrator("${it.groupValues[1]}:${it.groupValues[2]}")
                 }
             }
             line.contains("ws read error") ||
@@ -310,10 +342,10 @@ class ProxyService : Service() {
                 if (connStatus != ConnStatus.CONNECTED) connStatus = ConnStatus.CONNECTING
                 // "uplink dialing" carries `endpoint=host:port` — surface
                 // that as the registrator address so direct/modem mode
-                // shows something useful before any tunnel opens.
+                // shows something useful before any tunnel opens. Loopback
+                // dials are rewritten by applyCurrentRegistrator below.
                 endpointRe.find(line)?.let {
-                    currentRegistrator = "${it.groupValues[1]}:${it.groupValues[2]}"
-                    analytics?.setRegistrator(currentRegistrator)
+                    applyCurrentRegistrator("${it.groupValues[1]}:${it.groupValues[2]}")
                 }
             }
             // Server-side REBOOT command. The SDK logs this whenever the
@@ -687,9 +719,36 @@ class ProxyService : Service() {
             log("wifi_return enabled with unsupported method=\"${cfg.wifiReturnMethod}\" — bypassing relay")
             return host to port
         }
+        // Engine gate — last line of defence. bindProcessToNetwork only
+        // affects the current Linux process; a BINARY subprocess (separate
+        // PID from ProcessBuilder.start) DOES NOT inherit it. With BINARY
+        // engine, SDK target dials inside the subprocess would always go
+        // through Android's default route (= Wi-Fi when both transports
+        // up), leaking the Wi-Fi public IP to targets. The UI already
+        // forces engine=AAR when wifi_return is checked, but a stale
+        // pref / direct file edit / engine-switched-while-running could
+        // still land us here — bail safely instead of producing leaky
+        // traffic.
+        if (engine != Engine.AAR) {
+            log("wifi_return: BINARY engine doesn't inherit bindProcessToNetwork; " +
+                "target dials would leak to Wi-Fi. Skipping relay and falling " +
+                "back to direct dial.")
+            return host to port
+        }
         val portInt = port.toIntOrNull()
         if (portInt == null || portInt !in 1..65535) {
             log("wifi_return: invalid upstream port \"$port\"; bypassing relay")
+            return host to port
+        }
+        // Bind :proxy to cellular BEFORE the relay starts so SDK target
+        // dials (in-process Go via AAR) inherit cellular as their default
+        // route. Per-socket Wi-Fi binding inside the relay is then an
+        // explicit override for the agent↔registrator uplink only.
+        // If cellular isn't reachable, we can't safely run the relay
+        // (target dials would leak), so we bail.
+        if (!bindProcessToCellularBlocking()) {
+            log("wifi_return: cellular network unavailable within budget; " +
+                "skipping relay to avoid leaking Wi-Fi IP to targets.")
             return host to port
         }
         try {
@@ -701,12 +760,100 @@ class ProxyService : Service() {
             )
             val localPort = relay.start()
             wifiRelay = relay
-            log("wifi_return: relay up on 127.0.0.1:$localPort → $host:$portInt")
+            log("wifi_return: relay up on 127.0.0.1:$localPort → $host:$portInt " +
+                "(process bound to cellular $cellularNet)")
             return "127.0.0.1" to localPort.toString()
         } catch (t: Throwable) {
-            log("wifi_return: relay start failed (${t.message}) — falling back to direct dial")
+            log("wifi_return: relay start failed (${t.message}) — unbinding and falling back to direct dial")
+            unbindProcessFromCellular()
             return host to port
         }
+    }
+
+    // Acquires a cellular Network via requestNetwork and binds the :proxy
+    // process to it so all sockets created after this — including the Go
+    // SDK's target dials in the AAR engine — egress through cellular by
+    // default. The relay's outbound sockets override this back to Wi-Fi
+    // per-socket via wifiNet.bindSocket().
+    //
+    // Blocking up to 10s for the cellular Network to appear; returns false
+    // on timeout / system error. Caller is expected to bail (skip relay)
+    // on false because the alternative is silent Wi-Fi leakage.
+    //
+    // The callback survives this call: future onAvailable events re-bind
+    // (handles cellular reattach after IP rotation), and onLost
+    // deliberately does NOT unbind — leaving the process bound to a dead
+    // network makes new sockets fail with ENETUNREACH, which is the
+    // correct behaviour (we'd rather fail than silently leak to Wi-Fi).
+    private fun bindProcessToCellularBlocking(): Boolean {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return false
+        val req = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        val latch = CountDownLatch(1)
+        val ref = arrayOf<Network?>(null)
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                ref[0] = network
+                cellularNet = network
+                try {
+                    cm.bindProcessToNetwork(network)
+                    log("wifi_return: bindProcessToNetwork(cellular=$network)")
+                } catch (t: Throwable) {
+                    log("wifi_return: bindProcessToNetwork failed: ${t.message}")
+                }
+                latch.countDown()
+            }
+            override fun onLost(network: Network) {
+                if (cellularNet == network) {
+                    // Deliberate: don't unbind. New sockets will fail with
+                    // ENETUNREACH until a fresh cellular Network arrives
+                    // (via onAvailable), at which point we re-bind to it.
+                    // That's better than letting target dials silently
+                    // leak to Wi-Fi during cellular outages.
+                    log("wifi_return: cellular Network lost ($network); " +
+                        "process stays bound — new target dials will fail " +
+                        "until cellular reattaches")
+                    cellularNet = null
+                }
+            }
+        }
+        return try {
+            cm.requestNetwork(req, cb)
+            cellularNetworkCallback = cb
+            val ok = latch.await(10, TimeUnit.SECONDS)
+            if (!ok || ref[0] == null) {
+                log("wifi_return: cellular requestNetwork timed out (10s)")
+                try { cm.unregisterNetworkCallback(cb) } catch (_: Throwable) {}
+                cellularNetworkCallback = null
+                cellularNet = null
+                return false
+            }
+            true
+        } catch (t: Throwable) {
+            log("wifi_return: requestNetwork(CELLULAR) failed: ${t.message}")
+            try { cm.unregisterNetworkCallback(cb) } catch (_: Throwable) {}
+            cellularNetworkCallback = null
+            cellularNet = null
+            false
+        }
+    }
+
+    private fun unbindProcessFromCellular() {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        cellularNetworkCallback?.let { cb ->
+            try { cm?.unregisterNetworkCallback(cb) } catch (_: Throwable) {}
+        }
+        cellularNetworkCallback = null
+        cellularNet = null
+        // Restore Android's default behaviour: no process-wide binding,
+        // sockets follow the system's preferred default network.
+        try {
+            cm?.bindProcessToNetwork(null)
+            log("wifi_return: process unbound from cellular (default routing restored)")
+        } catch (_: Throwable) {}
     }
 
     private fun stopWifiRelayIfRunning() {
@@ -716,6 +863,10 @@ class ProxyService : Service() {
             log("wifi_return: relay stop error: ${t.message}")
         }
         unregisterWifiReturnRetestCallback()
+        // Tear down the cellular binding alongside the relay — once we're
+        // not routing target dials through cellular-only any more, the
+        // process should go back to standard default routing.
+        unbindProcessFromCellular()
     }
 
     // Shared split-routing failure handler. Both the initial self-test and
@@ -848,12 +999,14 @@ class ProxyService : Service() {
             val report = SplitRoutingSelfTest.runTest(this)
             log("wifi_return: self-test result=${report.result} " +
                 "wifi_ip=${report.wifiPublicIp} cell_ip=${report.cellPublicIp} " +
-                "took=${report.durationMs}ms detail=\"${report.detail}\"")
+                "default_ip=${report.defaultPublicIp} took=${report.durationMs}ms " +
+                "detail=\"${report.detail}\"")
             writeWifiInfoJson(report, wifiSnap)
 
             when (report.result) {
                 SplitRoutingSelfTest.Result.SUCCESS -> {
-                    log("wifi_return: split routing VERIFIED (wifi=${report.wifiPublicIp}, cell=${report.cellPublicIp})")
+                    log("wifi_return: split routing VERIFIED (wifi=${report.wifiPublicIp}, " +
+                        "cell=${report.cellPublicIp}, default=${report.defaultPublicIp})")
                 }
                 SplitRoutingSelfTest.Result.SAME_IP -> {
                     log("wifi_return: SAME IP on both transports — relay would be ineffective and target's exit IP " +
@@ -864,6 +1017,22 @@ class ProxyService : Service() {
                     // status write. wifiReturnStatus itself is also primed
                     // so the very next conn_info write carries it even if
                     // the status thread hasn't ticked yet.
+                    wifiReturnSplitFailed = true
+                    wifiReturnStatus = "split_failed"
+                    stopWifiRelayIfRunning()
+                    writeConnInfo()
+                    handleSplitFailureForCurrentEngine()
+                }
+                SplitRoutingSelfTest.Result.LEAK_DETECTED -> {
+                    // The split-routing test caught the SDK target dial
+                    // going through Wi-Fi (default route) instead of
+                    // cellular. Target hosts would see the Wi-Fi public IP,
+                    // not the mobile exit IP — catastrophic for anti-fraud.
+                    // Treat exactly like SAME_IP: disable the relay,
+                    // sticky-set the status, roll back the engine.
+                    log("wifi_return: LEAK DETECTED — default route=${report.defaultPublicIp} " +
+                        "(== wifi ${report.wifiPublicIp}), expected cellular ${report.cellPublicIp}. " +
+                        "Disabling relay to prevent target IP exposure.")
                     wifiReturnSplitFailed = true
                     wifiReturnStatus = "split_failed"
                     stopWifiRelayIfRunning()
@@ -937,6 +1106,7 @@ class ProxyService : Service() {
             val o = org.json.JSONObject()
             o.put("public_ip_wifi", report.wifiPublicIp)
             o.put("public_ip_cell", report.cellPublicIp)
+            o.put("public_ip_default", report.defaultPublicIp)
             o.put("link_speed_mbps", wifi.linkSpeedMbps)
             o.put("frequency_mhz", wifi.frequencyMhz)
             o.put("band", wifi.band)

@@ -16,25 +16,33 @@ import java.util.concurrent.TimeUnit
 // the routing the way we promised: agent↔registrator uplink rides
 // Wi-Fi, agent→target dial rides cellular.
 //
-// The test
-// ────────
-// 1. Request a Wi-Fi Network in parallel with the default. Open an
-//    HTTPS connection to api.ipify.org through THAT network. Read the
-//    public IP we egressed as.
-// 2. Request a Cellular Network in parallel. Same probe to ipify.
-// 3. If both probes succeed AND the two IPs differ → SUCCESS:
-//    physically split routing works.
-// 4. If both succeed but the IPs are equal → SAME_IP. This means the
-//    OS is suppressing one transport (almost always cellular when
-//    Wi-Fi is up), and our bindSocket calls in the relay don't
-//    actually segregate traffic — the agent's outbound dial leaks
-//    over Wi-Fi too, and the target sees the Wi-Fi IP instead of the
-//    mobile exit IP we wanted. This defeats the whole purpose of the
-//    app, so the relay must be disabled.
-// 5. If a probe fails individually → WIFI_PROBE_FAILED /
-//    CELL_PROBE_FAILED. Caller decides what to do; the typical
-//    pattern is "relay still works but in fallback mode (cellular
-//    only); rerun the test when network state changes".
+// Three probes
+// ────────────
+// 1. WIFI probe — `requestNetwork(TRANSPORT_WIFI)` + `network.openConnection`.
+//    Public IP as observed when egressing explicitly through Wi-Fi.
+// 2. CELL probe — same via TRANSPORT_CELLULAR.
+// 3. DEFAULT probe — plain `URL.openConnection()` without any Network
+//    binding. This is what SDK target dials actually use (they don't
+//    bind explicitly). On a healthy split setup the process is bound to
+//    cellular (`bindProcessToNetwork(cellularNet)`), so DEFAULT == CELL.
+//    On a leaking setup (e.g. BINARY engine subprocess that doesn't
+//    inherit the process bind, OR no bindProcessToNetwork applied)
+//    DEFAULT == WIFI — target sees Wi-Fi IP, not cellular. We catch
+//    that as LEAK_DETECTED.
+//
+// Verdict matrix
+// ──────────────
+//   wifi != cell  AND  default == cell    → SUCCESS         (true split)
+//   wifi != cell  AND  default == wifi    → LEAK_DETECTED   (process not
+//                                           bound — target leaks to Wi-Fi)
+//   wifi != cell  AND  default fails      → SUCCESS         (can't verify
+//                                           leak but at least split works)
+//   wifi == cell                          → SAME_IP         (OS suppresses
+//                                           one transport — can't split
+//                                           at all)
+//   any probe fails individually          → WIFI_PROBE_FAILED /
+//                                           CELL_PROBE_FAILED /
+//                                           BOTH_FAILED
 //
 // Why ipify
 // ─────────
@@ -60,8 +68,10 @@ import java.util.concurrent.TimeUnit
 object SplitRoutingSelfTest {
 
     enum class Result {
-        SUCCESS,                 // both probes ok, IPs differ
-        SAME_IP,                 // both probes ok, IPs equal — relay can't split
+        SUCCESS,                 // wifi != cell AND (default==cell OR default unknown)
+        SAME_IP,                 // wifi == cell — OS suppresses one transport
+        LEAK_DETECTED,           // wifi != cell BUT default == wifi — target dials
+                                 //   bypass cellular; clients would see Wi-Fi IP
         WIFI_PROBE_FAILED,       // Wi-Fi probe didn't complete
         CELL_PROBE_FAILED,       // cellular probe didn't complete
         BOTH_FAILED,             // neither probe came back
@@ -69,8 +79,12 @@ object SplitRoutingSelfTest {
 
     data class Report(
         val result: Result,
-        val wifiPublicIp: String,   // empty when WIFI_PROBE_FAILED
-        val cellPublicIp: String,   // empty when CELL_PROBE_FAILED
+        val wifiPublicIp: String,    // empty when WIFI_PROBE_FAILED
+        val cellPublicIp: String,    // empty when CELL_PROBE_FAILED
+        // Public IP observed via the process default route (no explicit
+        // bindSocket / Network handle). This is what SDK target dials
+        // actually egress through. Empty when the probe couldn't run.
+        val defaultPublicIp: String,
         val durationMs: Long,
         // Short diagnostic string ("ipify via wifi=ok, via cell=fail").
         // Goes into agent.log and wifi_info.json for debugging.
@@ -78,24 +92,22 @@ object SplitRoutingSelfTest {
     )
 
     private const val PROBE_TIMEOUT_MS = 6_000L
-    private const val OVERALL_BUDGET_MS = 15_000L
+    private const val OVERALL_BUDGET_MS = 18_000L  // budget grew with 3rd probe
     private val PROBE_URLS = listOf("https://api.ipify.org", "https://icanhazip.com")
 
     fun runTest(context: Context): Report {
         val start = System.currentTimeMillis()
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
             as? ConnectivityManager
-            ?: return Report(Result.BOTH_FAILED, "", "",
+            ?: return Report(Result.BOTH_FAILED, "", "", "",
                 System.currentTimeMillis() - start, "no ConnectivityManager")
 
         val wifiProbe = probeOnTransport(
             cm, NetworkCapabilities.TRANSPORT_WIFI, "wifi", start,
         )
-        // Bail early if the overall budget is already blown — saves us
-        // from a cellular probe that would just timeout anyway.
         if (System.currentTimeMillis() - start > OVERALL_BUDGET_MS) {
             return Report(
-                Result.BOTH_FAILED, wifiProbe ?: "", "",
+                Result.BOTH_FAILED, wifiProbe ?: "", "", "",
                 System.currentTimeMillis() - start,
                 "overall budget exceeded after wifi probe",
             )
@@ -103,32 +115,103 @@ object SplitRoutingSelfTest {
         val cellProbe = probeOnTransport(
             cm, NetworkCapabilities.TRANSPORT_CELLULAR, "cell", start,
         )
+        // Third probe — process DEFAULT route, no explicit Network bind.
+        // This is what SDK target dials actually use. If process is bound
+        // to cellular (bindProcessToNetwork), this equals cellProbe. If
+        // not bound (or subprocess that didn't inherit), it equals the
+        // active default — typically Wi-Fi on a dual-transport device.
+        // Mismatch with cellProbe = leak.
+        val defaultProbe = if (System.currentTimeMillis() - start < OVERALL_BUDGET_MS) {
+            probeOnDefault("default")
+        } else null
 
         val dur = System.currentTimeMillis() - start
         val wifiOk = !wifiProbe.isNullOrEmpty()
         val cellOk = !cellProbe.isNullOrEmpty()
+        val defaultOk = !defaultProbe.isNullOrEmpty()
         return when {
             !wifiOk && !cellOk -> Report(
-                Result.BOTH_FAILED, "", "", dur,
-                "wifi=fail cell=fail",
+                Result.BOTH_FAILED, "", "", defaultProbe.orEmpty(), dur,
+                "wifi=fail cell=fail default=${defaultProbe ?: "fail"}",
             )
             !wifiOk -> Report(
-                Result.WIFI_PROBE_FAILED, "", cellProbe.orEmpty(), dur,
-                "wifi=fail cell=$cellProbe",
+                Result.WIFI_PROBE_FAILED, "", cellProbe.orEmpty(),
+                defaultProbe.orEmpty(), dur,
+                "wifi=fail cell=$cellProbe default=${defaultProbe ?: "fail"}",
             )
             !cellOk -> Report(
-                Result.CELL_PROBE_FAILED, wifiProbe.orEmpty(), "", dur,
-                "wifi=$wifiProbe cell=fail",
+                Result.CELL_PROBE_FAILED, wifiProbe.orEmpty(), "",
+                defaultProbe.orEmpty(), dur,
+                "wifi=$wifiProbe cell=fail default=${defaultProbe ?: "fail"}",
             )
             wifiProbe == cellProbe -> Report(
-                Result.SAME_IP, wifiProbe.orEmpty(), cellProbe.orEmpty(), dur,
+                Result.SAME_IP, wifiProbe.orEmpty(), cellProbe.orEmpty(),
+                defaultProbe.orEmpty(), dur,
                 "ips equal — OS not splitting transports",
             )
+            // wifi != cell. Now distinguish SUCCESS vs LEAK_DETECTED via
+            // the default probe. If default probe failed entirely, we
+            // can't tell — choose the lenient path (SUCCESS) so that a
+            // transient probe failure doesn't disable the relay; the next
+            // retest will catch a real leak.
+            defaultOk && defaultProbe == wifiProbe -> Report(
+                Result.LEAK_DETECTED, wifiProbe.orEmpty(),
+                cellProbe.orEmpty(), defaultProbe.orEmpty(), dur,
+                "LEAK: default route uses Wi-Fi (${defaultProbe}) instead of " +
+                    "cellular (${cellProbe}) — SDK target dials would expose " +
+                    "Wi-Fi IP to targets",
+            )
+            defaultOk && defaultProbe == cellProbe -> Report(
+                Result.SUCCESS, wifiProbe.orEmpty(), cellProbe.orEmpty(),
+                defaultProbe.orEmpty(), dur,
+                "split ok: wifi=$wifiProbe cell=$cellProbe default=cell",
+            )
+            defaultOk -> Report(
+                // Edge case: default IP doesn't match either — could be a
+                // captive portal / VPN / unusual routing. Treat as leak to
+                // be safe; targets aren't seeing cellular anyway.
+                Result.LEAK_DETECTED, wifiProbe.orEmpty(),
+                cellProbe.orEmpty(), defaultProbe.orEmpty(), dur,
+                "default route ($defaultProbe) matches neither wifi " +
+                    "($wifiProbe) nor cellular ($cellProbe)",
+            )
             else -> Report(
-                Result.SUCCESS, wifiProbe.orEmpty(), cellProbe.orEmpty(), dur,
-                "split ok: wifi=$wifiProbe cell=$cellProbe",
+                Result.SUCCESS, wifiProbe.orEmpty(), cellProbe.orEmpty(),
+                "", dur,
+                "split ok: wifi=$wifiProbe cell=$cellProbe (default probe failed; " +
+                    "can't verify leak, assuming clean)",
             )
         }
+    }
+
+    // Probes the process default route (no explicit Network handle). Uses
+    // a plain URL.openConnection so we get whatever Android's default
+    // routing table picks — same path SDK target dials use.
+    private fun probeOnDefault(tag: String): String? {
+        for (urlStr in PROBE_URLS) {
+            val url = URL(urlStr)
+            var conn: HttpURLConnection? = null
+            try {
+                conn = url.openConnection() as? HttpURLConnection ?: continue
+                conn.connectTimeout = 4000
+                conn.readTimeout = 4000
+                conn.requestMethod = "GET"
+                conn.setRequestProperty("User-Agent", "ProxyAgent-SelfTest/$tag")
+                if (conn.responseCode != 200) continue
+                val body = BufferedReader(InputStreamReader(conn.inputStream))
+                    .use { it.readText() }
+                    .trim()
+                if (body.isNotEmpty() && body.length <= 39 &&
+                    (body.matches(IPV4_RE) || body.contains(':'))) {
+                    return body
+                }
+            } catch (_: Throwable) {
+                continue
+            } finally {
+                try { conn?.disconnect() } catch (_: Throwable) {}
+            }
+        }
+        return null
     }
 
     // Returns the public IP observed when egressing through the given

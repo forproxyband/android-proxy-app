@@ -340,6 +340,26 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // Wi-Fi return requires AAR engine — bindProcessToNetwork(cellular)
+        // sets a per-process default route that doesn't survive
+        // ProcessBuilder fork+exec, so a BINARY subprocess wouldn't
+        // inherit it and target dials would leak through Wi-Fi (default
+        // route on dual-transport devices). We gate the engine radio
+        // accordingly: when the Wi-Fi return checkbox is on, BINARY is
+        // disabled and AAR is auto-selected.
+        fun applyEngineGateForWifiReturn() {
+            val wifiOn = cbWifiReturn.isChecked && cbWifiReturn.isEnabled
+            rbEngineBinary.isEnabled = !wifiOn
+            if (wifiOn && !rbEngineAar.isChecked) {
+                rbEngineAar.isChecked = true
+            }
+            rbEngineBinary.text = if (wifiOn) {
+                "Binary subprocess  (disabled — needs AAR for Wi-Fi return)"
+            } else {
+                "Binary subprocess (default)"
+            }
+        }
+
         fun applyModeVisibility(modemMode: Boolean) {
             etId.visibility = if (modemMode) View.VISIBLE else View.GONE
             btnScanQr.visibility = if (modemMode) View.VISIBLE else View.GONE
@@ -398,22 +418,40 @@ class MainActivity : AppCompatActivity() {
             etImeiCustomCmd.setText(prefs.getString("imei_cmd", ""))
             applyImeiVisibility()
             cbWifiReturn.isChecked = prefs.getBoolean("wifi_return", false)
+            applyEngineGateForWifiReturn()
         }
         loadFromPrefs()
 
         rgMode.setOnCheckedChangeListener { _, checkedId ->
             applyModeVisibility(checkedId == R.id.rbModeModem)
         }
-        // Wi-Fi return preflight: when the user ticks the box (transition
-        // to checked), kick off an async check that mobile data can stay
-        // alive alongside Wi-Fi. If it can't, surface a dialog with auto-
-        // fix or manual instructions. Doesn't block save — the user can
-        // still go ahead and ignore the warning; the relay will just fall
-        // through to cellular when the OS blocks parallel transports.
+        // Wi-Fi return hard gate: the user can't leave the box ticked on a
+        // device that won't actually split traffic. Three rejection paths:
+        //   1. wifi_info.json shows a recent (<24h) SAME_IP self-test —
+        //      device is known-bad; we don't even run preflight, just
+        //      show the "already verified, fix mobile_data_always_on
+        //      first" dialog and uncheck.
+        //   2. Preflight returns BLOCKED and the user doesn't take the
+        //      auto-fix path (Ignore, Show instructions, or cancel) →
+        //      uncheck. Only a successful "Enable" keeps it checked.
+        //   3. Preflight returns BLOCKED and tryEnable() fails (ROM
+        //      rejected the write despite WRITE_SECURE_SETTINGS) → uncheck.
+        //
+        // We deliberately don't auto-uncheck on UNKNOWN (no SIM /
+        // Wi-Fi-only device) — that's a separate concern from "split
+        // routing doesn't work", and the user may legitimately want to
+        // pre-configure the toggle.
         cbWifiReturn.setOnCheckedChangeListener { _, isChecked ->
-            if (isChecked && cbWifiReturn.isEnabled) {
-                runMobileDataAlwaysOnPreflight()
-            }
+            // Whether the checkbox came on or off, the engine gate must
+            // refresh — turning the box off should re-enable BINARY, and
+            // turning it on must force AAR even before preflight returns.
+            applyEngineGateForWifiReturn()
+            if (!isChecked || !cbWifiReturn.isEnabled) return@setOnCheckedChangeListener
+            // Fast path: known-bad device from a previous self-test.
+            // Reading wifi_info.json on the UI thread is cheap (small
+            // file, fits in cache), no need to background it.
+            if (refuseDueToCachedSplitFail(cbWifiReturn)) return@setOnCheckedChangeListener
+            runMobileDataAlwaysOnPreflight(cbWifiReturn)
         }
         cbImeiRotate.setOnCheckedChangeListener { _, _ -> applyImeiVisibility() }
         spImeiMethod.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
@@ -446,8 +484,6 @@ class MainActivity : AppCompatActivity() {
                 val retentionChanged = prefs.getInt("analytics_retention_days", 30) != newRetention
                 val newEngine = if (rgEngine.checkedRadioButtonId == R.id.rbEngineAar) "aar" else "binary"
                 val newMode = if (rgMode.checkedRadioButtonId == R.id.rbModeBalancer) "balancer" else "modem"
-                val engineChanged = prefs.getString("engine", "binary") != newEngine
-                val modeChanged = prefs.getString("mode", "modem") != newMode
                 val imeiMethodKey = imeiMethodKeys[
                     spImeiMethod.selectedItemPosition.coerceIn(0, imeiMethodKeys.size - 1)]
                 // wifi_return is gated to Modem mode — if the user flipped
@@ -457,12 +493,26 @@ class MainActivity : AppCompatActivity() {
                 // a relay that can't intercept the balancer-discovered
                 // registrator.
                 val effectiveWifiReturn = cbWifiReturn.isChecked && newMode == "modem"
+                // Wi-Fi return REQUIRES AAR (see runBinaryEngine guard +
+                // bindProcessToNetwork comment in ProxyService). If we
+                // somehow end up saving with wifi_return=true and engine=
+                // binary (e.g. stale dialog state or pref tampering), the
+                // ProxyService guard would silently disable the relay,
+                // leaving the user confused. Clamp it here to AAR.
+                val effectiveEngine = if (effectiveWifiReturn) "aar" else newEngine
+                val engineForcedToAar = effectiveWifiReturn && newEngine != "aar"
+                // engineChanged tracks what actually goes into prefs — i.e.
+                // effectiveEngine, not the radio's nominal newEngine. That
+                // way the "stop & restart to apply" hint fires even when
+                // engine was clamped to AAR by the Wi-Fi return gate.
+                val engineChanged = prefs.getString("engine", "binary") != effectiveEngine
+                val modeChanged = prefs.getString("mode", "modem") != newMode
                 prefs.edit()
                     .putString("h", h).putString("p", p).putString("k", k)
                     .putString("id", id).putString("dns", d)
                     .putBoolean("speed_bytes", speedBytes)
                     .putInt("analytics_retention_days", newRetention)
-                    .putString("engine", newEngine)
+                    .putString("engine", effectiveEngine)
                     .putString("mode", newMode)
                     .putBoolean("apn_swap", cbApnSwap.isChecked)
                     .putBoolean("imei_rotate", cbImeiRotate.isChecked)
@@ -470,6 +520,13 @@ class MainActivity : AppCompatActivity() {
                     .putString("imei_cmd", etImeiCustomCmd.text.toString().trim())
                     .putBoolean("wifi_return", effectiveWifiReturn)
                     .apply()
+                if (engineForcedToAar) {
+                    Toast.makeText(
+                        this,
+                        "Wi-Fi return requires AAR engine — switched automatically",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
                 // Mirror cycle config into the cross-process file so
                 // ProxyService (:proxy) can see the toggle changes — its
                 // SharedPreferences in-memory cache otherwise stays stale.
@@ -996,14 +1053,60 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Wi-Fi return relay only saves data if cellular stays attached while
-    // Wi-Fi is connected. This async preflight checks the system setting
-    // (and probes if the setting isn't available) and surfaces a dialog
-    // when the OS would shut cellular off — with an auto-fix path when
-    // WRITE_SECURE_SETTINGS is granted, and an instruction string when
-    // it isn't. Doesn't block the user from saving with the box ticked;
-    // the warning is informational.
-    private fun runMobileDataAlwaysOnPreflight() {
+    // Fast pre-check before running the async preflight: if a recent
+    // self-test (≤24h) already produced SAME_IP on this device, the
+    // checkbox can't be turned on — show a dialog explaining what to do
+    // (fix mobile_data_always_on, then re-try), uncheck, and bail.
+    // Returns true iff the path was taken (caller should NOT continue
+    // with the regular preflight).
+    private fun refuseDueToCachedSplitFail(checkbox: CheckBox): Boolean {
+        val info = try {
+            val f = File(filesDir, "wifi_info.json")
+            if (!f.exists()) return false
+            org.json.JSONObject(f.readText())
+        } catch (_: Throwable) { return false }
+
+        val testResult = info.optString("test_result", "")
+        val testedAtMs = info.optLong("tested_at_ms", 0L)
+        // 24h freshness window: older results may be stale (user could
+        // have fixed the system setting since). Past that we let preflight
+        // re-decide rather than holding a permanent grudge.
+        val freshnessWindowMs = 24L * 60 * 60 * 1000
+        if (testResult != "SAME_IP" ||
+            testedAtMs <= 0L ||
+            System.currentTimeMillis() - testedAtMs >= freshnessWindowMs) {
+            return false
+        }
+
+        // Uncheck FIRST so any subsequent UI race (user double-tap) doesn't
+        // leave the box stuck on while the dialog is up. The listener
+        // re-fires with isChecked=false, which our guard skips.
+        checkbox.isChecked = false
+        AlertDialog.Builder(this)
+            .setTitle("Wi-Fi return: already verified not working")
+            .setMessage(
+                "A previous self-test on this device showed that the OS " +
+                "doesn't split Wi-Fi and cellular — they share the same " +
+                "public IP. The Wi-Fi return relay can't work here until " +
+                "that's fixed.\n\n" +
+                "Last check: ${info.optString("test_detail", "n/a")}\n\n" +
+                "Fix it via 'mobile_data_always_on=1', then re-tick this " +
+                "checkbox to re-test."
+            )
+            .setPositiveButton("Show instructions") { _, _ ->
+                showMobileDataAlwaysOnInstructions()
+            }
+            .setNegativeButton("Close", null)
+            .show()
+        return true
+    }
+
+    // Wi-Fi return preflight + HARD GATE: when the user ticks the box,
+    // async-check that cellular can stay alive alongside Wi-Fi. If the
+    // OS would shut cellular off, we surface a dialog with auto-fix
+    // or manual instructions — AND uncheck the box unless the user
+    // takes the auto-fix path and it succeeds.
+    private fun runMobileDataAlwaysOnPreflight(checkbox: CheckBox) {
         Thread {
             val report = try {
                 MobileDataAlwaysOnCheck.check(this)
@@ -1014,25 +1117,39 @@ class MainActivity : AppCompatActivity() {
                     detail = "check threw: ${t.message}",
                 )
             }
-            // Only act on BLOCKED. SUPPORTED is silent (the common case);
-            // UNKNOWN means we couldn't tell (no SIM, Wi-Fi-only device) —
-            // surfacing a warning there would be more confusing than helpful.
+            // SUPPORTED and UNKNOWN both leave the checkbox alone — the
+            // user got their wish, and we'll let the self-test decide
+            // for real at service start.
             if (report.result != MobileDataAlwaysOnCheck.Result.BLOCKED) return@Thread
-            runOnUiThread { showMobileDataAlwaysOnDialog(report) }
+            runOnUiThread { showMobileDataAlwaysOnDialog(report, checkbox) }
         }.apply { name = "MobileDataPreflight"; isDaemon = true; start() }
     }
 
-    private fun showMobileDataAlwaysOnDialog(report: MobileDataAlwaysOnCheck.Report) {
+    private fun showMobileDataAlwaysOnDialog(
+        report: MobileDataAlwaysOnCheck.Report,
+        checkbox: CheckBox,
+    ) {
         val baseMsg =
             "Wi-Fi return saves mobile data only when cellular stays attached " +
             "while Wi-Fi is connected. This device currently shuts cellular " +
-            "down once Wi-Fi is validated, which means the relay will fall " +
-            "back to cellular every time Wi-Fi is up — no savings.\n\n" +
+            "down once Wi-Fi is validated, so the relay would never actually " +
+            "split traffic.\n\n" +
             "Diagnostic: ${report.detail}"
 
+        // Helper: every path that doesn't end with a confirmed fix must
+        // uncheck the box. Toast tells the user why so it doesn't look
+        // like a UI ghost.
+        val unCheckWithReason: (String) -> Unit = { reason ->
+            checkbox.isChecked = false
+            Toast.makeText(this, "Wi-Fi return disabled: $reason", Toast.LENGTH_LONG).show()
+        }
+
         val builder = AlertDialog.Builder(this)
-            .setTitle("Cellular may drop while on Wi-Fi")
-            .setNegativeButton("Ignore", null)
+            .setTitle("Cellular drops while on Wi-Fi — can't enable")
+            .setCancelable(false)   // force a deliberate choice
+            .setNegativeButton("Ignore") { _, _ ->
+                unCheckWithReason("device blocks parallel transports")
+            }
 
         if (report.canAutoFix) {
             builder.setMessage(
@@ -1046,17 +1163,22 @@ class MainActivity : AppCompatActivity() {
                     val ok = try { MobileDataAlwaysOnCheck.tryEnable(this) }
                     catch (_: Throwable) { false }
                     runOnUiThread {
-                        Toast.makeText(
-                            this,
-                            if (ok) "Enabled mobile_data_always_on=1"
-                            else "Couldn't enable — ROM rejected the write. See manual instructions.",
-                            Toast.LENGTH_LONG,
-                        ).show()
-                        if (!ok) showMobileDataAlwaysOnInstructions()
+                        if (ok) {
+                            Toast.makeText(
+                                this,
+                                "Enabled mobile_data_always_on=1 — Wi-Fi return ready",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                            // Checkbox stays checked — the fix succeeded.
+                        } else {
+                            unCheckWithReason("ROM rejected the system write")
+                            showMobileDataAlwaysOnInstructions()
+                        }
                     }
                 }.apply { name = "MobileDataEnable"; isDaemon = true; start() }
             }
             builder.setNeutralButton("Show instructions") { _, _ ->
+                unCheckWithReason("manual fix required")
                 showMobileDataAlwaysOnInstructions()
             }
         } else {
@@ -1065,6 +1187,7 @@ class MainActivity : AppCompatActivity() {
                 "(WRITE_SECURE_SETTINGS not granted)."
             )
             builder.setPositiveButton("Show instructions") { _, _ ->
+                unCheckWithReason("manual fix required")
                 showMobileDataAlwaysOnInstructions()
             }
         }
