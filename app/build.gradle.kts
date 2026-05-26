@@ -11,12 +11,48 @@ android {
     namespace = "com.proxyagent.app"
     compileSdk = 35
 
+    // Pin NDK so CI (.github/workflows/build.yml installs this exact
+    // package via sdkmanager) and local builds use the same toolchain.
+    // r26d — current LTS line at time of writing; bumps should land
+    // here AND in the workflow simultaneously.
+    ndkVersion = "26.3.11579264"
+
     defaultConfig {
         applicationId = "com.proxyagent.app"
         minSdk = 21
         targetSdk = 35
         versionCode = appVersionCode
         versionName = appVersionName
+
+        // ABI filter for native libs. Matches the pre-built
+        // libproxyagent.so under app/src/main/jniLibs/<abi>/ so both
+        // our CMake-built libagentsplice.so and the Go binary cover
+        // the same architectures. Expand if/when the Go binary is
+        // rebuilt for armeabi-v7a / x86_64.
+        ndk {
+            //noinspection ChromeOsAbiSupport
+            abiFilters += listOf("arm64-v8a", "x86")
+        }
+
+        externalNativeBuild {
+            cmake {
+                cFlags += listOf("-fvisibility=hidden")
+            }
+        }
+    }
+
+    // Native build: libagentsplice.so (kernel splice(2) shim, see
+    // com.proxyagent.app.nativeagent.SpliceShim). Optional — when the
+    // .so can't be loaded the NATIVE engine silently falls back to
+    // its NIO + DirectByteBuffer bridge.
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            // Pin CMake to the same version installed by
+            // .github/workflows/build.yml so CI and local builds use
+            // identical toolchains.
+            version = "3.22.1"
+        }
     }
 
     buildFeatures {

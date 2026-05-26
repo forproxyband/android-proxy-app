@@ -193,6 +193,20 @@ class NativeProxyAgent {
         if (config.dnsServers.isNotBlank()) {
             dnsConfig.setFromString(config.dnsServers)
         }
+        // Route the splice shim's one-shot diagnostic lines (library
+        // load result, first successful zero-copy, fallback reason)
+        // through our log sink so they show up in agent.log together
+        // with the rest of the native-engine output. SpliceShim emits
+        // each event at most once per process, so this is not chatty.
+        SpliceShim.setLogger { level, msg, fields ->
+            val pairs = fields.entries.map { it.key to it.value }.toTypedArray()
+            when (level) {
+                "WARN" -> logWarn(msg, *pairs)
+                "ERROR" -> logError(msg, *pairs)
+                "DEBUG" -> logDebug(msg, *pairs)
+                else -> logInfo(msg, *pairs)
+            }
+        }
         val t = Thread({ supervisorMain(config) }, "NativeProxyAgent-Supervisor").apply {
             isDaemon = true
         }
@@ -296,6 +310,21 @@ class NativeProxyAgent {
         } finally {
             running.set(false)
             statusSnapshot = statusSnapshot.copy(running = false, connected = false)
+            // Session-end accounting for the splice fast path. The
+            // counter is process-wide (one entry per :proxy lifetime),
+            // not per-agent — if the user restarts the agent without
+            // killing :proxy, the value accumulates. That's a feature
+            // for diagnosing "how much zero-copy did we get across
+            // the full uptime" without per-restart noise.
+            val splicedBytes = SpliceShim.totalSplicedBytes()
+            if (splicedBytes > 0) {
+                val mib = splicedBytes / (1024.0 * 1024.0)
+                logInfo(
+                    "splice: session summary",
+                    "bytes" to splicedBytes,
+                    "mib" to "%.2f".format(mib),
+                )
+            }
             logInfo("supervisor stop")
         }
     }
@@ -1352,11 +1381,23 @@ internal class Uplink(
         agent.logInfo("tunnel closed")
     }
 
-    /** Drains [src] into [dst] over a single off-heap [ByteBuffer].
-     *  Allocated per bridge-direction so there's no false sharing
-     *  between the two threads; ~512 KiB native memory per tunnel
-     *  total (2 directions × 256 KiB). */
+    /** Drains [src] into [dst]. Two-tier fast path:
+     *
+     *  1. Try kernel `splice(2)` via the [SpliceShim] JNI bridge —
+     *     true zero-copy, bytes never enter userspace. Equivalent to
+     *     Go's `io.Copy(*net.TCPConn, *net.TCPConn)` fast path. When
+     *     this works we're done.
+     *  2. If the shim isn't available (library couldn't load, fd
+     *     extraction failed) OR the kernel refused the initial
+     *     splice — fall back to NIO over an off-heap DirectByteBuffer.
+     *     Still 2 userspace copies but no JVM heap allocation or GC
+     *     pressure.
+     *
+     *  SpliceShim.copy commits to splice once any bytes have moved —
+     *  it never returns false mid-stream, so the fallback only runs
+     *  when zero bytes were transferred (safe to retry). */
     private fun copyChannel(src: SocketChannel, dst: SocketChannel) {
+        if (SpliceShim.copy(src, dst)) return
         val buf = ByteBuffer.allocateDirect(NativeProxyAgent.BRIDGE_BUFFER_BYTES)
         while (true) {
             buf.clear()

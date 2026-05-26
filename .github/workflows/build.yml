@@ -24,7 +24,11 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: "platforms;android-35 build-tools;35.0.0 platform-tools"
+          # NDK + CMake are required by app/src/main/cpp/CMakeLists.txt
+          # (libagentsplice.so — kernel splice(2) zero-copy shim used
+          # by the NATIVE engine's TCP bridge). Pin the same NDK
+          # version we set in app/build.gradle.kts so CI is deterministic.
+          packages: "platforms;android-35 build-tools;35.0.0 platform-tools ndk;26.3.11579264 cmake;3.22.1"
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -32,7 +36,10 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          # Include CMakeLists.txt + C sources so a cpp change busts
+          # the cache and CI rebuilds the .so rather than picking up
+          # a stale one from the previous run.
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', '**/CMakeLists.txt', '**/*.c', '**/*.cpp', '**/*.h') }}
           restore-keys: gradle-${{ runner.os }}-
 
       - name: Make gradlew executable
