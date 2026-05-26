@@ -29,13 +29,18 @@ internal class SpliceShim {
     // Using a class with a single shared instance is simpler.
     external fun spliceLoop(fdSrc: Int, fdDst: Int, chunkSize: Int): Long
 
-    /** JNI-level fd extraction. Bypasses Android's non-SDK API
-     *  restrictions (API 28+) by reading the FileDescriptor field of
-     *  SocketChannelImpl via JNI's GetFieldID/GetIntField instead of
-     *  Java reflection — those are explicitly excluded from the
-     *  hidden-API enforcement. Returns -1 if the field layout is
-     *  unrecognised, in which case copy() falls back to NIO. */
-    external fun extractFd(channel: Any): Int
+    /** JNI-level fd extraction. Returns a packed jlong:
+     *
+     *   On success (>= 0):
+     *     fd       = (packed and 0xFFFFFFFFL).toInt()
+     *     strategy = ((packed shr 32) and 0xFFL).toInt()
+     *                1=fdVal, 2=fd.fd, 3=fd.descriptor, 4=fd.getInt$()
+     *
+     *   On failure (< 0): negative error code; see decodeFdError().
+     *
+     *  Packing the strategy ID with the fd lets the Kotlin side log
+     *  exactly which path worked without an extra JNI round-trip. */
+    external fun extractFd(channel: Any): Long
 
     /** Telemetry hook so the host (NativeProxyAgent) can route
      *  splice/fallback events into its log sink. Calls are infrequent
@@ -59,6 +64,20 @@ internal class SpliceShim {
         private val loggedFallback = AtomicBoolean(false)
         private val totalSplicedBytes = AtomicLong(0L)
 
+        // Tunnel-direction counters — each successful copyChannel
+        // invocation increments exactly one of these. Exposed via
+        // stats() so the agent can include them in its session
+        // summary log line.
+        private val tunnelsSpliced = AtomicLong(0L)
+        private val tunnelsFallback = AtomicLong(0L)
+
+        // Cached human name of whichever fd-extraction strategy
+        // worked on the first successful extraction. Used in the
+        // "splice: kernel zero-copy active" line and in the session
+        // summary so the user can see which path the kernel-level
+        // bridge is actually using on this device/OS combo.
+        @Volatile private var winningStrategy: String? = null
+
         /** Install (or replace) the telemetry hook. NativeProxyAgent
          *  calls this once per agent start with its own log sink. */
         fun setLogger(fn: Logger?) {
@@ -70,6 +89,21 @@ internal class SpliceShim {
          *  diagnostics panel or "Save log" footer. Resets only when
          *  the process restarts. */
         fun totalSplicedBytes(): Long = totalSplicedBytes.get()
+
+        /** Composite stats snapshot for the session summary line. */
+        data class Stats(
+            val tunnelsSpliced: Long,
+            val tunnelsFallback: Long,
+            val bytesSpliced: Long,
+            val strategy: String?,
+        )
+
+        fun stats(): Stats = Stats(
+            tunnelsSpliced = tunnelsSpliced.get(),
+            tunnelsFallback = tunnelsFallback.get(),
+            bytesSpliced = totalSplicedBytes.get(),
+            strategy = winningStrategy,
+        )
 
         /**
          * Attempt a kernel zero-copy bridge between two [SocketChannel]s.
@@ -86,22 +120,34 @@ internal class SpliceShim {
          */
         fun copy(src: SocketChannel, dst: SocketChannel): Boolean {
             if (!ensureLoaded()) {
+                tunnelsFallback.incrementAndGet()
                 logFallbackOnce("library_not_loaded")
                 return false
             }
-            val fdSrc = fdOf(src)
-            if (fdSrc < 0) {
-                logFallbackOnce("fd_extraction_failed_src")
+            val srcPacked = fdOf(src)
+            if (srcPacked < 0) {
+                tunnelsFallback.incrementAndGet()
+                logFallbackOnce("fd_extraction_failed_src:${decodeFdError(srcPacked)}")
                 return false
             }
-            val fdDst = fdOf(dst)
-            if (fdDst < 0) {
-                logFallbackOnce("fd_extraction_failed_dst")
+            val dstPacked = fdOf(dst)
+            if (dstPacked < 0) {
+                tunnelsFallback.incrementAndGet()
+                logFallbackOnce("fd_extraction_failed_dst:${decodeFdError(dstPacked)}")
                 return false
             }
+            // Decode the packed (strategy, fd) for src; the strategy
+            // is the same as dst's by construction (same OS, same
+            // SocketChannel impl), so we cache from src only.
+            val fdSrc = (srcPacked and 0xFFFFFFFFL).toInt()
+            val fdDst = (dstPacked and 0xFFFFFFFFL).toInt()
+            val strategy = ((srcPacked shr 32) and 0xFFL).toInt()
+            cacheStrategyOnce(strategy)
+
             val result = try {
                 singleton.spliceLoop(fdSrc, fdDst, CHUNK_BYTES)
             } catch (t: Throwable) {
+                tunnelsFallback.incrementAndGet()
                 logFallbackOnce("spliceLoop_threw:${t.javaClass.simpleName}")
                 return false
             }
@@ -109,11 +155,13 @@ internal class SpliceShim {
             // failed); safe to fall back. >= 0 means the splice loop
             // ran and the source reached EOF or both sides closed.
             if (result < 0) {
+                tunnelsFallback.incrementAndGet()
                 logFallbackOnce("native_setup_failed")
                 return false
             }
             // Success — accumulate bytes and emit a one-shot "active"
             // line on first transfer of this process.
+            tunnelsSpliced.incrementAndGet()
             if (result > 0) {
                 totalSplicedBytes.addAndGet(result)
             }
@@ -121,10 +169,31 @@ internal class SpliceShim {
                 logger?.invoke(
                     "INFO",
                     "splice: kernel zero-copy active",
-                    mapOf("first_bytes" to result),
+                    mapOf(
+                        "strategy" to (winningStrategy ?: strategyName(strategy)),
+                        "first_bytes" to result,
+                    ),
                 )
             }
             return true
+        }
+
+        /** Cache the strategy name on first successful extraction.
+         *  Race-safe via the @Volatile write — if two threads race
+         *  the first extraction, both write the same value so the
+         *  loss is harmless. */
+        private fun cacheStrategyOnce(strategy: Int) {
+            if (winningStrategy == null) {
+                winningStrategy = strategyName(strategy)
+            }
+        }
+
+        private fun strategyName(strategy: Int): String = when (strategy) {
+            1 -> "SocketChannelImpl.fdVal"
+            2 -> "FileDescriptor.fd"
+            3 -> "FileDescriptor.descriptor"
+            4 -> "FileDescriptor.getInt\$()"
+            else -> "unknown_$strategy"
         }
 
         /** Sticky probe — load the library at most once per process.
@@ -198,12 +267,29 @@ internal class SpliceShim {
          * unrecognised, JNI lookup threw) — the bridge falls back to
          * NIO without data loss.
          */
-        private fun fdOf(channel: SocketChannel): Int {
+        /** Returns the packed (strategy, fd) jlong directly from JNI,
+         *  or a negative error code. The caller decodes; we keep the
+         *  packing here in Kotlin land so the C side stays minimal. */
+        private fun fdOf(channel: SocketChannel): Long {
             return try {
                 singleton.extractFd(channel)
             } catch (_: Throwable) {
-                -1
+                -1L
             }
+        }
+
+        /** Map the negative return codes from [SpliceShim.extractFd]
+         *  to short, log-friendly diagnostic strings so a fallback
+         *  log line lands the actual reason in agent.log rather than
+         *  a generic "didn't work". Keep this in sync with the
+         *  C-side return codes in splice_shim.c. */
+        private fun decodeFdError(code: Long): String = when (code.toInt()) {
+            -1 -> "channel_null"
+            -2 -> "fd_field_not_found"     // SocketChannelImpl.fd not visible
+            -3 -> "fd_object_null"          // channel not connected yet
+            -4 -> "hidden_api_blocked"      // all int-extraction paths refused
+            -10 -> "negative_fd"            // socket reports invalid fd
+            else -> "code_$code"
         }
 
         // Per-call ceiling for splice(); kernel will return less when

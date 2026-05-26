@@ -98,77 +98,151 @@ done:
 
 // Extract the raw POSIX file descriptor from a Java SocketChannel.
 //
-// Why this lives in JNI and not in Kotlin reflection:
+// On Android targeting API 28+ ("non-SDK API restrictions"), both
+// reflective AND JNI access to hidden fields is enforced — apps
+// targeting API 30+ get a hard block, returning NULL from
+// GetFieldID / GetMethodID instead of finding the member. The
+// historical JNI escape hatch was closed in Android 9+.
 //
-// On Android targeting API 28+ ("non-SDK API restrictions"), reflective
-// access to `sun.nio.ch.SocketChannelImpl.fd` and `FileDescriptor.fd` /
-// `FileDescriptor.getInt$()` is restricted. Apps targeting API 30+
-// hit a hard block (LinkageError / NoSuchMethodException) on these
-// for any app that's not part of the platform.
+// To still extract the int fd we run several strategies in order,
+// returning the first one that works. Each strategy targets a
+// different platform/version combination:
 //
-// JNI's GetFieldID / GetIntField run at the JVM level and are not
-// subject to the Java-reflection-layer non-SDK enforcement — they
-// can read private fields of system classes the same way they read
-// fields of user classes. This is the documented escape hatch
-// (see Google's "Restrictions on non-SDK interfaces" doc, "JNI
-// access" exclusion).
+//   1. SocketChannelImpl.fdVal (int) — present on Android since
+//      libcore was ported from OpenJDK 11+. Sometimes accessible
+//      because it's a private int, not a reference to a system class.
 //
-// We walk the channel's class hierarchy looking for a field named
-// "fd" of type `Ljava/io/FileDescriptor;` — sun.nio.ch.SocketChannelImpl
-// has it on every Android version we care about. Then we dereference
-// the FileDescriptor's int member — tries "descriptor" first (the
-// AOSP libcore convention) then "fd" (OpenJDK convention) for forward/
-// backward compat.
+//   2. SocketChannelImpl.fd (FileDescriptor) + FileDescriptor.fd
+//      (int) — the canonical OpenJDK / current AOSP layout.
 //
-// Returns the raw int fd on success, or -1 if any reflection step
-// failed. Caller (SpliceShim.fdOf) treats -1 as "fall back to NIO".
-JNIEXPORT jint JNICALL
+//   3. Same FileDescriptor, but with field "descriptor" (older AOSP
+//      libcore convention used pre-Android 10).
+//
+//   4. Same FileDescriptor, calling getInt$() method (Android's
+//      @hide accessor — was widely used before the blocklist).
+//
+// On every strategy we clear any pending JNI exception (GetFieldID
+// throws NoSuchFieldError on miss + a SecurityException when the
+// hidden API blocks access; both must be cleared before the next
+// attempt or the JVM will abort the JNI call).
+//
+// Return value (jlong, packed):
+//   Non-negative: success. Decode as:
+//                 fd       = (int)(packed & 0xFFFFFFFFL)
+//                 strategy = (int)((packed >> 32) & 0xFF)
+//                            1 = SocketChannelImpl.fdVal
+//                            2 = FileDescriptor.fd
+//                            3 = FileDescriptor.descriptor
+//                            4 = FileDescriptor.getInt$()
+//   Negative:     error code (cast through Long.toInt for legibility):
+//   -1:   channel null / unrecognised layout
+//   -2:   no "fd" field of type FileDescriptor anywhere in hierarchy
+//         (would indicate a totally different SocketChannel impl)
+//   -3:   fd field exists but its FileDescriptor object is null
+//         (channel not connected?)
+//   -4:   FileDescriptor's int member couldn't be extracted by ANY
+//         strategy — hidden API enforcement fully locked
+//   -10:  successfully read a field but value was < 0 (closed fd)
+//
+// Caller (SpliceShim) maps codes to diagnostic strings + the strategy
+// ID to a human name, then logs both in a single line so the user
+// can see exactly which path works (or that none does).
+//
+// Packing the strategy into the return saves a second JNI round-trip
+// (no separate "which strategy worked" probe call) — it's free
+// metadata for every successful extraction.
+
+// Helper: walks the class hierarchy of `obj` looking for a field
+// named `name` with JNI type signature `sig`. Returns a usable
+// fieldID or NULL. The class chain is walked because GetFieldID
+// only looks at the class it was given, not its superclasses.
+static jfieldID find_field_in_hierarchy(JNIEnv *env, jobject obj,
+                                        const char *name, const char *sig) {
+    jclass cls = (*env)->GetObjectClass(env, obj);
+    while (cls != NULL) {
+        jfieldID f = (*env)->GetFieldID(env, cls, name, sig);
+        if (f != NULL) {
+            (*env)->DeleteLocalRef(env, cls);
+            return f;
+        }
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        jclass parent = (*env)->GetSuperclass(env, cls);
+        (*env)->DeleteLocalRef(env, cls);
+        cls = parent;
+    }
+    return NULL;
+}
+
+// Helper: pack a strategy id and fd into a single jlong for the
+// return value of extractFd. See the function header for layout.
+static inline jlong pack(jint strategy, jint fd) {
+    return ((jlong)strategy << 32) | ((jlong)fd & 0xFFFFFFFFLL);
+}
+
+JNIEXPORT jlong JNICALL
 Java_com_proxyagent_app_nativeagent_SpliceShim_extractFd(
     JNIEnv *env, jobject thiz, jobject channel) {
 
     (void)thiz;
     if (channel == NULL) return -1;
 
-    // Find the FileDescriptor-typed "fd" field by walking up
-    // the class hierarchy. SocketChannelImpl declares it directly.
-    jclass searchCls = (*env)->GetObjectClass(env, channel);
-    jfieldID fdField = NULL;
+    // Strategy 1: SocketChannelImpl.fdVal (int) — direct shortcut
+    // when the field exists and isn't on the blocklist.
+    jfieldID fdValField = find_field_in_hierarchy(env, channel, "fdVal", "I");
+    if (fdValField != NULL) {
+        jint v = (*env)->GetIntField(env, channel, fdValField);
+        if (v >= 0) return pack(1, v);
+        return -10;
+    }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
 
-    while (searchCls != NULL) {
-        fdField = (*env)->GetFieldID(env, searchCls,
-                                     "fd", "Ljava/io/FileDescriptor;");
-        if (fdField != NULL) break;
-        // GetFieldID throws NoSuchFieldError on miss; clear it.
-        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
-        jclass parent = (*env)->GetSuperclass(env, searchCls);
-        (*env)->DeleteLocalRef(env, searchCls);
-        searchCls = parent;
-    }
-    if (fdField == NULL) {
-        if (searchCls != NULL) (*env)->DeleteLocalRef(env, searchCls);
-        return -1;
-    }
+    // Strategy 2/3/4: get the FileDescriptor first, then try to read
+    // its int member via several field/method variants.
+    jfieldID fdField = find_field_in_hierarchy(env, channel,
+                                                "fd", "Ljava/io/FileDescriptor;");
+    if (fdField == NULL) return -2;
 
     jobject fdObj = (*env)->GetObjectField(env, channel, fdField);
-    (*env)->DeleteLocalRef(env, searchCls);
-    if (fdObj == NULL) return -1;
+    if (fdObj == NULL) return -3;
 
-    // Now extract the int from FileDescriptor. AOSP libcore names the
-    // field "descriptor"; OpenJDK names it "fd". Try both.
     jclass fdCls = (*env)->GetObjectClass(env, fdObj);
-    jfieldID intField = (*env)->GetFieldID(env, fdCls, "descriptor", "I");
-    if (intField == NULL) {
-        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
-        intField = (*env)->GetFieldID(env, fdCls, "fd", "I");
-    }
-    (*env)->DeleteLocalRef(env, fdCls);
-    if (intField == NULL) {
-        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+
+    // 2: OpenJDK / current AOSP — `private int fd`
+    jfieldID intField = (*env)->GetFieldID(env, fdCls, "fd", "I");
+    if (intField != NULL) {
+        jint v = (*env)->GetIntField(env, fdObj, intField);
+        (*env)->DeleteLocalRef(env, fdCls);
         (*env)->DeleteLocalRef(env, fdObj);
-        return -1;
+        return v < 0 ? -10 : pack(2, v);
+    }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+
+    // 3: older AOSP libcore — `private int descriptor`
+    intField = (*env)->GetFieldID(env, fdCls, "descriptor", "I");
+    if (intField != NULL) {
+        jint v = (*env)->GetIntField(env, fdObj, intField);
+        (*env)->DeleteLocalRef(env, fdCls);
+        (*env)->DeleteLocalRef(env, fdObj);
+        return v < 0 ? -10 : pack(3, v);
+    }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+
+    // 4: Android @hide accessor method `public int getInt$()`
+    jmethodID getIntM = (*env)->GetMethodID(env, fdCls, "getInt$", "()I");
+    if (getIntM != NULL) {
+        jint v = (*env)->CallIntMethod(env, fdObj, getIntM);
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+        } else {
+            (*env)->DeleteLocalRef(env, fdCls);
+            (*env)->DeleteLocalRef(env, fdObj);
+            return v < 0 ? -10 : pack(4, v);
+        }
+    } else {
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
     }
 
-    jint result = (*env)->GetIntField(env, fdObj, intField);
+    (*env)->DeleteLocalRef(env, fdCls);
     (*env)->DeleteLocalRef(env, fdObj);
-    return result < 0 ? -1 : result;
+    return -4;  // hidden API fully locked, no extraction path worked
 }

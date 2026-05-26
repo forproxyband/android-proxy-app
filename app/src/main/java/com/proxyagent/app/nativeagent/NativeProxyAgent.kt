@@ -311,18 +311,27 @@ class NativeProxyAgent {
             running.set(false)
             statusSnapshot = statusSnapshot.copy(running = false, connected = false)
             // Session-end accounting for the splice fast path. The
-            // counter is process-wide (one entry per :proxy lifetime),
-            // not per-agent — if the user restarts the agent without
-            // killing :proxy, the value accumulates. That's a feature
-            // for diagnosing "how much zero-copy did we get across
-            // the full uptime" without per-restart noise.
-            val splicedBytes = SpliceShim.totalSplicedBytes()
-            if (splicedBytes > 0) {
-                val mib = splicedBytes / (1024.0 * 1024.0)
+            // counters are process-wide (one entry per :proxy
+            // lifetime), not per-agent — if the user restarts the
+            // agent without killing :proxy, values accumulate. That's
+            // a feature for diagnosing "how much zero-copy did we get
+            // across the full uptime" without per-restart noise.
+            //
+            // Always emit the summary if either path saw any traffic,
+            // even when splice ended up never engaging — that's the
+            // exact case where the user wants to know "did splice
+            // work at all and if not, how many tunnels went through
+            // NIO instead".
+            val s = SpliceShim.stats()
+            if (s.tunnelsSpliced > 0 || s.tunnelsFallback > 0) {
+                val mib = s.bytesSpliced / (1024.0 * 1024.0)
                 logInfo(
                     "splice: session summary",
-                    "bytes" to splicedBytes,
-                    "mib" to "%.2f".format(mib),
+                    "strategy" to (s.strategy ?: "none"),
+                    "tunnels_spliced" to s.tunnelsSpliced,
+                    "tunnels_fallback" to s.tunnelsFallback,
+                    "bytes_spliced" to s.bytesSpliced,
+                    "mib_spliced" to "%.2f".format(mib),
                 )
             }
             logInfo("supervisor stop")
