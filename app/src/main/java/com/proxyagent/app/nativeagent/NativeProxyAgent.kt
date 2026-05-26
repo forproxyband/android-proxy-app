@@ -13,6 +13,8 @@ import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.Socket
 import java.net.URL
+import java.nio.ByteBuffer
+import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingDeque
@@ -470,6 +472,26 @@ class NativeProxyAgent {
         // line rates and small enough that the per-tunnel memory
         // footprint stays sane on Android.
         internal const val BRIDGE_BUFFER_BYTES = 256 * 1024
+
+        // Per-socket SO_RCVBUF / SO_SNDBUF hint we apply BEFORE
+        // connect() so the TCP window for the new connection is sized
+        // for high-BDP paths. On Android the kernel may clamp to
+        // net.core.rmem_max / net.core.wmem_max (typically 4–8 MiB);
+        // we ask for 4 MiB and take whatever the OS gives.
+        //
+        // Why this matters: bandwidth × RTT defines max in-flight
+        // bytes. At RTT = 200 ms (cellular or trans-continental Wi-Fi
+        // path to a datacenter registrator), the Android default
+        // receive buffer of ~208 KiB caps a single TCP flow at
+        // 208 KB / 0.2 s ≈ 8 Mbps — exactly the upload throughput
+        // we observed before this knob existed. With a 4 MiB buffer
+        // the cap moves to ~160 Mbps per flow, well past anything we
+        // expect on mobile or home Wi-Fi.
+        //
+        // Note: this MUST be set BEFORE connect() to take effect for
+        // the new connection's window scaling. Setting it later is a
+        // no-op on most TCP stacks.
+        internal const val SOCKET_BUFFER_HINT_BYTES = 4 * 1024 * 1024
     }
 }
 
@@ -954,6 +976,8 @@ internal class Uplink(
             agent.logInfo("opening quic tunnel", "target" to target)
             val sock = Socket()
             sock.tcpNoDelay = true
+            try { sock.receiveBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
+            try { sock.sendBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
             sock.connect(InetSocketAddress(dns.resolve(host), port),
                 NativeProxyAgent.TARGET_DIAL_TIMEOUT_MS.toInt())
             targetSock = sock
@@ -985,6 +1009,9 @@ internal class Uplink(
         sock.tcpNoDelay = true
         sock.keepAlive = true
         try { sock.setSoLinger(false, 0) } catch (_: Throwable) {}
+        // Pre-connect buffer hints (see SOCKET_BUFFER_HINT_BYTES doc).
+        try { sock.receiveBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
+        try { sock.sendBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
         sock.connect(
             InetSocketAddress(dns.resolve(creds.host), creds.port),
             cfg.dialTimeoutMs,
@@ -1158,20 +1185,22 @@ internal class Uplink(
 
     private fun handleOpenTcp(token: String, host: String, port: Int) {
         val pool = dataPool ?: throw IOException("no data pool (not TCP mode)")
-        var dataSock: Socket? = null
-        var targetSock: Socket? = null
+        var dataCh: SocketChannel? = null
+        var targetCh: SocketChannel? = null
         try {
             // Dial target + take data conn in parallel — same as Go.
-            val futureTarget = bridgeExecutor.submit<Socket> {
-                val s = Socket()
-                s.tcpNoDelay = true
-                s.connect(
+            val futureTarget = bridgeExecutor.submit<SocketChannel> {
+                val ch = SocketChannel.open()
+                ch.socket().tcpNoDelay = true
+                try { ch.socket().receiveBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
+                try { ch.socket().sendBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
+                ch.socket().connect(
                     InetSocketAddress(dns.resolve(host), port),
                     NativeProxyAgent.TARGET_DIAL_TIMEOUT_MS.toInt(),
                 )
-                s
+                ch
             }
-            val futureData = bridgeExecutor.submit<Socket> { pool.take() }
+            val futureData = bridgeExecutor.submit<SocketChannel> { pool.take() }
 
             val target = try {
                 futureTarget.get(NativeProxyAgent.TARGET_DIAL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
@@ -1179,31 +1208,34 @@ internal class Uplink(
                 futureData.cancel(true)
                 throw IOException("target dial: ${t.message ?: t.javaClass.simpleName}", t)
             }
-            targetSock = target
+            targetCh = target
             val data = try {
                 futureData.get(NativeProxyAgent.TARGET_DIAL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             } catch (t: Throwable) {
                 try { target.close() } catch (_: Throwable) {}
-                targetSock = null
+                targetCh = null
                 throw IOException("data conn: ${t.message ?: t.javaClass.simpleName}", t)
             }
-            dataSock = data
+            dataCh = data
 
             // Token on the data conn → server pairs with pending waiter.
+            // Direct ByteBuffer write — token is 32 ASCII bytes so the
+            // off-heap allocation is trivial; sticks to the same
+            // direct-buffer path as the bridge.
             try {
-                data.soTimeout = 10_000
-                val out = data.getOutputStream()
-                out.write(token.toByteArray(StandardCharsets.US_ASCII))
-                out.flush()
-                data.soTimeout = 0
+                data.socket().soTimeout = 10_000
+                val tokenBytes = token.toByteArray(StandardCharsets.US_ASCII)
+                val tbuf = ByteBuffer.wrap(tokenBytes)
+                while (tbuf.hasRemaining()) data.write(tbuf)
+                data.socket().soTimeout = 0
             } catch (t: Throwable) {
                 throw IOException("token write: ${t.message ?: t.javaClass.simpleName}", t)
             }
 
             bridge(data, target)
         } catch (t: Throwable) {
-            try { dataSock?.close() } catch (_: Throwable) {}
-            try { targetSock?.close() } catch (_: Throwable) {}
+            try { dataCh?.close() } catch (_: Throwable) {}
+            try { targetCh?.close() } catch (_: Throwable) {}
             throw t
         }
     }
@@ -1216,6 +1248,8 @@ internal class Uplink(
         val stream = q.openStream()
         val targetSock = Socket().apply {
             tcpNoDelay = true
+            try { receiveBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
+            try { sendBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
             connect(InetSocketAddress(dns.resolve(host), port),
                 NativeProxyAgent.TARGET_DIAL_TIMEOUT_MS.toInt())
         }
@@ -1278,29 +1312,55 @@ internal class Uplink(
 
     // ── Bridging ────────────────────────────────────────────────────────
 
-    private fun bridge(a: Socket, b: Socket) {
-        // TCP-only bridge — both sides are *Socket so we can half-
-        // close cleanly with shutdownOutput on EOF. Either direction
-        // ending tears down the pair, mirroring Go's bridge semantics:
-        // we don't wait for the OTHER direction to drain (the close
-        // below makes it EOF/EPIPE out).
+    /** TCP-only bridge using NIO + DirectByteBuffer. Both sides are
+     *  SocketChannel so the copy avoids per-iteration JVM heap
+     *  allocation (the buffer is off-heap, native memory) and skips
+     *  the InputStream/OutputStream wrapper layer. Still 2 userspace
+     *  copies — true kernel-level zero-copy would need a JNI splice
+     *  shim which we deliberately avoid to keep the agent pure-JVM.
+     *
+     *  Half-close semantics mirror Go's bridge: when either direction
+     *  hits EOF we shutdownOutput on the destination so the peer sees
+     *  FIN, then close both ends so the OTHER copier exits via
+     *  IOException on its read. */
+    private fun bridge(a: SocketChannel, b: SocketChannel) {
         val done = java.util.concurrent.CountDownLatch(1)
         bridgeExecutor.execute {
             try {
-                copyStream(a.getInputStream(), b.getOutputStream())
-                try { b.shutdownOutput() } catch (_: Throwable) {}
+                copyChannel(a, b)
+                try { b.socket().shutdownOutput() } catch (_: Throwable) {}
             } catch (_: Throwable) {} finally { done.countDown() }
         }
         bridgeExecutor.execute {
             try {
-                copyStream(b.getInputStream(), a.getOutputStream())
-                try { a.shutdownOutput() } catch (_: Throwable) {}
+                copyChannel(b, a)
+                try { a.socket().shutdownOutput() } catch (_: Throwable) {}
             } catch (_: Throwable) {} finally { done.countDown() }
         }
         try { done.await() } catch (_: InterruptedException) {}
         try { a.close() } catch (_: Throwable) {}
         try { b.close() } catch (_: Throwable) {}
         agent.logInfo("tunnel closed")
+    }
+
+    /** Drains [src] into [dst] over a single off-heap [ByteBuffer].
+     *  Allocated per bridge-direction so there's no false sharing
+     *  between the two threads; ~512 KiB native memory per tunnel
+     *  total (2 directions × 256 KiB). */
+    private fun copyChannel(src: SocketChannel, dst: SocketChannel) {
+        val buf = ByteBuffer.allocateDirect(NativeProxyAgent.BRIDGE_BUFFER_BYTES)
+        while (true) {
+            buf.clear()
+            val n = src.read(buf)
+            if (n < 0) break  // EOF
+            buf.flip()
+            // Blocking-mode SocketChannel writes are documented to
+            // attempt to write all remaining bytes, but the spec
+            // allows short writes; loop to be safe.
+            while (buf.hasRemaining()) {
+                dst.write(buf)
+            }
+        }
     }
 
     /** Bridges a QUIC stream (InputStream + OutputStream) with a TCP
@@ -1368,7 +1428,11 @@ internal class Uplink(
         private val cfg: NativeProxyAgent.Config,
         private val dns: DnsConfig,
     ) {
-        private val available = LinkedBlockingDeque<Socket>()
+        // SocketChannel rather than Socket — pool entries feed straight
+        // into the NIO bridge, so we avoid a wrap/unwrap round-trip on
+        // the hot OPEN path. The underlying socket is reachable via
+        // .socket() when we need timeouts or shutdownOutput.
+        private val available = LinkedBlockingDeque<SocketChannel>()
         private val closed = AtomicBoolean(false)
         private var refiller: Thread? = null
 
@@ -1378,7 +1442,7 @@ internal class Uplink(
             t.start()
         }
 
-        fun take(): Socket {
+        fun take(): SocketChannel {
             val cached = available.pollLast()
             if (cached != null) {
                 // Wake the refiller — best effort.
@@ -1393,8 +1457,8 @@ internal class Uplink(
             if (!closed.compareAndSet(false, true)) return
             try { refiller?.interrupt() } catch (_: Throwable) {}
             while (true) {
-                val s = available.pollFirst() ?: break
-                try { s.close() } catch (_: Throwable) {}
+                val ch = available.pollFirst() ?: break
+                try { ch.close() } catch (_: Throwable) {}
             }
         }
 
@@ -1413,38 +1477,46 @@ internal class Uplink(
 
         private fun fillOnce() {
             while (!closed.get() && available.size < capacity) {
-                val s = try { dialAndHandshake() } catch (t: Throwable) {
+                val ch = try { dialAndHandshake() } catch (t: Throwable) {
                     uplink.agent.logDebug("pool refill dial failed",
                         "endpoint" to "${creds.host}:${creds.port}",
                         "error" to (t.message ?: t.javaClass.simpleName))
                     return
                 }
                 if (closed.get()) {
-                    try { s.close() } catch (_: Throwable) {}
+                    try { ch.close() } catch (_: Throwable) {}
                     return
                 }
-                available.offerLast(s)
+                available.offerLast(ch)
             }
         }
 
-        private fun dialAndHandshake(): Socket {
-            val s = Socket()
-            s.tcpNoDelay = true
-            s.keepAlive = true
+        private fun dialAndHandshake(): SocketChannel {
+            val ch = SocketChannel.open()
             try {
-                s.connect(
+                ch.socket().tcpNoDelay = true
+                ch.socket().keepAlive = true
+                // Buffer hints before connect — see SOCKET_BUFFER_HINT_BYTES
+                // for why this is necessary for high-BDP receive paths.
+                try { ch.socket().receiveBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
+                try { ch.socket().sendBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
+                ch.socket().connect(
                     InetSocketAddress(dns.resolve(creds.host), creds.port),
                     NativeProxyAgent.POOL_DIAL_TIMEOUT_MS.toInt(),
                 )
-                s.soTimeout = NativeProxyAgent.POOL_DIAL_TIMEOUT_MS.toInt()
-                val out = s.getOutputStream()
-                out.write(NativeProxyAgent.WIRE_MAGIC)
-                out.write(byteArrayOf(NativeProxyAgent.WIRE_VERSION, NativeProxyAgent.CONN_TYPE_DATA))
-                out.flush()
-                s.soTimeout = 0
-                return s
+                // Wire handshake via a 6-byte direct-buffer write —
+                // keeps the path off the JVM heap from byte zero.
+                val hs = ByteBuffer.allocate(NativeProxyAgent.WIRE_MAGIC.size + 2)
+                hs.put(NativeProxyAgent.WIRE_MAGIC)
+                hs.put(NativeProxyAgent.WIRE_VERSION)
+                hs.put(NativeProxyAgent.CONN_TYPE_DATA)
+                hs.flip()
+                ch.socket().soTimeout = NativeProxyAgent.POOL_DIAL_TIMEOUT_MS.toInt()
+                while (hs.hasRemaining()) ch.write(hs)
+                ch.socket().soTimeout = 0
+                return ch
             } catch (t: Throwable) {
-                try { s.close() } catch (_: Throwable) {}
+                try { ch.close() } catch (_: Throwable) {}
                 throw t
             }
         }
