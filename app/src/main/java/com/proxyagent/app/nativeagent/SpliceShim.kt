@@ -1,5 +1,6 @@
 package com.proxyagent.app.nativeagent
 
+import android.os.ParcelFileDescriptor
 import java.nio.channels.SocketChannel
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -124,13 +125,38 @@ internal class SpliceShim {
                 logFallbackOnce("library_not_loaded")
                 return false
             }
-            val srcPacked = fdOf(src)
+            // Strategy 0: ParcelFileDescriptor.fromSocket — public
+            // Android API since API 12. The framework's own code
+            // calls socket.getFileDescriptor$() inside it, but the
+            // hidden-API check uses the IMMEDIATE caller (PFD class,
+            // bootclassloader) which is always allowed. detachFd()
+            // returns the raw int and marks PFD as detached so its
+            // finalizer won't close the fd later — the original
+            // Socket keeps its own reference to the same FileDescriptor,
+            // unaffected by the detach.
+            //
+            // This path works on any Android API ≥ 12 regardless of
+            // targetSdkVersion or non-SDK enforcement state. We try
+            // it FIRST and only fall through to the JNI strategies
+            // if PFD itself somehow refuses (e.g. SocketAdaptor that
+            // doesn't expose its FD, which shouldn't happen for
+            // connected channels but we don't want to crash on it).
+            var srcPacked = fdViaPfd(src)
+            var dstPacked = fdViaPfd(dst)
+            // If PFD didn't yield both fds, try the JNI strategies.
+            // We deliberately don't mix-and-match (e.g. PFD for src
+            // and JNI for dst) — each pair must agree on which
+            // strategy worked so the cached `winningStrategy` reflects
+            // the actually-used path consistently.
+            if (srcPacked < 0 || dstPacked < 0) {
+                srcPacked = fdOf(src)
+                dstPacked = fdOf(dst)
+            }
             if (srcPacked < 0) {
                 tunnelsFallback.incrementAndGet()
                 logFallbackOnce("fd_extraction_failed_src:${decodeFdError(srcPacked)}")
                 return false
             }
-            val dstPacked = fdOf(dst)
             if (dstPacked < 0) {
                 tunnelsFallback.incrementAndGet()
                 logFallbackOnce("fd_extraction_failed_dst:${decodeFdError(dstPacked)}")
@@ -189,6 +215,7 @@ internal class SpliceShim {
         }
 
         private fun strategyName(strategy: Int): String = when (strategy) {
+            0 -> "ParcelFileDescriptor"
             1 -> "SocketChannelImpl.fdVal"
             2 -> "FileDescriptor.fd"
             3 -> "FileDescriptor.descriptor"
@@ -276,6 +303,40 @@ internal class SpliceShim {
             } catch (_: Throwable) {
                 -1L
             }
+        }
+
+        /** Strategy 0 — extract fd via the public ParcelFileDescriptor
+         *  API. Bypasses Android non-SDK enforcement entirely because
+         *  every call we make is to a public-API method; the hidden
+         *  socket.getFileDescriptor$() call happens INSIDE the framework
+         *  (PFD class), and the hidden-API check sees the framework
+         *  class as the caller, which is always allowed.
+         *
+         *  Returns a packed (strategy=0, fd) jlong on success, or a
+         *  negative error code matching extractFd's convention. */
+        private fun fdViaPfd(channel: SocketChannel): Long {
+            return try {
+                val socket = channel.socket() ?: return -1L
+                val pfd = ParcelFileDescriptor.fromSocket(socket)
+                    ?: return -3L
+                // detachFd reads the int AND marks the PFD detached
+                // so its finalizer won't close the underlying fd
+                // later. The original Socket keeps a separate
+                // reference to the same FileDescriptor object, which
+                // is unaffected by PFD's internal mFd=null.
+                val fd = pfd.detachFd()
+                if (fd < 0) -10L else packStrategyFd(0, fd)
+            } catch (_: Throwable) {
+                -1L
+            }
+        }
+
+        /** Mirror of the C-side pack() helper — keeps the encoding
+         *  consistent between Kotlin (PFD strategy) and native
+         *  (strategies 1-4). Layout: high 32 bits = strategy ID,
+         *  low 32 bits = fd. */
+        private fun packStrategyFd(strategy: Int, fd: Int): Long {
+            return (strategy.toLong() shl 32) or (fd.toLong() and 0xFFFFFFFFL)
         }
 
         /** Map the negative return codes from [SpliceShim.extractFd]
