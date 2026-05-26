@@ -8,6 +8,17 @@
          Wi-Fi return widget. Normal permission, no runtime prompt. SSID is
          NOT read so we don't need ACCESS_FINE_LOCATION / NEARBY_WIFI_DEVICES. -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- CRITICAL for Wi-Fi return: ConnectivityManager.requestNetwork()
+         throws SecurityException without this permission on every Android
+         version. Without it, the relay can't acquire a Wi-Fi Network for
+         bindSocket, can't acquire a cellular Network for bindProcessToNetwork,
+         and the split-routing self-test's WIFI/CELL probes both fail —
+         making the whole feature silently leak traffic through Wi-Fi.
+         Normal protection level, auto-granted at install, no runtime prompt.
+         Versions < 1.0.56 missed this declaration; the symptom in the log
+         was "requestNetwork(Wi-Fi) failed: was not granted either of these
+         permissions: CHANGE_NETWORK_STATE, WRITE_SETTINGS". -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />

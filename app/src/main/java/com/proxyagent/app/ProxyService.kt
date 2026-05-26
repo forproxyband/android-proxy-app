@@ -867,6 +867,9 @@ class ProxyService : Service() {
         // not routing target dials through cellular-only any more, the
         // process should go back to standard default routing.
         unbindProcessFromCellular()
+        // Reset the initial-test flag so a fresh start (e.g. user reties
+        // by toggling and re-saving) gets a fresh verification cycle.
+        initialSelfTestDone = false
     }
 
     // Shared split-routing failure handler. Both the initial self-test and
@@ -972,10 +975,18 @@ class ProxyService : Service() {
         } catch (_: Throwable) {}
     }
 
+    // Tracks whether we've completed at least one self-test for the current
+    // relay lifecycle. Resets when the relay is (re)started. Used to
+    // distinguish the INITIAL test (must verify the feature actually works)
+    // from later RETESTS (transient failures are tolerable). On initial
+    // BOTH_FAILED we disable the relay; on retest BOTH_FAILED we keep it.
+    @Volatile private var initialSelfTestDone: Boolean = false
+
     // Runs the actual test + persists wifi_info.json + dispatches result.
     // Guarded so re-trigger fires while a test is still in flight coalesce
     // into a no-op instead of stacking. Engine-specific rollback on
-    // SAME_IP failure runs via handleSplitFailureForCurrentEngine().
+    // SAME_IP / LEAK_DETECTED / initial-BOTH_FAILED runs via
+    // handleSplitFailureForCurrentEngine().
     private fun runWifiReturnSelfTestNow() {
         if (selfTestInFlight) {
             log("wifi_return: self-test already in flight; skipping retrigger")
@@ -1052,9 +1063,41 @@ class ProxyService : Service() {
                     log("wifi_return: cellular probe failed — keeping relay")
                 }
                 SplitRoutingSelfTest.Result.BOTH_FAILED -> {
-                    log("wifi_return: both probes failed — keeping relay, will retest later")
+                    // On INITIAL test (just-started relay): treat as
+                    // verification failure and disable. Both probes failing
+                    // at startup almost always means the system rejected
+                    // our requestNetwork calls — e.g. missing
+                    // CHANGE_NETWORK_STATE permission, or a hostile ROM
+                    // that blocks parallel transport requests. Either way
+                    // the relay would be running blind: we can't confirm
+                    // split routing, can't verify the Wi-Fi binding stuck.
+                    // Better to fail loud now than leak target dials.
+                    //
+                    // On RETESTS (after Wi-Fi changes / post-rotation):
+                    // tolerate it. Could be a transient probe outage —
+                    // captive-portal handover, cellular bouncing during a
+                    // tower switch. The initial test already verified
+                    // the feature works on this device.
+                    if (!initialSelfTestDone) {
+                        log("wifi_return: initial self-test failed BOTH probes — " +
+                            "split routing cannot be verified. Disabling relay. " +
+                            "Common cause: CHANGE_NETWORK_STATE permission missing " +
+                            "from manifest, or system blocks parallel requestNetwork calls.")
+                        wifiReturnSplitFailed = true
+                        wifiReturnStatus = "split_failed"
+                        stopWifiRelayIfRunning()
+                        writeConnInfo()
+                        handleSplitFailureForCurrentEngine()
+                    } else {
+                        log("wifi_return: both probes failed on retest — keeping relay (transient assumed; initial test already verified)")
+                    }
                 }
             }
+            // Mark first test complete only after the result has been
+            // acted on, so a SAME_IP / LEAK / initial-BOTH_FAILED that
+            // leads to stop+rollback doesn't leave this true for the
+            // (impossible) next test.
+            initialSelfTestDone = true
         } catch (t: Throwable) {
             log("wifi_return: self-test crashed: ${t.message}")
         } finally {

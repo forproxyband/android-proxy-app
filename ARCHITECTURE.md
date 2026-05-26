@@ -439,7 +439,16 @@ Verdict:
 - Either WIFI/CELL probe times out → `WIFI_PROBE_FAILED` /
   `CELL_PROBE_FAILED`. Keep the relay running; retest fires on next
   network change.
-- Both timeout → `BOTH_FAILED`. Same.
+- Both timeout — context-dependent:
+  - On the **initial** test (`initialSelfTestDone=false`) → treat
+    as verification failure and disable the relay. Both probes
+    failing at startup almost always means the system rejected our
+    `requestNetwork` calls — historically the cause was missing
+    `CHANGE_NETWORK_STATE` in the manifest (fixed in 1.0.56), but
+    could also be a hostile ROM that throttles transport requests.
+    Either way, running blind would leak traffic — better to fail.
+  - On **subsequent** retests → keep the relay; transient probe
+    outage doesn't invalidate the initial verification.
 
 Result is persisted to `wifi_info.json` along with a
 `WifiInfoProbe.snapshot` of the Wi-Fi link (speed, frequency, band,
