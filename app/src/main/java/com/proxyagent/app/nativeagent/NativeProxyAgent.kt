@@ -462,6 +462,14 @@ class NativeProxyAgent {
         internal const val TARGET_DIAL_TIMEOUT_MS = 30_000L
         internal const val POOL_DIAL_TIMEOUT_MS = 10_000L
         internal const val POOL_REFILL_IDLE_MS = 5_000L
+
+        // Bridge buffer size for the bidirectional copy between the
+        // tunnel transport and the dialed TCP target. Matches the Go
+        // SDK's pipeQUIC buffer; 256 KiB is large enough that the
+        // userspace copy isn't a bottleneck at typical mobile/desktop
+        // line rates and small enough that the per-tunnel memory
+        // footprint stays sane on Android.
+        internal const val BRIDGE_BUFFER_BYTES = 256 * 1024
     }
 }
 
@@ -918,15 +926,23 @@ internal class Uplink(
         agent.incTunnels()
         var targetSock: Socket? = null
         try {
-            val reader = BufferedInputStream(stream.input)
+            // Read header byte-by-byte from the raw QUIC input. kwik
+            // (and the Go SDK) buffer their stream internally so an
+            // additional BufferedInputStream just adds copies on the
+            // hot path. Bounded to 8 KiB / 15 s so a malformed peer
+            // can't pin us forever.
+            val streamIn = stream.input
             val line = StringBuilder()
             val deadline = System.currentTimeMillis() + 15_000
+            val one = ByteArray(1)
             while (true) {
                 if (System.currentTimeMillis() > deadline) {
                     throw IOException("quic tunnel header timeout")
                 }
-                val b = reader.read()
-                if (b < 0) throw EOFException("quic tunnel header EOF")
+                val n = streamIn.read(one)
+                if (n < 0) throw EOFException("quic tunnel header EOF")
+                if (n == 0) continue
+                val b = one[0].toInt() and 0xFF
                 if (b == '\n'.code) break
                 if (b != '\r'.code) line.append(b.toChar())
                 if (line.length > 8192) throw IOException("quic header too long")
@@ -941,7 +957,7 @@ internal class Uplink(
             sock.connect(InetSocketAddress(dns.resolve(host), port),
                 NativeProxyAgent.TARGET_DIAL_TIMEOUT_MS.toInt())
             targetSock = sock
-            bridgeStreams(reader, stream.output, sock)
+            bridgeStreams(streamIn, stream.output, sock)
             agent.logInfo("quic tunnel closed", "target" to target)
         } catch (t: Throwable) {
             agent.logWarn("quic tunnel failed",
@@ -1263,7 +1279,12 @@ internal class Uplink(
     // ── Bridging ────────────────────────────────────────────────────────
 
     private fun bridge(a: Socket, b: Socket) {
-        val done = java.util.concurrent.CountDownLatch(2)
+        // TCP-only bridge — both sides are *Socket so we can half-
+        // close cleanly with shutdownOutput on EOF. Either direction
+        // ending tears down the pair, mirroring Go's bridge semantics:
+        // we don't wait for the OTHER direction to drain (the close
+        // below makes it EOF/EPIPE out).
+        val done = java.util.concurrent.CountDownLatch(1)
         bridgeExecutor.execute {
             try {
                 copyStream(a.getInputStream(), b.getOutputStream())
@@ -1282,8 +1303,12 @@ internal class Uplink(
         agent.logInfo("tunnel closed")
     }
 
+    /** Bridges a QUIC stream (InputStream + OutputStream) with a TCP
+     *  socket. Exits as soon as either direction completes, then
+     *  closes both ends so the other thread unblocks via EOF/EPIPE.
+     *  Matches Go's pipeQUIC behaviour. */
     private fun bridgeStreams(input: InputStream, output: OutputStream, sock: Socket) {
-        val done = java.util.concurrent.CountDownLatch(2)
+        val done = java.util.concurrent.CountDownLatch(1)
         bridgeExecutor.execute {
             try { copyStream(input, sock.getOutputStream()) } catch (_: Throwable) {}
             finally { done.countDown() }
@@ -1294,16 +1319,23 @@ internal class Uplink(
         }
         try { done.await() } catch (_: InterruptedException) {}
         try { sock.close() } catch (_: Throwable) {}
+        try { output.close() } catch (_: Throwable) {}
         agent.logInfo("tunnel closed")
     }
 
+    /** Drains [input] into [output]. Uses a 256 KiB buffer to match
+     *  the Go SDK and amortise the per-syscall / per-write overhead at
+     *  high throughput. NO per-iteration flush — kwik's QUIC output
+     *  flush is a no-op anyway, and TCP sockets don't buffer in
+     *  userspace by default. A flushed write would force kwik to
+     *  re-evaluate frame scheduling on every chunk and stutter the
+     *  pipeline on receiver-bound paths. */
     private fun copyStream(input: InputStream, output: OutputStream) {
-        val buf = ByteArray(64 * 1024)
+        val buf = ByteArray(NativeProxyAgent.BRIDGE_BUFFER_BYTES)
         while (true) {
             val n = input.read(buf)
             if (n < 0) break
             output.write(buf, 0, n)
-            output.flush()
         }
     }
 

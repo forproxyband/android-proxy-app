@@ -96,10 +96,18 @@ class KwikQuicTransport private constructor(
                 .noServerCertificateCheck()
                 .connectTimeout(Duration.ofMillis(dialTimeoutMs.toLong()))
                 .maxIdleTimeout(Duration.ofSeconds(60))
-                // Initial per-stream receive window. Go SDK uses 8 MB;
-                // matching here so 1 Gbps × 50 ms BDP (~6 MiB) fits with
-                // headroom for retransmits.
-                .defaultStreamReceiveBufferSize(8L * 1024 * 1024)
+                // Per-stream receive window. Builder side-effect (see
+                // kwik QuicClientConnectionImpl): also sets the
+                // connection-level cap to 10× this value, so 16 MiB
+                // here gives 160 MiB connection-level — enough headroom
+                // for high-throughput uploads through several parallel
+                // tunnels (each tunnel = one server-initiated stream).
+                // Smaller values (1 MiB / 8 MiB) showed receive-side
+                // starvation on Wi-Fi at ~70 Mbps speedtest upload —
+                // kwik runs flow-control updates per-stream while the
+                // Go SDK uses larger windows + Brutal CC, so we
+                // compensate with raw window size.
+                .defaultStreamReceiveBufferSize(16L * 1024 * 1024)
                 // Limit peer-initiated streams. Each tunnel = one stream
                 // in QUIC mode, so 1024 is plenty for typical loads and
                 // bounds memory if the server misbehaves.

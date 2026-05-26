@@ -598,6 +598,25 @@ class ProxyService : Service() {
         mode = if (intent.getStringExtra("mode") == "balancer") Mode.BALANCER else Mode.MODEM
         if (host.isEmpty()) { stopSelf(); return START_NOT_STICKY }
 
+        // Defensive bind reset. The :proxy process survives stops in
+        // NATIVE/BINARY (only AAR self-kills), so a previous Wi-Fi
+        // return session could have left this process bound to cellular
+        // even when the user has since unticked the checkbox. Without
+        // an explicit reset here, all outbound traffic from :proxy
+        // (registrator dial, NAT-IP probe, target dials) would silently
+        // go through mobile data, with no visible "wifi_return"
+        // signalling in the current session's logs. Costs nothing when
+        // no bind exists. See also stopWifiRelayIfRunning where this
+        // is also called on shutdown.
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            if (cm?.boundNetworkForProcess != null) {
+                log("Cleaning up stale process bind from previous session " +
+                    "(boundNetworkForProcess=${cm.boundNetworkForProcess})")
+                cm.bindProcessToNetwork(null)
+            }
+        } catch (_: Throwable) {}
+
         connStatus = ConnStatus.STARTING
         // Android 14+ ties FGS time-limits to the type. specialUse has no
         // 6h/24h dataSync cap, but the system silently treats absent type as
@@ -877,19 +896,30 @@ class ProxyService : Service() {
     }
 
     private fun stopWifiRelayIfRunning() {
-        val r = wifiRelay ?: return
-        wifiRelay = null
-        try { r.stop() } catch (t: Throwable) {
-            log("wifi_return: relay stop error: ${t.message}")
+        val r = wifiRelay
+        if (r != null) {
+            wifiRelay = null
+            try { r.stop() } catch (t: Throwable) {
+                log("wifi_return: relay stop error: ${t.message}")
+            }
+            unregisterWifiReturnRetestCallback()
+            // Reset the initial-test flag so a fresh start (e.g. user
+            // retries by toggling and re-saving) gets a fresh
+            // verification cycle.
+            initialSelfTestDone = false
         }
-        unregisterWifiReturnRetestCallback()
-        // Tear down the cellular binding alongside the relay — once we're
-        // not routing target dials through cellular-only any more, the
-        // process should go back to standard default routing.
+        // ALWAYS unbind, even if `wifiRelay` was null when we got here.
+        // Reason: bindProcessToCellularBlocking() commits the process
+        // bind BEFORE relay startup. If the relay creation later threw
+        // (or the service was killed by the OS between bind and assign),
+        // `wifiRelay` ends up null but the bind is still live — and in
+        // the NATIVE engine the :proxy process survives stop, so the
+        // next session inherits a stale cellular bind that silently
+        // funnels every outbound socket (including NAT-IP probes)
+        // through mobile data instead of the default route. The
+        // bindProcessToNetwork(null) call is a cheap no-op when nothing
+        // is bound, so making this unconditional is safe.
         unbindProcessFromCellular()
-        // Reset the initial-test flag so a fresh start (e.g. user reties
-        // by toggling and re-saving) gets a fresh verification cycle.
-        initialSelfTestDone = false
     }
 
     // Shared split-routing failure handler. Both the initial self-test and

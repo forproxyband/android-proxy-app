@@ -358,7 +358,7 @@ class MainActivity : AppCompatActivity() {
             rbEngineBinary.text = if (wifiOn) {
                 "Binary subprocess  (disabled — needs in-process engine for Wi-Fi return)"
             } else {
-                "Binary subprocess  (testing — no Wi-Fi return)"
+                "Binary subprocess"
             }
         }
 

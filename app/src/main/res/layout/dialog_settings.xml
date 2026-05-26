@@ -201,13 +201,13 @@
             android:id="@+id/rbEngineBinary"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Binary subprocess  (testing — no Wi-Fi return)"
+            android:text="Binary subprocess"
             android:textSize="13sp" />
         <RadioButton
             android:id="@+id/rbEngineAar"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="In-process AAR  (testing — known broken)"
+            android:text="In-process AAR"
             android:textSize="13sp" />
     </RadioGroup>
 
