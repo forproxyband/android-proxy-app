@@ -190,18 +190,26 @@ don't want the kwik dependency take.
 
 ### REBOOT path differences
 
-The three engines surface server-side REBOOT differently — the UI
+Server-initiated REBOOT arrives as a `{"command":"REBOOT","reason":"..."}`
+JSON line on the control channel in all three engines. The UI
 auto-cycle hook (`triggerAutoIpCycle`) is reachable from all three.
 
 - **BINARY / AAR**: REBOOT is detected by parsing the SDK's
   `"REBOOT received from registrator reason=..."` log line in
   `parseAgentLine`. The same line also drops out of the Go SDK's own
   log when it tears down the tunnel session for reconnect.
-- **NATIVE**: emits the identical log string into the `LogSink` so
-  the existing `parseAgentLine` matches, AND exposes a typed
-  `RebootListener` callback consumed in `runNativeEngine` as a
-  belt-and-braces second path (in case the log sink is swapped out
-  mid-run).
+- **NATIVE**: `Uplink.controlReadLoop` parses the JSON, dispatches to
+  `handleReboot(reason)`, which emits the *identical* log string into
+  the `LogSink` (so `parseAgentLine` matches) AND fires the typed
+  `RebootListener`, then tears down the transport so the supervisor
+  reconnects. `ProxyService.runNativeEngine` wires only the LogSink
+  path through to `triggerAutoIpCycle` and intentionally does **not**
+  set a `RebootListener` — both paths would fire for one REBOOT, and
+  although `triggerAutoIpCycle` is idempotent (`autoCycling` flag),
+  the duplicate call adds a noisy "Auto IP-cycle already in progress"
+  line to every rotation. The typed listener remains on
+  `NativeProxyAgent`'s public API for third-party integrators who
+  don't plumb a LogSink.
 
 ### Wi-Fi return engine gate
 

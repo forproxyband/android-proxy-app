@@ -1286,12 +1286,19 @@ class ProxyService : Service() {
                     log("[native] $line")
                 }
 
-                // REBOOT path matches the binary/AAR engines, where
-                // parseAgentLine hooks the "REBOOT received from
-                // registrator" log line. The listener is a belt-and-
-                // braces second path so this still acts if the log sink
-                // is ever swapped out.
-                agent.setRebootListener { reason -> triggerAutoIpCycle(reason) }
+                // REBOOT routing: NativeProxyAgent emits the same
+                // "REBOOT received from registrator reason=..." log
+                // line as the Go SDK, and parseAgentLine (called from
+                // the LogSink above) already triggers
+                // triggerAutoIpCycle off it. We deliberately do NOT
+                // wire setRebootListener here — both paths would fire
+                // for the same REBOOT, and although triggerAutoIpCycle
+                // is idempotent via the autoCycling flag, the duplicate
+                // call adds a confusing "Auto IP-cycle already in
+                // progress; ignoring REBOOT" line to every rotation.
+                // The typed listener stays on NativeProxyAgent's public
+                // API for third-party integrators who don't wire a
+                // LogSink.
 
                 val cfg = com.proxyagent.app.nativeagent.NativeProxyAgent.Config(
                     registratorHost = if (mode == Mode.MODEM) effHost else null,
