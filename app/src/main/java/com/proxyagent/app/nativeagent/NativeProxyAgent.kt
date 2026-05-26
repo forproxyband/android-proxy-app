@@ -973,7 +973,13 @@ internal class Uplink(
             val host = hdr.string("host") ?: throw IOException("missing host")
             val port = hdr.int("port") ?: throw IOException("missing port")
             val target = "$host:$port"
-            agent.logInfo("opening quic tunnel", "target" to target)
+            // Use the same "opening tunnel" prefix as the TCP path so
+            // external parsers (ProxyService.parseAgentLine in the
+            // Android host) increment activeTunnels uniformly across
+            // transports. The Go SDK historically emitted "opening
+            // quic tunnel" here which doesn't match the standard
+            // matcher — we deliberately diverge for parity in the UI.
+            agent.logInfo("opening tunnel", "target" to target, "transport" to "quic")
             val sock = Socket()
             sock.tcpNoDelay = true
             try { sock.receiveBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
@@ -982,7 +988,10 @@ internal class Uplink(
                 NativeProxyAgent.TARGET_DIAL_TIMEOUT_MS.toInt())
             targetSock = sock
             bridgeStreams(streamIn, stream.output, sock)
-            agent.logInfo("quic tunnel closed", "target" to target)
+            // "tunnel closed" matches the standard parseAgentLine
+            // matcher; the "transport=quic" key keeps the QUIC origin
+            // visible for log readers.
+            agent.logInfo("tunnel closed", "target" to target, "transport" to "quic")
         } catch (t: Throwable) {
             agent.logWarn("quic tunnel failed",
                 "error" to (t.message ?: t.javaClass.simpleName))
