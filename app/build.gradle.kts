@@ -151,8 +151,14 @@ dependencies {
     // records and the QUIC-specific key exporter that JSSE/Conscrypt do not.
     // Total APK overhead is ~5 MB (bcprov + bctls); acceptable for parity
     // with the Go SDK's QUIC throughput.
-    implementation("org.bouncycastle:bcprov-jdk18on:1.79")
-    implementation("org.bouncycastle:bctls-jdk18on:1.79")
+    //
+    // TEMPORARILY DISABLED — isolation test: does BC on the classpath break
+    // kwik? Android bundles its own `org.bouncycastle.*`; the duplicate may
+    // corrupt the JCA crypto kwik relies on. With these out (and TlsCrypto's
+    // X25519 stubbed), the in-house QUIC won't function, but if kwik starts
+    // working again we've found the culprit. Restore both lines after.
+    // implementation("org.bouncycastle:bcprov-jdk18on:1.79")
+    // implementation("org.bouncycastle:bctls-jdk18on:1.79")
     // Desugaring for java.time.* on API < 26 (needed by kwik).
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
 }

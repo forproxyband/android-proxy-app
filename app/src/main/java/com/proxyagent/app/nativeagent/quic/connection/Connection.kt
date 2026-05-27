@@ -416,6 +416,14 @@ internal class Connection(
                     val loss = spaceFor(space).recovery.detectLost()
                     for (f in loss.framesToRetransmit) requeueLostFrame(space, f)
                     if (loss.bytesLost > 0) cc.onPacketLost(loss.bytesLost.toInt())
+                    // Log incoming ACKs for the 1-RTT space only (Initial/
+                    // Handshake are noisy during the brief handshake). Shows
+                    // whether the server is acking our packets — particularly
+                    // our PING keepalives. `acked_now` is how many of OUR sent
+                    // packets this ACK newly covered.
+                    if (space == PacketNumberSpace.ONE_RTT) {
+                        log("recv ACK: largest=${frame.largestAcked} ranges=${frame.ranges.size} acked_now=${acked.size} cc.in_flight=${cc.bytesInFlight}")
+                    }
                 }
                 is Crypto -> {
                     val tlsLevel = when (space) {

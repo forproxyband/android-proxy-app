@@ -1,8 +1,6 @@
 package com.proxyagent.app.nativeagent.quic.tls
 
 import com.proxyagent.app.nativeagent.quic.crypto.Hkdf
-import org.bouncycastle.crypto.params.X25519PrivateKeyParameters
-import org.bouncycastle.crypto.params.X25519PublicKeyParameters
 import java.security.MessageDigest
 import java.security.SecureRandom
 
@@ -38,33 +36,25 @@ internal object TlsCrypto {
         }
     }
 
-    /** Generate a fresh X25519 key pair. */
+    /** Generate a fresh X25519 key pair.
+     *  STUBBED for the BC-isolation test — see build.gradle.kts. The
+     *  in-house QUIC ("native" toggle) is non-functional while BC is
+     *  removed; selecting it throws here. kwik (the default toggle)
+     *  is unaffected and is what this test exercises. */
     fun generateX25519KeyPair(): X25519KeyPair {
-        val priv = X25519PrivateKeyParameters(rng)
-        val pub = priv.generatePublicKey()
-        return X25519KeyPair(
-            publicKey = pub.encoded,
-            privateKey = priv.encoded,
+        throw UnsupportedOperationException(
+            "X25519 stubbed: BouncyCastle removed for kwik-isolation test. " +
+                "Select 'kwik library' in QUIC implementation settings."
         )
     }
 
     /**
-     * X25519 ECDH: given our private key and peer's public key,
-     * compute the 32-byte shared secret. RFC 7748 §6.1 says to
-     * reject the all-zero output (would mean peer chose a
-     * malicious public key forcing a known shared secret) — we
-     * follow that, throwing on contributory-behavior failure.
+     * X25519 ECDH. STUBBED for the BC-isolation test (see above).
      */
     fun x25519(privateKey: ByteArray, peerPublicKey: ByteArray): ByteArray {
-        require(privateKey.size == 32 && peerPublicKey.size == 32)
-        val priv = X25519PrivateKeyParameters(privateKey, 0)
-        val pub = X25519PublicKeyParameters(peerPublicKey, 0)
-        val out = ByteArray(32)
-        priv.generateSecret(pub, out, 0)
-        if (out.all { it == 0.toByte() }) {
-            throw TlsException("x25519 yielded all-zero shared secret (peer used small-order point)")
-        }
-        return out
+        throw UnsupportedOperationException(
+            "X25519 stubbed: BouncyCastle removed for kwik-isolation test."
+        )
     }
 
     // ── SHA-256 ───────────────────────────────────────────────
