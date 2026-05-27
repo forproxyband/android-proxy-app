@@ -152,15 +152,25 @@ internal class Connection(
 
     // ── Public API ────────────────────────────────────────────
 
+    /** Diagnostic log tag — visible via `adb logcat -s NativeQUIC`.
+     *  All log lines are at INFO level so the user gets them with
+     *  one filter regardless of release/debug build. */
+    private fun log(msg: String) {
+        android.util.Log.i("NativeQUIC", "[$serverHost] $msg")
+    }
+
     /** Establish the connection. Blocks until handshake completes
      *  or a fatal error occurs. */
     fun connect(timeoutMs: Long) {
+        log("connect: dcid=${originalDcid.toHex()} scid=${sourceCid.toHex()} timeout=${timeoutMs}ms")
         socket.connect(resolvedAddress)
         socket.soTimeout = 250  // ms — short so receive thread can poll closed flag
+        log("connect: udp connected to $resolvedAddress, local=${socket.localPort}")
 
         // Install Initial keys from our chosen random DCID.
         val initialKeys = InitialKeys.derive(originalDcid)
         initialSpace.installInitialKeys(initialKeys.client, initialKeys.server)
+        log("connect: initial keys derived")
 
         recvThread = Thread(::receiveLoop, "quic-recv-${serverHost}").apply {
             isDaemon = true
@@ -175,7 +185,9 @@ internal class Connection(
         // Route via handleTlsStep so the Level→PacketNumberSpace
         // conversion (and any new secrets, though there are none
         // at this point) lives in one place.
-        handleTlsStep(tls.start())
+        val firstStep = tls.start()
+        log("connect: TLS started, ClientHello size=${firstStep.outgoing.values.firstOrNull()?.size ?: 0}")
+        handleTlsStep(firstStep)
         sendQueue.offer(QueuedSendWork.Tick)
 
         // Wait for handshake.
@@ -229,20 +241,25 @@ internal class Connection(
     // ── Internals: receive loop ───────────────────────────────
 
     private fun receiveLoop() {
+        log("recvLoop: started")
         val buf = ByteArray(2048)
         val pkt = DatagramPacket(buf, buf.size)
+        var packetCount = 0
         while (!closed.get()) {
             try {
                 socket.receive(pkt)
+                packetCount++
+                log("recv: pkt#$packetCount size=${pkt.length} firstByte=0x${(buf[0].toInt() and 0xFF).toString(16)}")
                 processDatagram(buf, pkt.length)
             } catch (_: java.net.SocketTimeoutException) {
                 // Normal — loop polls closed flag.
             } catch (t: Throwable) {
                 if (!closed.get()) {
-                    // TODO: surface via callback to NativeProxyAgent's log sink
+                    log("recvLoop: ${t.javaClass.simpleName}: ${t.message}")
                 }
             }
         }
+        log("recvLoop: exit (packets=$packetCount)")
     }
 
     private fun processDatagram(bytes: ByteArray, length: Int) {
@@ -297,9 +314,11 @@ internal class Connection(
             System.arraycopy(unprotectedPn, 0, aad, info.packetNumberOffset - info.headerStartOffset, pnLength)
             val plaintext = try {
                 cs.receive!!.decrypt(pn, ciphertext, aad)
-            } catch (_: Throwable) {
+            } catch (t: Throwable) {
+                log("recv long: AEAD decrypt failed space=$space pn=$pn ct=${ciphertext.size}B: ${t.javaClass.simpleName}")
                 return -1  // RFC 9001 §5.5: silently drop AEAD failures
             }
+            log("recv long: decrypted space=$space pn=$pn payload=${plaintext.size}B")
             // Update largest received PN.
             if (pn > cs.largestReceivedPn) cs.largestReceivedPn = pn
             // Parse frames and dispatch.
@@ -308,7 +327,8 @@ internal class Connection(
             cs.recovery.onPacketReceived(pn, ackElic)
             dispatchFrames(space, frames)
             payloadEnd - datagramStart
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            log("processLongPacket: ${t.javaClass.simpleName}: ${t.message}")
             -1
         }
     }
@@ -423,11 +443,14 @@ internal class Connection(
                 TlsClient.Direction.TX -> cs.installSendKeys(ns.trafficSecret)
                 TlsClient.Direction.RX -> cs.installReceiveKeys(ns.trafficSecret)
             }
+            log("tls: new secret level=${ns.level} dir=${ns.direction}")
         }
         step.peerTransportParameters?.let { tp ->
             peerTransportParameters = tp
             flow.applyPeerMaxData(tp.initialMaxData)
+            log("tls: peer TPs received, peer_max_data=${tp.initialMaxData}")
         }
+        if (step.handshakeComplete) log("tls: handshake complete")
         for ((level, bytes) in step.outgoing) {
             val space = when (level) {
                 TlsClient.Level.INITIAL -> PacketNumberSpace.INITIAL
@@ -618,10 +641,14 @@ internal class Connection(
         // Send on wire.
         try {
             socket.send(DatagramPacket(fullPacket, fullPacket.size, resolvedAddress))
-        } catch (_: Throwable) {
-            // TODO: log
+            log("send: space=$space pn=$pn size=${fullPacket.size}B frames=${frames.joinToString { it.javaClass.simpleName }}")
+        } catch (t: Throwable) {
+            log("send: ${t.javaClass.simpleName}: ${t.message}")
         }
     }
+
+    private fun ByteArray.toHex(): String =
+        joinToString("") { "%02x".format(it) }
 
     private fun roughHeaderSize(space: PacketNumberSpace): Int = when (space) {
         PacketNumberSpace.INITIAL -> 1 + 4 + 1 + destinationCid.size + 1 + sourceCid.size + 1 + 4  // ~rough
