@@ -94,6 +94,23 @@ android {
         jniLibs {
             useLegacyPackaging = true
         }
+        resources {
+            // BouncyCastle ships the same OSGi metadata file in each
+            // of bcprov / bcutil / bctls. AGP's default merger
+            // refuses duplicates; these manifests are OSGi metadata
+            // we don't run, so exclude them outright. The
+            // META-INF/versions/9/* split is from BC's multi-
+            // release jars — same content shipped at the JDK 9+
+            // location and the legacy one.
+            excludes += setOf(
+                "META-INF/versions/9/OSGI-INF/MANIFEST.MF",
+                "META-INF/versions/9/OSGI-INF/**",
+                "META-INF/OSGI-INF/MANIFEST.MF",
+                "META-INF/OSGI-INF/**",
+                "META-INF/INDEX.LIST",
+                "META-INF/DEPENDENCIES",
+            )
+        }
     }
 
     applicationVariants.all {
