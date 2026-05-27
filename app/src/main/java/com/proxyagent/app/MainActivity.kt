@@ -325,6 +325,10 @@ class MainActivity : AppCompatActivity() {
         val rbEngineNative = view.findViewById<RadioButton>(R.id.rbEngineNative)
         val rbEngineBinary = view.findViewById<RadioButton>(R.id.rbEngineBinary)
         val rbEngineAar = view.findViewById<RadioButton>(R.id.rbEngineAar)
+        val quicImplBlock = view.findViewById<android.widget.LinearLayout>(R.id.quicImplBlock)
+        val rgQuicImpl = view.findViewById<RadioGroup>(R.id.rgQuicImpl)
+        val rbQuicImplNative = view.findViewById<RadioButton>(R.id.rbQuicImplNative)
+        val rbQuicImplKwik = view.findViewById<RadioButton>(R.id.rbQuicImplKwik)
         val rgMode = view.findViewById<RadioGroup>(R.id.rgMode)
         val rbModeModem = view.findViewById<RadioButton>(R.id.rbModeModem)
         val rbModeBalancer = view.findViewById<RadioButton>(R.id.rbModeBalancer)
@@ -428,6 +432,22 @@ class MainActivity : AppCompatActivity() {
                 "binary" -> rbEngineBinary.isChecked = true
                 else -> rbEngineNative.isChecked = true     // "native" or unset
             }
+            // QUIC implementation picker, persisted per `quic_impl` key.
+            // Default to "kwik" — the in-house QUIC is still under
+            // interop testing; users opt in explicitly.
+            when (prefs.getString("quic_impl", "kwik")) {
+                "native" -> rbQuicImplNative.isChecked = true
+                else -> rbQuicImplKwik.isChecked = true
+            }
+            // Visibility tied to engine choice — kwik vs in-house only
+            // matters when NATIVE is the agent engine; the binary
+            // subprocess and the AAR drop-in carry their own QUIC.
+            quicImplBlock.visibility = if (rbEngineNative.isChecked)
+                android.view.View.VISIBLE else android.view.View.GONE
+            rgEngine.setOnCheckedChangeListener { _, _ ->
+                quicImplBlock.visibility = if (rbEngineNative.isChecked)
+                    android.view.View.VISIBLE else android.view.View.GONE
+            }
             val modemMode = prefs.getString("mode", "modem") == "modem"
             if (modemMode) rbModeModem.isChecked = true else rbModeBalancer.isChecked = true
             applyModeVisibility(modemMode)
@@ -508,6 +528,15 @@ class MainActivity : AppCompatActivity() {
                     R.id.rbEngineBinary -> "binary"
                     else -> "native"   // rbEngineNative or nothing checked
                 }
+                // QUIC implementation choice. Only consumed when engine
+                // == "native"; for binary / aar this value is ignored
+                // (those agents ship their own QUIC). We persist either
+                // way so the radio retains its selection when the user
+                // flips back to NATIVE.
+                val newQuicImpl = when (rgQuicImpl.checkedRadioButtonId) {
+                    R.id.rbQuicImplNative -> "native"
+                    else -> "kwik"  // rbQuicImplKwik or nothing
+                }
                 val newMode = if (rgMode.checkedRadioButtonId == R.id.rbModeBalancer) "balancer" else "modem"
                 val imeiMethodKey = imeiMethodKeys[
                     spImeiMethod.selectedItemPosition.coerceIn(0, imeiMethodKeys.size - 1)]
@@ -532,6 +561,7 @@ class MainActivity : AppCompatActivity() {
                 // way the "stop & restart to apply" hint fires even when
                 // engine was clamped by the Wi-Fi return gate.
                 val engineChanged = prefs.getString("engine", "native") != effectiveEngine
+                val quicImplChanged = prefs.getString("quic_impl", "kwik") != newQuicImpl
                 val modeChanged = prefs.getString("mode", "modem") != newMode
                 prefs.edit()
                     .putString("h", h).putString("p", p).putString("k", k)
@@ -539,6 +569,7 @@ class MainActivity : AppCompatActivity() {
                     .putBoolean("speed_bytes", speedBytes)
                     .putInt("analytics_retention_days", newRetention)
                     .putString("engine", effectiveEngine)
+                    .putString("quic_impl", newQuicImpl)
                     .putString("mode", newMode)
                     .putBoolean("apn_swap", cbApnSwap.isChecked)
                     .putBoolean("imei_rotate", cbImeiRotate.isChecked)
@@ -576,7 +607,7 @@ class MainActivity : AppCompatActivity() {
                 catch (_: Throwable) {}
                 val running = readFile("proxy_state").let { it == "running" || it == "starting" }
                 val msg = when {
-                    running && (engineChanged || modeChanged) -> "Saved — stop & restart to apply"
+                    running && (engineChanged || modeChanged || quicImplChanged) -> "Saved — stop & restart to apply"
                     running -> "Saved — restart agent to apply"
                     else -> "Saved"
                 }

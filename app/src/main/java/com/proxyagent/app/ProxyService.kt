@@ -1429,13 +1429,18 @@ class ProxyService : Service() {
                     dialTimeoutMs = 5000,
                     heartbeatIntervalSec = 60,
                     enableHeartbeat = true,
-                    // In-house QUIC stack (com.proxyagent.app.nativeagent.quic.*).
-                    // Replaces the kwik-based factory after that lib's
-                    // single-sender-thread architecture starved ACK / window
-                    // updates under load — see ARCHITECTURE.md regression
-                    // guard. Flip back to KwikQuicTransport.Factory() if
-                    // interop against the proxy-server breaks.
-                    quicTransportFactory = com.proxyagent.app.nativeagent.quic.NativeQuicTransport.Factory(),
+                    // QUIC factory chosen by the user in Settings (key
+                    // `quic_impl`). Both ship in the APK so we A/B between
+                    // the in-house stack and the kwik library without a
+                    // rebuild. Default to kwik until the in-house QUIC is
+                    // field-validated against the proxy-server (Phase 11
+                    // in nativeagent/quic/DESIGN.md).
+                    quicTransportFactory = when (
+                        getSharedPreferences("cfg", 0).getString("quic_impl", "kwik")
+                    ) {
+                        "native" -> com.proxyagent.app.nativeagent.quic.NativeQuicTransport.Factory()
+                        else -> com.proxyagent.app.nativeagent.KwikQuicTransport.Factory()
+                    },
                 )
 
                 connStatus = ConnStatus.CONNECTING

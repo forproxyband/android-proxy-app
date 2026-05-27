@@ -1089,6 +1089,10 @@ internal class Uplink(
     private fun startQuic(creds: RegistratorCreds) {
         val factory = cfg.quicTransportFactory
             ?: throw IOException("QUIC factory not registered")
+        // Surface the implementation class so the user can tell whether
+        // the Settings toggle (`quic_impl` pref) actually flipped the
+        // factory. Useful when A/B-testing kwik vs the in-house QUIC.
+        agent.logInfo("uplink: QUIC impl", "class" to factory.javaClass.name)
         val transport = factory.connect(
             host = creds.host,
             port = creds.port,

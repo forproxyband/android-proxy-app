@@ -211,6 +211,45 @@
             android:textSize="13sp" />
     </RadioGroup>
 
+    <!-- QUIC implementation picker — only meaningful for the NATIVE
+         engine (kwik / native subpackage are both Kotlin QUIC libs).
+         Hidden / grey when engine != native. Both options ship in
+         the APK so user can A/B without rebuilding. -->
+    <LinearLayout
+        android:id="@+id/quicImplBlock"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:layout_marginTop="10dp"
+        android:layout_marginStart="16dp">
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="QUIC implementation (NATIVE only):"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            android:textColor="#888888"
+            android:layout_marginBottom="4dp" />
+        <RadioGroup
+            android:id="@+id/rgQuicImpl"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+            <RadioButton
+                android:id="@+id/rbQuicImplNative"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="In-house QUIC (Brutal CC, experimental)"
+                android:textSize="13sp" />
+            <RadioButton
+                android:id="@+id/rbQuicImplKwik"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="kwik library (NewReno CC, stable)"
+                android:textSize="13sp" />
+        </RadioGroup>
+    </LinearLayout>
+
     <View
         android:layout_width="match_parent"
         android:layout_height="1dp"
