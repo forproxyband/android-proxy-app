@@ -119,11 +119,12 @@ internal class SpliceShim {
             var ch: SocketChannel? = null
             val packed = try {
                 ch = SocketChannel.open()
-                // Try PFD first; fall through to JNI strategies if it
-                // doesn't yield a usable fd (e.g. SocketAdaptor on a
-                // future Android refusing to expose its FileDescriptor).
-                val viaPfd = fdViaPfd(ch)
-                if (viaPfd >= 0) viaPfd else fdOf(ch)
+                // Probe in the same order copy() uses on real tunnels:
+                // JNI first (no FileDescriptor side effects), PFD only
+                // if JNI is fully blocked. Keeps the cached
+                // winningStrategy consistent with the hot path.
+                val viaJni = fdOf(ch)
+                if (viaJni >= 0) viaJni else fdViaPfd(ch)
             } catch (t: Throwable) {
                 // Always emit, not once-per-process — see the success
                 // path below for the restart-friendliness reasoning.
@@ -217,32 +218,36 @@ internal class SpliceShim {
                 logFallbackOnce("library_not_loaded")
                 return false
             }
-            // Strategy 0: ParcelFileDescriptor.fromSocket — public
-            // Android API since API 12. The framework's own code
-            // calls socket.getFileDescriptor$() inside it, but the
-            // hidden-API check uses the IMMEDIATE caller (PFD class,
-            // bootclassloader) which is always allowed. detachFd()
-            // returns the raw int and marks PFD as detached so its
-            // finalizer won't close the fd later — the original
-            // Socket keeps its own reference to the same FileDescriptor,
-            // unaffected by the detach.
+            // Try the JNI strategies FIRST (fdVal → FileDescriptor.fd
+            // → .descriptor → getInt$()). They only read fields, no
+            // side effects, so two bridge threads racing to extract
+            // fds from the same socket pair both succeed.
             //
-            // This path works on any Android API ≥ 12 regardless of
-            // targetSdkVersion or non-SDK enforcement state. We try
-            // it FIRST and only fall through to the JNI strategies
-            // if PFD itself somehow refuses (e.g. SocketAdaptor that
-            // doesn't expose its FD, which shouldn't happen for
-            // connected channels but we don't want to crash on it).
-            var srcPacked = fdViaPfd(src)
-            var dstPacked = fdViaPfd(dst)
-            // If PFD didn't yield both fds, try the JNI strategies.
-            // We deliberately don't mix-and-match (e.g. PFD for src
-            // and JNI for dst) — each pair must agree on which
-            // strategy worked so the cached `winningStrategy` reflects
-            // the actually-used path consistently.
+            // PFD is the fallback because pfd.detachFd() ->
+            // IoUtils.acquireRawFd() calls fd.setInt$(-1) on the
+            // ORIGINAL Socket's FileDescriptor. After that the
+            // sibling bridge thread (running the opposite direction
+            // of the copy) sees a -1 fd on its fdViaPfd() / fdOf()
+            // call and is forced into the NIO fallback path —
+            // producing the asymmetric "one direction is fast, the
+            // other crawls" failure mode we hit before this reorder.
+            //
+            // Cost of the reorder: on a future Android that fully
+            // blocks even JNI field reads of the system FileDescriptor
+            // class, we'd now go through PFD on every tunnel and
+            // re-introduce the race. Acceptable trade — JNI extraction
+            // has worked on every Android we've shipped to.
+            var srcPacked = fdOf(src)
+            var dstPacked = fdOf(dst)
+            // If JNI failed for either side (hidden-API blocklist on
+            // some future device), fall back to PFD. We do BOTH via
+            // PFD so the cached `winningStrategy` reflects a single
+            // path consistently. PFD's side effect is unavoidable
+            // here, but at least we only pay it when JNI is fully
+            // locked down.
             if (srcPacked < 0 || dstPacked < 0) {
-                srcPacked = fdOf(src)
-                dstPacked = fdOf(dst)
+                srcPacked = fdViaPfd(src)
+                dstPacked = fdViaPfd(dst)
             }
             if (srcPacked < 0) {
                 tunnelsFallback.incrementAndGet()

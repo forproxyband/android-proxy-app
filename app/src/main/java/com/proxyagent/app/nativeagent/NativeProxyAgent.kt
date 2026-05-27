@@ -1382,7 +1382,13 @@ internal class Uplink(
      *  FIN, then close both ends so the OTHER copier exits via
      *  IOException on its read. */
     private fun bridge(a: SocketChannel, b: SocketChannel) {
-        val done = java.util.concurrent.CountDownLatch(1)
+        // Wait for BOTH directions, not just the first. With a latch
+        // of 1 the first half-close (e.g. PC ends an upload-only
+        // payload) tripped the await and the close() pair below would
+        // tear the still-draining download direction down mid-flight.
+        // Matches Go's bridge in proxy-agent-sdk-go/.../uplink.go
+        // which receives from `done` twice before deferring Close().
+        val done = java.util.concurrent.CountDownLatch(2)
         bridgeExecutor.execute {
             try {
                 copyChannel(a, b)
@@ -1438,7 +1444,10 @@ internal class Uplink(
      *  closes both ends so the other thread unblocks via EOF/EPIPE.
      *  Matches Go's pipeQUIC behaviour. */
     private fun bridgeStreams(input: InputStream, output: OutputStream, sock: Socket) {
-        val done = java.util.concurrent.CountDownLatch(1)
+        // CountDownLatch(2): wait for both directions. Same reasoning
+        // as bridge() above — latch of 1 cuts the busy direction off
+        // when the quiet one half-closes first.
+        val done = java.util.concurrent.CountDownLatch(2)
         bridgeExecutor.execute {
             try { copyStream(input, sock.getOutputStream()) } catch (_: Throwable) {}
             finally { done.countDown() }

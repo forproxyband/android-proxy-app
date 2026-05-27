@@ -45,12 +45,22 @@ Java_com_proxyagent_app_nativeagent_SpliceShim_spliceLoop(
     size_t chunk = (chunkSize > 0) ? (size_t)chunkSize : (size_t)CHUNK_DEFAULT;
     jlong total = 0;
 
+    // Flags: SPLICE_F_MOVE only — same as Go's stdlib splice path
+    // (internal/poll/splice_linux.go). We deliberately do NOT set
+    // SPLICE_F_MORE: while MORE is documented as a TCP_CORK-style
+    // "more data coming" hint on socket outputs, setting it on EVERY
+    // splice() iteration corks the destination until either a call
+    // without MORE arrives (we never do that) or the 200 ms cork
+    // ceiling fires. For a continuously-flowing upload stream this
+    // caps throughput at ~pipe_buffer/200ms ≈ 320 KB/s — exactly the
+    // failure mode we observed before this change. Sender-side TCP
+    // already coalesces small writes; we don't need MORE.
     for (;;) {
         // Step 1: pull bytes from src socket into the kernel pipe.
         ssize_t n = splice((int)fdSrc, NULL,
                            pipefd[1], NULL,
                            chunk,
-                           SPLICE_F_MOVE | SPLICE_F_MORE);
+                           SPLICE_F_MOVE);
         if (n == 0) {
             // Clean EOF on src — peer FIN'd; nothing left to copy.
             break;
@@ -75,7 +85,7 @@ Java_com_proxyagent_app_nativeagent_SpliceShim_spliceLoop(
             ssize_t k = splice(pipefd[0], NULL,
                                (int)fdDst, NULL,
                                (size_t)pending,
-                               SPLICE_F_MOVE | SPLICE_F_MORE);
+                               SPLICE_F_MOVE);
             if (k == 0) {
                 // Destination shut down. Treat as EOF.
                 goto done;
