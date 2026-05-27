@@ -271,6 +271,7 @@ internal class Connection(
     }
 
     private fun processDatagram(bytes: ByteArray, length: Int) {
+        statsDatagrams.incrementAndGet()
         var offset = 0
         while (offset < length) {
             val buf = ByteBuffer.wrap(bytes, offset, length - offset)
@@ -283,6 +284,14 @@ internal class Connection(
             offset += consumed
         }
     }
+
+    /** Total UDP datagrams received and frame-type tallies for
+     *  post-mortem diagnostics. Logged periodically by the sender
+     *  thread so we can see if STREAM frames arrive at all even
+     *  when individual frame logs get drowned out. */
+    private val statsDatagrams = java.util.concurrent.atomic.AtomicLong(0L)
+    private val statsStreamFrames = java.util.concurrent.atomic.AtomicLong(0L)
+    private val statsNewServerStreams = java.util.concurrent.atomic.AtomicLong(0L)
 
     private fun processLongPacket(bytes: ByteArray, datagramStart: Int, datagramEnd: Int, buf: ByteBuffer): Int {
         return try {
@@ -418,6 +427,7 @@ internal class Connection(
                     handleTlsStep(step)
                 }
                 is StreamFrame -> {
+                    statsStreamFrames.incrementAndGet()
                     val isNew = !streams.containsKey(frame.streamId)
                     val s = streams.getOrPut(frame.streamId) {
                         // Server-initiated stream.
@@ -427,9 +437,10 @@ internal class Connection(
                             peerMaxStreamData = peerTransportParameters?.initialMaxStreamDataBidiLocal ?: 0L,
                         )
                         incomingServerStreams.offer(ns)
+                        statsNewServerStreams.incrementAndGet()
                         ns
                     }
-                    if (isNew) log("recv STREAM: NEW server stream id=${frame.streamId} peer_max=${s.peerMaxStreamData}")
+                    if (isNew) log("recv STREAM: NEW server stream id=${frame.streamId} peer_max=${s.peerMaxStreamData} queue_size=${incomingServerStreams.size}")
                     s.acceptStreamFrame(frame)
                     flow.onBytesReceived(frame.data.size)
                     log("recv STREAM: id=${frame.streamId} offset=${frame.offset} len=${frame.data.size} fin=${frame.fin} readOffset=${s.recvBuffer.readOffset}")
@@ -477,7 +488,14 @@ internal class Connection(
         step.peerTransportParameters?.let { tp ->
             peerTransportParameters = tp
             flow.applyPeerMaxData(tp.initialMaxData)
-            log("tls: peer TPs received, peer_max_data=${tp.initialMaxData}")
+            log("tls: peer TPs received," +
+                " max_data=${tp.initialMaxData}" +
+                " max_streams_bidi=${tp.initialMaxStreamsBidi}" +
+                " max_streams_uni=${tp.initialMaxStreamsUni}" +
+                " sd_bidi_local=${tp.initialMaxStreamDataBidiLocal}" +
+                " sd_bidi_remote=${tp.initialMaxStreamDataBidiRemote}" +
+                " sd_uni=${tp.initialMaxStreamDataUni}" +
+                " max_idle_ms=${tp.maxIdleTimeoutMs}")
         }
         if (step.handshakeComplete) log("tls: handshake complete")
         for ((level, bytes) in step.outgoing) {
@@ -523,9 +541,26 @@ internal class Connection(
 
     private fun senderLoop() {
         log("senderLoop: started")
+        var lastStatsLogNanos = System.nanoTime()
         while (!closed.get()) {
             try {
                 sendQueue.poll(20, TimeUnit.MILLISECONDS)  // wait up to 20ms
+
+                // Periodic stats — every 5 seconds. Helps see at a
+                // glance whether we're getting STREAM frames at all,
+                // or if new server-initiated streams arrive.
+                val now = System.nanoTime()
+                if (now - lastStatsLogNanos > 5_000_000_000L) {
+                    log("stats: datagrams=${statsDatagrams.get()}" +
+                        " stream_frames=${statsStreamFrames.get()}" +
+                        " new_server_streams=${statsNewServerStreams.get()}" +
+                        " accept_queue=${incomingServerStreams.size}" +
+                        " streams_map=${streams.size}" +
+                        " cc.in_flight=${cc.bytesInFlight}" +
+                        " cc.cwnd=${cc.congestionWindow}" +
+                        " flow.send_credit=${flow.sendCredit()}")
+                    lastStatsLogNanos = now
+                }
 
                 // Priority 1: Crypto data still owed at any level.
                 for (space in listOf(PacketNumberSpace.INITIAL, PacketNumberSpace.HANDSHAKE, PacketNumberSpace.ONE_RTT)) {
