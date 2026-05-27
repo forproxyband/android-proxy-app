@@ -522,6 +522,7 @@ internal class Connection(
     }
 
     private fun senderLoop() {
+        log("senderLoop: started")
         while (!closed.get()) {
             try {
                 sendQueue.poll(20, TimeUnit.MILLISECONDS)  // wait up to 20ms
@@ -567,10 +568,14 @@ internal class Connection(
                 }
             } catch (t: Throwable) {
                 if (!closed.get()) {
-                    // TODO: log via callback
+                    // SURFACE these — silent swallow hides bugs like
+                    // the HP-sample-out-of-bounds that ate our PING
+                    // emissions for hours of debugging.
+                    log("senderLoop: ${t.javaClass.simpleName}: ${t.message}")
                 }
             }
         }
+        log("senderLoop: exit")
     }
 
     private fun drainStreams() {
@@ -633,7 +638,20 @@ internal class Connection(
             val totalSoFar = payloadSize + 16 /* AEAD tag */ + pnLen + roughHeaderSize(space)
             maxOf(1240 - totalSoFar, 0)
         } else 0
-        val paddedFrames = if (initialPadding > 0) frames + Padding(initialPadding) else frames
+        // Header-protection sample minimum (RFC 9001 §5.4.2): the
+        // sample is taken at `pn_offset + 4` and is 16 bytes long, so
+        // the packet must extend at least `pn_offset + 4 + 16` bytes
+        // total. That implies `pnLen + payload_with_tag >= 4 + 16 = 20`,
+        // i.e. plaintext payload must be at least `20 - 16 - pnLen` =
+        // `4 - pnLen + (pnLen extras)`. For pnLen=1..4, plaintext must
+        // be ≥ `4` bytes (we round up to 4 — overpad by a byte or two
+        // for shorter PN never hurts). Without this, PING-only or
+        // tiny ACK-only packets fail copyOfRange when sampling.
+        val hpSamplePadding = if (initialPadding == 0) {
+            maxOf(4 - payloadSize, 0)
+        } else 0
+        val totalExtraPadding = initialPadding + hpSamplePadding
+        val paddedFrames = if (totalExtraPadding > 0) frames + Padding(totalExtraPadding) else frames
 
         // Encode payload.
         val payloadBuf = ByteBuffer.allocate(2048)
