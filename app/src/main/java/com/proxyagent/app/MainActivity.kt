@@ -1093,12 +1093,19 @@ class MainActivity : AppCompatActivity() {
 
         val engine = prefs.getString("engine", "native") ?: "native"
         val mode = prefs.getString("mode", "modem") ?: "modem"
+        // QUIC impl is passed via intent (like engine/mode) NOT read from
+        // SharedPreferences in the :proxy process — that process caches
+        // prefs in memory and doesn't see cross-process writes, so a
+        // settings change wouldn't take effect. Intent extras are always
+        // fresh.
+        val quicImpl = prefs.getString("quic_impl", "kwik") ?: "kwik"
         return try {
             val svc = Intent(this, ProxyService::class.java).apply {
                 putExtra("host", h); putExtra("port", po); putExtra("key", k)
                 putExtra("id", id); putExtra("dns", d)
                 putExtra("engine", engine)
                 putExtra("mode", mode)
+                putExtra("quic_impl", quicImpl)
             }
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc) else startService(svc)
             tvStatus.text = "STARTING..."

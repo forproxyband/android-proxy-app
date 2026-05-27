@@ -49,6 +49,10 @@ class ProxyService : Service() {
     // Live native agent — only set when engine=NATIVE.
     @Volatile private var nativeAgent: com.proxyagent.app.nativeagent.NativeProxyAgent? = null
     @Volatile private var mode: Mode = Mode.MODEM
+    // QUIC implementation choice ("kwik" | "native"), passed via the
+    // start intent (NOT SharedPreferences — the :proxy process caches
+    // prefs and misses cross-process writes from the settings UI).
+    @Volatile private var quicImpl: String = "kwik"
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var analytics: AnalyticsRecorder? = null
     @Volatile private var lastNatRefreshMs = 0L
@@ -672,6 +676,7 @@ class ProxyService : Service() {
             else -> Engine.NATIVE   // "native" or unset → default to native
         }
         mode = if (intent.getStringExtra("mode") == "balancer") Mode.BALANCER else Mode.MODEM
+        quicImpl = intent.getStringExtra("quic_impl") ?: "kwik"
         if (host.isEmpty()) { stopSelf(); return START_NOT_STICKY }
 
         // Defensive bind reset. The :proxy process survives stops in
@@ -1430,14 +1435,14 @@ class ProxyService : Service() {
                     heartbeatIntervalSec = 60,
                     enableHeartbeat = true,
                     // QUIC factory chosen by the user in Settings (key
-                    // `quic_impl`). Both ship in the APK so we A/B between
-                    // the in-house stack and the kwik library without a
-                    // rebuild. Default to kwik until the in-house QUIC is
-                    // field-validated against the proxy-server (Phase 11
-                    // in nativeagent/quic/DESIGN.md).
-                    quicTransportFactory = when (
-                        getSharedPreferences("cfg", 0).getString("quic_impl", "kwik")
-                    ) {
+                    // `quic_impl`), delivered via the start intent (see
+                    // the `quicImpl` field — reading SharedPreferences
+                    // here would get a stale cached value in the :proxy
+                    // process). Both ship in the APK so we A/B between the
+                    // in-house stack and the kwik library without a rebuild.
+                    // Default kwik until the in-house QUIC is field-
+                    // validated (Phase 11 in nativeagent/quic/DESIGN.md).
+                    quicTransportFactory = when (quicImpl) {
                         "native" -> com.proxyagent.app.nativeagent.quic.NativeQuicTransport.Factory()
                         else -> com.proxyagent.app.nativeagent.KwikQuicTransport.Factory()
                     },

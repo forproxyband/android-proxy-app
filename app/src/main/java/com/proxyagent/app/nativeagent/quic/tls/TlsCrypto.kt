@@ -2,15 +2,8 @@ package com.proxyagent.app.nativeagent.quic.tls
 
 import com.proxyagent.app.nativeagent.quic.crypto.Hkdf
 import java.math.BigInteger
-import java.security.KeyFactory
-import java.security.KeyPairGenerator
 import java.security.MessageDigest
-import java.security.PrivateKey
 import java.security.SecureRandom
-import java.security.interfaces.XECPublicKey
-import java.security.spec.NamedParameterSpec
-import java.security.spec.XECPublicKeySpec
-import javax.crypto.KeyAgreement
 
 /**
  * TLS 1.3 crypto primitives for our hand-rolled handshake.
@@ -23,21 +16,24 @@ import javax.crypto.KeyAgreement
  * trust). This keeps the code small and removes huge swaths
  * of TLS complexity.
  *
- * **Why Android's built-in XDH for X25519, NOT BouncyCastle.**
- * We originally pulled BouncyCastle for X25519. That broke kwik
- * (and would break any other JCA crypto user in the app):
- * Android bundles its own `org.bouncycastle.*` in the platform,
- * and a second full BC under the same package names corrupts the
- * JCA provider chain — empirically confirmed by an isolation test
- * (kwik QUIC went from working to ERR_TIMED_OUT the moment BC was
- * on the classpath, and recovered the moment it was removed).
+ * **X25519 is hand-rolled (RFC 7748), NOT a provider.** Two failed
+ * approaches before this:
+ *  1. BouncyCastle — broke kwik and every other JCA crypto user in
+ *     the app (Android's bundled `org.bouncycastle.*` collides with
+ *     a second full BC; confirmed by isolation test).
+ *  2. Platform `XDH` KeyAgreement — works on Pixel but throws
+ *     `No AlgorithmParameterSpec classes are supported` on Samsung's
+ *     Conscrypt. Android's XDH support is inconsistent across
+ *     vendors and API levels.
  *
- * So we use the platform's `XDH` KeyAgreement (Conscrypt) instead.
- * X25519 via `XDH` is available on API 33+ (and on the API 36
- * devices we target). On older devices `KeyPairGenerator`/
- * `KeyAgreement` throw `NoSuchAlgorithmException`, which surfaces
- * as a handshake failure and the agent falls back to TCP or kwik.
- * No third-party dependency, no package conflict.
+ * So we compute X25519 ourselves with `BigInteger` modular math
+ * over GF(2^255 - 19) and the Montgomery ladder (RFC 7748 §5).
+ * Deterministic, identical on every device, zero provider deps.
+ * NOT constant-time — acceptable here because the shared secret
+ * is a one-shot QUIC handshake value, not a long-lived key, and
+ * the agent runs on the user's own device (no remote timing
+ * oracle). Everything else (HKDF, AES-GCM, SHA-256) stays on the
+ * JDK, which is uniform since API 21.
  */
 internal object TlsCrypto {
 
@@ -46,68 +42,120 @@ internal object TlsCrypto {
     /** 32 random bytes for the ClientHello.random field. */
     fun randomBytes(n: Int): ByteArray = ByteArray(n).also { rng.nextBytes(it) }
 
-    // ── X25519 (RFC 7748 §6.1) via the platform XDH provider ───
+    // ── X25519 (RFC 7748 §5) — hand-rolled BigInteger ladder ───
 
-    /** Holds the raw 32-byte public key (for the ClientHello key
-     *  share) and the live [PrivateKey] object (for ECDH — we keep
-     *  the object rather than raw scalar bytes because some
-     *  providers don't expose the scalar). */
-    class X25519KeyPair(val publicKey: ByteArray, val privateKey: PrivateKey) {
-        init { require(publicKey.size == 32) { "X25519 public key must be 32 bytes" } }
+    /** Raw 32-byte public and private (scalar) keys, both little-endian. */
+    class X25519KeyPair(val publicKey: ByteArray, val privateKey: ByteArray) {
+        init {
+            require(publicKey.size == 32) { "X25519 public key must be 32 bytes" }
+            require(privateKey.size == 32) { "X25519 private key must be 32 bytes" }
+        }
     }
 
-    private val x25519Params = NamedParameterSpec("X25519")
+    /** Field prime 2^255 - 19. */
+    private val P25519: BigInteger = BigInteger.ONE.shiftLeft(255).subtract(BigInteger.valueOf(19))
+    /** Montgomery curve constant (A-2)/4 = 121665. */
+    private val A24: BigInteger = BigInteger.valueOf(121665L)
+    /** Base point u-coordinate = 9 (little-endian: byte 0 = 9, rest 0). */
+    private val BASE_POINT: ByteArray = ByteArray(32).also { it[0] = 9 }
 
-    /** Generate a fresh X25519 key pair via the platform provider. */
+    /** Generate a key pair: random 32-byte scalar, public =
+     *  X25519(scalar, basepoint). */
     fun generateX25519KeyPair(): X25519KeyPair {
-        val kpg = KeyPairGenerator.getInstance("XDH")
-        kpg.initialize(x25519Params)
-        val kp = kpg.generateKeyPair()
-        val pubRaw = encodeU((kp.public as XECPublicKey).u)
-        return X25519KeyPair(pubRaw, kp.private)
+        val priv = randomBytes(32)
+        val pub = scalarMult(priv, BASE_POINT)
+        return X25519KeyPair(pub, priv)
     }
 
     /**
-     * X25519 ECDH between our [privateKey] and the peer's raw
-     * 32-byte public key. RFC 7748 §6.1 — reject the all-zero
-     * shared secret (small-order point attack).
+     * X25519 ECDH: X25519(our_scalar, peer_u). RFC 7748 §6.1 —
+     * reject the all-zero output (small-order point attack).
      */
-    fun x25519(privateKey: PrivateKey, peerPublicKey: ByteArray): ByteArray {
-        require(peerPublicKey.size == 32) { "peer X25519 key must be 32 bytes" }
-        val kf = KeyFactory.getInstance("XDH")
-        val peerPub = kf.generatePublic(XECPublicKeySpec(x25519Params, decodeU(peerPublicKey)))
-        val ka = KeyAgreement.getInstance("XDH")
-        ka.init(privateKey)
-        ka.doPhase(peerPub, true)
-        val out = ka.generateSecret()
-        if (out.size != 32 || out.all { it == 0.toByte() }) {
-            throw TlsException("x25519 produced invalid shared secret (len=${out.size})")
+    fun x25519(privateKey: ByteArray, peerPublicKey: ByteArray): ByteArray {
+        require(privateKey.size == 32 && peerPublicKey.size == 32)
+        val out = scalarMult(privateKey, peerPublicKey)
+        if (out.all { it == 0.toByte() }) {
+            throw TlsException("x25519 yielded all-zero shared secret (peer used small-order point)")
         }
         return out
     }
 
-    /** Encode an X25519 u-coordinate [BigInteger] as 32 bytes,
-     *  little-endian (RFC 7748 wire format). */
-    private fun encodeU(u: BigInteger): ByteArray {
-        val be = u.toByteArray()  // big-endian, possibly with a leading sign byte
-        val out = ByteArray(32)   // little-endian, zero-padded
-        var src = be.size - 1     // least-significant byte of the value
-        var dst = 0
-        while (src >= 0 && dst < 32) {
-            out[dst] = be[src]
-            src--; dst++
+    /**
+     * The X25519 function (RFC 7748 §5): clamp the scalar, decode
+     * the u-coordinate, run the Montgomery ladder, return the
+     * 32-byte little-endian result.
+     */
+    private fun scalarMult(scalarBytes: ByteArray, uBytes: ByteArray): ByteArray {
+        // Clamp the scalar (RFC 7748 §5).
+        val k = scalarBytes.copyOf(32)
+        k[0] = (k[0].toInt() and 248).toByte()
+        k[31] = ((k[31].toInt() and 127) or 64).toByte()
+        val kInt = decodeLE(k)
+
+        // Decode u, masking the high bit of the last byte.
+        val u = uBytes.copyOf(32)
+        u[31] = (u[31].toInt() and 127).toByte()
+        val x1 = decodeLE(u).mod(P25519)
+
+        var x2 = BigInteger.ONE
+        var z2 = BigInteger.ZERO
+        var x3 = x1
+        var z3 = BigInteger.ONE
+        var swap = 0
+
+        for (t in 254 downTo 0) {
+            val kt = if (kInt.testBit(t)) 1 else 0
+            swap = swap xor kt
+            if (swap == 1) {
+                var tmp = x2; x2 = x3; x3 = tmp
+                tmp = z2; z2 = z3; z3 = tmp
+            }
+            swap = kt
+
+            val a = x2.add(z2).mod(P25519)
+            val aa = a.multiply(a).mod(P25519)
+            val b = x2.subtract(z2).mod(P25519)
+            val bb = b.multiply(b).mod(P25519)
+            val e = aa.subtract(bb).mod(P25519)
+            val c = x3.add(z3).mod(P25519)
+            val d = x3.subtract(z3).mod(P25519)
+            val da = d.multiply(a).mod(P25519)
+            val cb = c.multiply(b).mod(P25519)
+            val x3s = da.add(cb).mod(P25519)
+            x3 = x3s.multiply(x3s).mod(P25519)
+            val z3s = da.subtract(cb).mod(P25519)
+            z3 = x1.multiply(z3s.multiply(z3s).mod(P25519)).mod(P25519)
+            x2 = aa.multiply(bb).mod(P25519)
+            z2 = e.multiply(aa.add(A24.multiply(e).mod(P25519)).mod(P25519)).mod(P25519)
         }
-        return out
+        if (swap == 1) {
+            var tmp = x2; x2 = x3; x3 = tmp
+            tmp = z2; z2 = z3; z3 = tmp
+        }
+
+        // x2 / z2 = x2 * z2^(p-2) mod p (Fermat inverse).
+        val zInv = z2.modPow(P25519.subtract(BigInteger.TWO), P25519)
+        val result = x2.multiply(zInv).mod(P25519)
+        return encodeLE32(result)
     }
 
-    /** Decode a 32-byte little-endian X25519 public key into the
-     *  u-coordinate [BigInteger] the JCA spec expects. */
-    private fun decodeU(raw: ByteArray): BigInteger {
-        // Reverse to big-endian, prepend a zero byte to force a
-        // positive BigInteger regardless of the high bit.
-        val be = ByteArray(raw.size + 1)
-        for (i in raw.indices) be[be.size - 1 - i] = raw[i]
+    /** 32-byte little-endian → BigInteger (positive). */
+    private fun decodeLE(le: ByteArray): BigInteger {
+        val be = ByteArray(le.size + 1)  // +1 leading zero forces positive
+        for (i in le.indices) be[be.size - 1 - i] = le[i]
         return BigInteger(be)
+    }
+
+    /** BigInteger → 32-byte little-endian (truncated / zero-padded). */
+    private fun encodeLE32(n: BigInteger): ByteArray {
+        val out = ByteArray(32)
+        var v = n
+        val mask = BigInteger.valueOf(0xFFL)
+        for (i in 0 until 32) {
+            out[i] = v.and(mask).toInt().toByte()
+            v = v.shiftRight(8)
+        }
+        return out
     }
 
     // ── SHA-256 ───────────────────────────────────────────────
