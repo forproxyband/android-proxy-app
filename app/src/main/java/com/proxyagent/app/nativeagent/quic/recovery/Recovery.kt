@@ -55,6 +55,15 @@ internal class SpaceRecovery(val space: PacketNumberSpace) {
     private var largestAckedSent: Long = -1L
     private var largestAckedSentTime: Long = -1L
     private var ackElicitingOutstanding: Long = 0L
+    /** True when we've received an ack-eliciting packet that hasn't
+     *  yet been covered by an ACK frame we sent. The sender consults
+     *  (and clears) this via [consumeAckPending] so we emit an ACK
+     *  ONLY when there's something new to acknowledge — RFC 9000
+     *  §13.2.1. Without this gate we flooded ~50 ACK-only packets/sec
+     *  (one per sender-loop tick), which looks like a misbehaving
+     *  client to quic-go's flood protection and burned packet-number
+     *  space. */
+    private var ackPending = false
     private val lock = ReentrantLock()
 
     /** Result of detectLost: frames to re-send + bytes freed. */
@@ -67,14 +76,26 @@ internal class SpaceRecovery(val space: PacketNumberSpace) {
     }
 
     /** Called when we receive a packet (any packet). Used to
-     *  build the next ACK frame. */
+     *  build the next ACK frame. Sets [ackPending] when the packet
+     *  is ack-eliciting so the sender knows to emit an ACK. */
     fun onPacketReceived(packetNumber: Long, ackEliciting: Boolean) = lock.withLock {
         received.add(packetNumber)
+        if (ackEliciting) ackPending = true
         if (received.size > MAX_RANGES_BUFFERED) {
             // Drop the smallest entries — they're so old the peer
             // has stopped caring. Keeps the ACK-frame size bounded.
             received.pollFirst()
         }
+    }
+
+    /** Returns true (and clears the flag) if we owe the peer an ACK
+     *  for ack-eliciting packets received since our last ACK. The
+     *  sender calls this once per loop tick; only when it returns
+     *  true do we actually build + emit an ACK frame. */
+    fun consumeAckPending(): Boolean = lock.withLock {
+        val p = ackPending
+        ackPending = false
+        p
     }
 
     /**

@@ -571,10 +571,14 @@ internal class Connection(
                     }
                 }
 
-                // Priority 2: ACK frames where ack-eliciting packets are outstanding.
+                // Priority 2: ACK frames — but ONLY when we actually
+                // owe one (received an ack-eliciting packet since the
+                // last ACK). Previously we emitted an ACK every tick
+                // unconditionally → ~50 ACK-only packets/sec flood.
                 for (space in listOf(PacketNumberSpace.INITIAL, PacketNumberSpace.HANDSHAKE, PacketNumberSpace.ONE_RTT)) {
                     val cs = spaceFor(space)
                     if (!cs.ready()) continue
+                    if (!cs.recovery.consumeAckPending()) continue
                     val ack = cs.recovery.buildAckFrame(0L, peerTransportParameters?.ackDelayExponent ?: 3)
                     if (ack != null) {
                         emitPacketInSpace(space, listOf(ack), ackEliciting = false, inFlight = false)
