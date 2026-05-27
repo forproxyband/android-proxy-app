@@ -188,7 +188,10 @@ backed by `tech.kwik:kwik:0.10.10`. Tuning mirrors
 `proxy-agent-sdk-go/internal/netagent/quic_tuning.go` where the kwik
 builder exposes the equivalent:
 
-- `defaultStreamReceiveBufferSize(8 MB)` — initial per-stream window.
+- `defaultStreamReceiveBufferSize(16 MiB)` — per-stream receive window.
+  Side-effect (kwik internals): also raises the connection-level cap
+  to 10× this value (160 MiB) — enough headroom for several parallel
+  upload tunnels.
 - `maxOpenPeerInitiatedBidirectionalStreams(1024)` — peer-initiated
   stream cap.
 - `socketFactory` builds a `DatagramSocket` with `receiveBufferSize` /
@@ -197,10 +200,24 @@ builder exposes the equivalent:
   the OS gives.
 - `keepAlive(20)` matches the Go config's `KeepAlivePeriod`.
 
-Brutal congestion control is **not portable** — kwik exposes no CC
-plugin point, so the QUIC path uses kwik's NewReno-based controller.
-Server-side Brutal still operates if configured. On very lossy
-uplinks expect lower upload throughput than the Go agent.
+**Congestion control — FixedWindow swap.** Brutal CC isn't portable
+to kwik (no CC plugin point on the builder), and kwik's default
+NewReno caps QUIC send-side throughput around 40 Mbps on healthy
+~86 ms RTT paths (slow-start + multiplicative decrease on spurious
+loss). To match the BINARY engine's Brutal-paced ~92 Mbps, the
+factory reflectively replaces `SenderImpl.congestionController` with
+`tech.kwik.core.cc.FixedWindowCongestionController` carrying a 16 MiB
+fixed window (≈ 1.5 Gbps ceiling at 86 ms RTT — well above the link).
+`FixedWindowCC` inherits all the bytes-in-flight accounting from
+`AbstractCongestionController` but never modifies the window — same
+"trust the link" behavior as Brutal without re-implementing the CC.
+Outcome is logged as `uplink: QUIC congestion control state=swapped`
+(or `skipped:<reason>` on fallback). The swap is best-effort: any
+reflection failure leaves NewReno in place — connection still works
+at the original throughput. Pin kwik or re-verify
+`KwikQuicTransport.Companion.swapToFixedWindowCC` on dependency
+bumps (field names `sender`, `congestionController`, `bytesInFlight`,
+`log` must still exist).
 
 ALPN is `proxy-tunnel/1`, certificate validation is disabled
 (`noServerCertificateCheck()` — same posture as the Go SDK's

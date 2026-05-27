@@ -1103,6 +1103,12 @@ internal class Uplink(
         controlOutput = BufferedOutputStream(stream.output)
         agent.logInfo("uplink: QUIC control established",
             "endpoint" to "${creds.host}:${creds.port}")
+        // Surface kwik's CC swap result so agent.log shows which CC
+        // is in effect. `swapped` = FixedWindow pacing (high download
+        // throughput); `skipped:<reason>` = fell back to NewReno
+        // (lower download throughput, see KwikQuicTransport.ccSwapState).
+        agent.logInfo("uplink: QUIC congestion control",
+            "state" to KwikQuicTransport.ccSwapState)
     }
 
     private fun cleanupTransport() {
