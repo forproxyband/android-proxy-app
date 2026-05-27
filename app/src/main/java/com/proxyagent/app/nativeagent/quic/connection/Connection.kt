@@ -496,6 +496,16 @@ internal class Connection(
     /** CRYPTO frame data we owe to the wire, per space. */
     private val pendingCrypto = ConcurrentHashMap<PacketNumberSpace, ByteArray>()
 
+    /** Timestamp (ns) of last ack-eliciting packet we sent in 1-RTT.
+     *  Used by the PING keepalive heuristic — if we go too long without
+     *  sending anything ack-eliciting, the server's application-layer
+     *  routing may classify us as idle and stop routing tunnels through
+     *  us (this matched kwik's `keepAlive(20)` behavior — without it,
+     *  proxy-server-go appears to drop us from the active agent pool
+     *  even though the QUIC connection itself is healthy). */
+    @Volatile private var lastAckElicitingSendNanos: Long = System.nanoTime()
+    private val keepAliveIntervalNanos: Long = 15_000_000_000L  // 15 s
+
     private fun queueCryptoData(space: PacketNumberSpace, data: ByteArray) {
         pendingCrypto.merge(space, data) { a, b -> a + b }
     }
@@ -544,6 +554,17 @@ internal class Connection(
 
                 // Priority 4: STREAM frames, paced.
                 if (oneRttSpace.ready()) drainStreams()
+
+                // Priority 5: PING keepalive. ACK frames are not
+                // ack-eliciting; if we send only ACKs for too long, the
+                // peer's application layer may consider us idle. Mirrors
+                // kwik's `keepAlive(20)` — without this, proxy-server-go
+                // observed agents stuck "connected but never routed to".
+                if (oneRttSpace.ready() &&
+                    System.nanoTime() - lastAckElicitingSendNanos > keepAliveIntervalNanos) {
+                    log("send PING (keepalive after ${(System.nanoTime() - lastAckElicitingSendNanos) / 1_000_000}ms idle)")
+                    emitOneRttPacket(listOf(Ping))
+                }
             } catch (t: Throwable) {
                 if (!closed.get()) {
                     // TODO: log via callback
@@ -681,6 +702,12 @@ internal class Connection(
             frames = frames,
         ))
         if (inFlight) cc.onPacketSent(fullPacket.size)
+        // Update the keepalive heuristic: PINGs, STREAM, CRYPTO, etc.
+        // are ack-eliciting and reset the idle counter. Pure-ACK
+        // packets don't.
+        if (ackEliciting && space == PacketNumberSpace.ONE_RTT) {
+            lastAckElicitingSendNanos = nowNanos
+        }
 
         // Send on wire.
         try {
