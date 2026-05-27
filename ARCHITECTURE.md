@@ -303,8 +303,27 @@ that are easy to regress:
 - **Per-packet wire logs are gated behind `Connection.verboseWire`
   (default off).** At line rate the per-send / per-ACK / per-STREAM
   logs fire ~10k×/s, flooding logcat and throttling the sender thread.
-  The 5-second `stats:` line is the always-on diagnostic; flip
+  The 5-second `stats:` line is the always-on diagnostic (mirrored into
+  the exportable agent log via `Connection.externalStatLog`); flip
   `verboseWire` on only for deep wire debugging.
+
+- **Loss recovery: retransmit frames VERBATIM, and keep the PTO.**
+  Two bugs here stalled every transfer right after the handshake (build
+  91: `stream_frames` frozen, `cc.in_flight` never draining):
+  1. *Retransmit must preserve stream offsets.* A lost STREAM frame is
+     re-queued onto `pendingRetransmit` and re-emitted exactly as sent.
+     Do NOT push its bytes back through `SendBuffer` — `pollSendFrame`
+     stamps a fresh `offset = sendOffset` (already advanced past it),
+     punching a hole in the byte stream so the receiver waits forever.
+  2. *PTO is mandatory.* Packet-threshold loss detection needs 3 *later*
+     packets ACKed, so a packet lost at the tail of a burst is never
+     detected. The `senderLoop` PTO retransmits the oldest unacked
+     ack-eliciting packet when no ACK has progressed within
+     `max(3·sRTT, 250 ms) << backoff`, reset on ACK progress. Without
+     it, one tail-lost packet kills the connection (and lost
+     ClientHello/Finished caused the multi-retry handshake). Also
+     `CryptoSpace.largestAckedSentPn` must be updated from incoming ACKs
+     — it anchors the sent-PN encoding length (RFC 9000 §A.2).
 
 ### NATIVE engine TCP fast path
 

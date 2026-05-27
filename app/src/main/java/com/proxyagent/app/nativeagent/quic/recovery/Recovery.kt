@@ -176,6 +176,38 @@ internal class SpaceRecovery(val space: PacketNumberSpace) {
 
     fun hasAckEliciting(): Boolean = lock.withLock { ackElicitingOutstanding > 0 }
 
+    /** Number of packets still tracked (sent, not yet acked or
+     *  declared lost). Diagnostic + PTO gating. */
+    fun outstandingCount(): Int = lock.withLock { sent.size }
+
+    /** What [takeOldestAckElicitingForRetransmit] hands back. */
+    data class Retransmittable(val frames: List<Frame>, val sizeBytes: Int, val inFlight: Boolean)
+
+    /**
+     * PTO probe support: remove and return the OLDEST still-unacked
+     * ack-eliciting packet so the caller can retransmit its frames —
+     * with their ORIGINAL stream offsets preserved — in a fresh
+     * packet, and free the original's in-flight bytes. Returns null
+     * if nothing ack-eliciting is outstanding.
+     *
+     * We remove it (treat as lost) rather than leave it tracked so
+     * in-flight accounting doesn't inflate across repeated PTOs; a
+     * late ACK for the original simply won't find it in [sent], which
+     * is harmless (the retransmit carries the same bytes/offset).
+     */
+    fun takeOldestAckElicitingForRetransmit(): Retransmittable? = lock.withLock {
+        val it = sent.entries.iterator()
+        while (it.hasNext()) {
+            val (_, p) = it.next()
+            if (p.ackEliciting) {
+                it.remove()
+                ackElicitingOutstanding = (ackElicitingOutstanding - 1).coerceAtLeast(0L)
+                return@withLock Retransmittable(p.frames, p.sizeBytes, p.inFlight)
+            }
+        }
+        null
+    }
+
     fun largestAckedSentTime(): Long = lock.withLock { largestAckedSentTime }
     fun largestAckedSent(): Long = lock.withLock { largestAckedSent }
 

@@ -426,12 +426,25 @@ internal class Connection(
             when (frame) {
                 is Padding, is Ping -> { /* nothing to do */ }
                 is Ack -> {
-                    val acked = spaceFor(space).recovery.processAckFrame(frame, peerTransportParameters?.ackDelayExponent ?: 3)
+                    val cs = spaceFor(space)
+                    // Maintain the PN-encoding anchor (largest PN the peer has
+                    // acknowledged). This was NEVER updated before — stuck at
+                    // -1 — so emitPacketInSpace sized every sent PN off the
+                    // absolute value rather than the in-flight range (RFC 9000
+                    // §A.2) and could desync once many packets were outstanding.
+                    if (frame.largestAcked > cs.largestAckedSentPn) cs.largestAckedSentPn = frame.largestAcked
+                    val acked = cs.recovery.processAckFrame(frame, peerTransportParameters?.ackDelayExponent ?: 3)
                     val now = System.nanoTime()
                     for (p in acked) {
                         cc.onPacketAcked(p.sizeBytes, now - p.sentTimeNanos)
                     }
-                    val loss = spaceFor(space).recovery.detectLost()
+                    // ACK progress resets the PTO timer + backoff so the probe
+                    // only fires when the peer truly goes quiet on us.
+                    if (acked.isNotEmpty()) {
+                        lastAckProgressNanos = now
+                        ptoBackoff = 0
+                    }
+                    val loss = cs.recovery.detectLost()
                     for (f in loss.framesToRetransmit) requeueLostFrame(space, f)
                     if (loss.bytesLost > 0) cc.onPacketLost(loss.bytesLost.toInt())
                     // Log incoming ACKs for the 1-RTT space only (Initial/
@@ -555,6 +568,24 @@ internal class Connection(
     @Volatile private var lastAckElicitingSendNanos: Long = System.nanoTime()
     private val keepAliveIntervalNanos: Long = 15_000_000_000L  // 15 s
 
+    // ── Loss recovery: retransmit queue + PTO ─────────────────
+    //
+    // Frames to retransmit AS-IS, preserving their original stream
+    // offsets. CRITICAL: a lost STREAM frame must be re-emitted with
+    // its ORIGINAL offset — the old requeueLostFrame wrote the bytes
+    // back through SendBuffer, where pollSendFrame then stamped a
+    // fresh (higher) offset, punching a hole in the byte stream and
+    // stalling the receiver. Drained ahead of new STREAM data.
+    private val pendingRetransmit =
+        java.util.concurrent.ConcurrentLinkedQueue<Pair<PacketNumberSpace, Frame>>()
+    /** Wall-clock of the last ACK that made progress (advanced the
+     *  largest-acked / acked new packets). The PTO timer measures
+     *  from here: if ack-eliciting data is outstanding and no ACK
+     *  progresses for the PTO interval, we probe-retransmit. */
+    @Volatile private var lastAckProgressNanos: Long = System.nanoTime()
+    /** Exponential PTO backoff exponent; reset to 0 on ACK progress. */
+    @Volatile private var ptoBackoff: Int = 0
+
     // ── Send pacing (token bucket) ────────────────────────────
     //
     // Why a token bucket instead of Brutal CC's per-packet
@@ -610,17 +641,26 @@ internal class Connection(
         it.sendBuffer.queuedBytes > 0 || (it.sendBuffer.closed && !it.sentFin)
     }
 
+    /** True if any packet-number space has ack-eliciting packets in
+     *  flight — gates the PTO timer so it idles when nothing's pending. */
+    private fun anyAckElicitingOutstanding(): Boolean =
+        initialSpace.recovery.hasAckEliciting() ||
+        handshakeSpace.recovery.hasAckEliciting() ||
+        oneRttSpace.recovery.hasAckEliciting()
+
     private fun queueCryptoData(space: PacketNumberSpace, data: ByteArray) {
         pendingCrypto.merge(space, data) { a, b -> a + b }
     }
 
     private fun requeueLostFrame(space: PacketNumberSpace, f: Frame) {
-        // Simplification: only re-queue CRYPTO and STREAM frames.
-        // Other frame types are state-driven and get re-emitted
-        // naturally by their owning subsystem.
+        // Only CRYPTO and STREAM carry data worth retransmitting; other
+        // frame types are state-driven and re-emitted by their owning
+        // subsystem. Re-emit the ORIGINAL frame verbatim (same offset
+        // and bytes) — do NOT round-trip through SendBuffer, which would
+        // reassign a fresh offset and corrupt the stream.
         when (f) {
-            is Crypto -> queueCryptoData(space, f.data)
-            is StreamFrame -> streams[f.streamId]?.sendBuffer?.write(f.data)
+            is Crypto -> pendingRetransmit.offer(space to f)
+            is StreamFrame -> pendingRetransmit.offer(space to f)
             else -> {}
         }
     }
@@ -650,7 +690,12 @@ internal class Connection(
                         " streams_map=${streams.size}" +
                         " cc.in_flight=${cc.bytesInFlight}" +
                         " cc.cwnd=${cc.congestionWindow}" +
-                        " flow.send_credit=${flow.sendCredit()}")
+                        " flow.send_credit=${flow.sendCredit()}" +
+                        " 1rtt[sent_pn=${oneRttSpace.nextSendPn - 1}" +
+                        " acked_pn=${oneRttSpace.recovery.largestAckedSent()}" +
+                        " recv_pn=${oneRttSpace.largestReceivedPn}" +
+                        " outstanding=${oneRttSpace.recovery.outstandingCount()}" +
+                        " pto_backoff=$ptoBackoff]")
                     lastStatsLogNanos = now
                 }
 
@@ -700,6 +745,50 @@ internal class Connection(
                             emitOneRttPacket(listOf(MaxStreamData(id, newMax)))
                         }
                     }
+                }
+
+                // Priority 3c: PTO — recover from TAIL loss. Threshold loss
+                // detection needs 3 LATER packets acked; a packet lost at the
+                // end of a burst (nothing sent after it) is never detected, so
+                // without this the stream stalls forever and cc.in_flight never
+                // drains (exactly the build-91 freeze, and the repeated
+                // handshake timeouts when a ClientHello/Finished is lost). If
+                // ack-eliciting data is outstanding and no ACK has progressed
+                // for the PTO interval, retransmit the oldest unacked packet's
+                // frames (with their ORIGINAL offsets), backing off each time.
+                if (anyAckElicitingOutstanding()) {
+                    val ptoNanos = maxOf(cc.smoothedRttNanos * 3, 250_000_000L) shl ptoBackoff.coerceAtMost(6)
+                    if (System.nanoTime() - lastAckProgressNanos > ptoNanos) {
+                        var probed = false
+                        for (sp in listOf(PacketNumberSpace.INITIAL, PacketNumberSpace.HANDSHAKE, PacketNumberSpace.ONE_RTT)) {
+                            val cs = spaceFor(sp)
+                            if (!cs.ready()) continue
+                            val r = cs.recovery.takeOldestAckElicitingForRetransmit() ?: continue
+                            if (r.inFlight) cc.onPacketLost(r.sizeBytes)
+                            var enq = false
+                            for (f in r.frames) if (f is Crypto || f is StreamFrame) {
+                                pendingRetransmit.offer(sp to f); enq = true
+                            }
+                            // Nothing concrete to resend (e.g. a PING-only
+                            // packet) — send a fresh PING to elicit an ACK.
+                            if (!enq) emitPacketInSpace(sp, listOf(Ping), ackEliciting = true, inFlight = true)
+                            probed = true
+                        }
+                        if (probed) {
+                            ptoBackoff++
+                            lastAckProgressNanos = System.nanoTime()
+                            log("PTO probe (backoff=$ptoBackoff)")
+                        }
+                    }
+                }
+
+                // Priority 3d: drain the retransmit queue — re-emit lost/probe
+                // frames verbatim (original offsets) in fresh packets.
+                while (true) {
+                    val rt = pendingRetransmit.poll() ?: break
+                    val cs = spaceFor(rt.first)
+                    if (!cs.ready()) continue  // space discarded (e.g. post-handshake Initial)
+                    emitPacketInSpace(rt.first, listOf(rt.second), ackEliciting = true, inFlight = true)
                 }
 
                 // Priority 4: STREAM frames, paced via the token bucket.
