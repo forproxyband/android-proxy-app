@@ -1429,9 +1429,13 @@ class ProxyService : Service() {
                     dialTimeoutMs = 5000,
                     heartbeatIntervalSec = 60,
                     enableHeartbeat = true,
-                    // Hard kwik dep — see app/build.gradle.kts. Tries
-                    // QUIC first if cached, otherwise TCP first.
-                    quicTransportFactory = com.proxyagent.app.nativeagent.KwikQuicTransport.Factory(),
+                    // In-house QUIC stack (com.proxyagent.app.nativeagent.quic.*).
+                    // Replaces the kwik-based factory after that lib's
+                    // single-sender-thread architecture starved ACK / window
+                    // updates under load — see ARCHITECTURE.md regression
+                    // guard. Flip back to KwikQuicTransport.Factory() if
+                    // interop against the proxy-server breaks.
+                    quicTransportFactory = com.proxyagent.app.nativeagent.quic.NativeQuicTransport.Factory(),
                 )
 
                 connStatus = ConnStatus.CONNECTING

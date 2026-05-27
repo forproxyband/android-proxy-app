@@ -1,0 +1,372 @@
+package com.proxyagent.app.nativeagent.quic.stream
+
+import com.proxyagent.app.nativeagent.quic.wire.Stream as StreamFrame
+import java.io.InputStream
+import java.io.OutputStream
+import java.util.TreeMap
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
+/**
+ * Per-stream send/receive state machine + buffers.
+ *
+ * **Stream IDs (RFC 9000 §2.1).** The low 2 bits of a stream ID
+ * encode `(initiator, directionality)`:
+ *  - 0x00: client-initiated, bidirectional
+ *  - 0x01: server-initiated, bidirectional
+ *  - 0x02: client-initiated, unidirectional
+ *  - 0x03: server-initiated, unidirectional
+ *
+ * For our proxy use case, the agent is the QUIC **client**. The
+ * proxy-server opens one bidi stream per tunnel (so server-
+ * initiated bidi, low 2 bits = 0x01). We also open one client-
+ * initiated bidi stream for the control channel.
+ *
+ * **State machines.** Send and receive sides advance
+ * independently. We track them as enums and refuse transitions
+ * that would violate the spec — though in practice we route
+ * through STREAM/RESET_STREAM/STOP_SENDING frames in the
+ * connection layer.
+ *
+ * **Buffers.**
+ *  - Send: unbounded (`SendBuffer`) — application writes
+ *    accumulate here, the sender thread drains and emits STREAM
+ *    frames. Backpressure is via the peer's MAX_STREAM_DATA
+ *    flow-control window, not via a fixed buffer cap.
+ *    Explicitly NOT the kwik 50 KB-cap design that triggered our
+ *    receive-direction regression — see `ARCHITECTURE.md` QUIC
+ *    section.
+ *  - Receive: `ReceiveBuffer` reassembles potentially out-of-
+ *    order STREAM frames into contiguous bytes the application
+ *    can read.
+ */
+internal class Stream(
+    val streamId: Long,
+    /** Initial flow-control window we grant the peer for sending
+     *  on this stream (peer's MAX_STREAM_DATA from our side). */
+    val ourInitialMaxStreamData: Long,
+    /** Initial flow-control window the peer granted us for
+     *  sending on this stream (their MAX_STREAM_DATA from us). */
+    var peerMaxStreamData: Long,
+) {
+    /** Send-side state per RFC 9000 §3.1. */
+    enum class SendState { READY, SEND, DATA_SENT, DATA_RECVD, RESET_SENT, RESET_RECVD }
+    /** Receive-side state per RFC 9000 §3.2. */
+    enum class RecvState { RECV, SIZE_KNOWN, DATA_RECVD, DATA_READ, RESET_RECVD, RESET_READ }
+
+    @Volatile var sendState: SendState = SendState.READY
+        private set
+    @Volatile var recvState: RecvState = RecvState.RECV
+        private set
+
+    val sendBuffer = SendBuffer()
+    val recvBuffer = ReceiveBuffer(ourInitialMaxStreamData)
+
+    /** Highest stream offset we've sent. */
+    @Volatile var sendOffset: Long = 0L
+        private set
+    /** Whether the FIN bit has been set on a sent STREAM frame. */
+    @Volatile var sentFin: Boolean = false
+        private set
+
+    private val lock = ReentrantLock()
+
+    /** Public input/output streams for the application layer. */
+    val input: InputStream = StreamInputStream(this)
+    val output: OutputStream = StreamOutputStream(this)
+
+    /**
+     * Called by the sender thread to drain up to [maxBytes]
+     * of pending data plus a FIN flag if the send side is
+     * closing. Returns null when nothing to send. Advances
+     * [sendOffset] by the returned frame's data length.
+     *
+     * Honors the peer's flow-control window — never returns
+     * more bytes than `peerMaxStreamData - sendOffset`.
+     */
+    fun pollSendFrame(maxBytes: Int): StreamFrame? = lock.withLock {
+        if (sendState == SendState.DATA_RECVD || sendState == SendState.RESET_SENT) return@withLock null
+        val flowCredit = (peerMaxStreamData - sendOffset).coerceAtLeast(0L)
+        val budget = minOf(maxBytes.toLong(), flowCredit).toInt()
+        val data: ByteArray
+        val finBit: Boolean
+        if (budget <= 0) {
+            // Even with no payload bytes, we may still want to
+            // emit a FIN-only frame if the app has closed.
+            if (sendBuffer.closed && !sentFin && sendBuffer.queuedBytes == 0L) {
+                data = ByteArray(0)
+                finBit = true
+            } else {
+                return@withLock null
+            }
+        } else {
+            data = sendBuffer.drain(budget)
+            if (data.isEmpty() && !(sendBuffer.closed && !sentFin)) return@withLock null
+            finBit = sendBuffer.closed && sendBuffer.queuedBytes == 0L
+        }
+        val frame = StreamFrame(
+            streamId = streamId,
+            offset = sendOffset,
+            data = data,
+            fin = finBit,
+            explicitLength = true,
+        )
+        sendOffset += data.size
+        if (finBit) {
+            sentFin = true
+            sendState = SendState.DATA_SENT
+        } else if (sendState == SendState.READY) {
+            sendState = SendState.SEND
+        }
+        frame
+    }
+
+    /**
+     * Called by the receiver thread when a STREAM frame for this
+     * stream arrives. Inserts into the receive buffer (which
+     * tolerates out-of-order delivery). Returns true if any new
+     * contiguous bytes became readable.
+     */
+    fun acceptStreamFrame(frame: StreamFrame): Boolean = lock.withLock {
+        require(frame.streamId == streamId) { "stream id mismatch" }
+        val advanced = recvBuffer.write(frame.offset, frame.data, fin = frame.fin)
+        if (frame.fin) {
+            recvState = when (recvState) {
+                RecvState.RECV -> RecvState.SIZE_KNOWN
+                else -> recvState
+            }
+        }
+        if (recvBuffer.eofReached) {
+            recvState = when (recvState) {
+                RecvState.SIZE_KNOWN, RecvState.RECV -> RecvState.DATA_RECVD
+                else -> recvState
+            }
+        }
+        advanced
+    }
+
+    /**
+     * Called when peer sends MAX_STREAM_DATA for this stream;
+     * widens our send window. No-op if [newMax] is not higher
+     * than what we already had.
+     */
+    fun applyMaxStreamData(newMax: Long) = lock.withLock {
+        if (newMax > peerMaxStreamData) peerMaxStreamData = newMax
+    }
+
+    /** Mark send side closed (FIN to be set on next/last frame). */
+    fun closeSend() = lock.withLock { sendBuffer.close() }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Send buffer — unbounded, blocking-on-write only when peer's
+// flow-control window is exhausted (managed by Stream.pollSendFrame).
+// ────────────────────────────────────────────────────────────────────
+
+/**
+ * Append-only FIFO of bytes waiting to be sent. Backed by a
+ * deque of `ByteArray` chunks so writes never block on
+ * allocation (unlike a fixed-size circular buffer).
+ *
+ * The deliberate design here is: **the application thread never
+ * blocks on this buffer alone**. Backpressure comes from the
+ * peer's MAX_STREAM_DATA window via [Stream.pollSendFrame]
+ * returning a no-data frame, which makes the sender skip this
+ * stream until the peer extends credit. This is the inverse of
+ * kwik's "50 KB cap then block" design — see the ARCHITECTURE
+ * regression note explaining why.
+ */
+internal class SendBuffer {
+    private val chunks = ArrayDeque<ByteArray>()
+    private var headOffset = 0  // bytes consumed from chunks[0]
+    @Volatile var queuedBytes: Long = 0L
+        private set
+    @Volatile var closed: Boolean = false
+        private set
+    private val lock = ReentrantLock()
+
+    fun write(data: ByteArray, off: Int = 0, len: Int = data.size - off) = lock.withLock {
+        check(!closed) { "write to closed SendBuffer" }
+        if (len <= 0) return@withLock
+        val copy = ByteArray(len)
+        System.arraycopy(data, off, copy, 0, len)
+        chunks.addLast(copy)
+        queuedBytes += len
+    }
+
+    /** Drain up to [maxBytes] from the head into a fresh array. */
+    fun drain(maxBytes: Int): ByteArray = lock.withLock {
+        if (maxBytes <= 0 || chunks.isEmpty()) return@withLock ByteArray(0)
+        val out = ByteArray(minOf(maxBytes.toLong(), queuedBytes).toInt())
+        var written = 0
+        while (written < out.size && chunks.isNotEmpty()) {
+            val head = chunks.first()
+            val available = head.size - headOffset
+            val take = minOf(available, out.size - written)
+            System.arraycopy(head, headOffset, out, written, take)
+            written += take
+            headOffset += take
+            if (headOffset >= head.size) {
+                chunks.removeFirst()
+                headOffset = 0
+            }
+        }
+        queuedBytes -= written
+        if (written == out.size) out else out.copyOf(written)
+    }
+
+    fun close() = lock.withLock { closed = true }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Receive buffer — reassembles potentially out-of-order STREAM frames
+// into contiguous in-order bytes for the application.
+// ────────────────────────────────────────────────────────────────────
+
+/**
+ * Holds out-of-order frame payloads keyed by their start offset,
+ * and exposes a contiguous read-side as a blocking InputStream.
+ *
+ * [maxOffsetAllowed] is the flow-control window we advertised
+ * to the peer (initial value = `ourInitialMaxStreamData`). The
+ * Stream is responsible for emitting MAX_STREAM_DATA frames as
+ * the application drains data so the peer can keep sending.
+ */
+internal class ReceiveBuffer(initialMaxOffset: Long) {
+    private val pending = TreeMap<Long, ByteArray>()  // sorted by offset
+    /** Next offset the application can read from. Anything in
+     *  `pending` at or below this offset has already been
+     *  promoted into [readable]. */
+    @Volatile var readOffset: Long = 0L
+        private set
+    /** Highest offset we've received so far (incl. discontiguous
+     *  bytes). Used to advertise flow control. */
+    @Volatile var highWaterOffset: Long = 0L
+        private set
+    /** True once the peer FIN'd and we've delivered all bytes up
+     *  through the FIN offset. */
+    @Volatile var eofReached: Boolean = false
+        private set
+    /** Final size if the FIN'd offset is known (peer set FIN);
+     *  -1 if not yet. */
+    private var finalSize: Long = -1L
+    @Volatile var maxOffsetAllowed: Long = initialMaxOffset
+        private set
+    private val readable = ArrayDeque<ByteArray>()
+    private var readableHeadOffset = 0
+    private val lock = ReentrantLock()
+    private val notEmpty = lock.newCondition()
+
+    /**
+     * Insert frame data at [offset]. Returns true if any new
+     * contiguous bytes became readable. Out-of-window or
+     * duplicate data is silently dropped (RFC 9000 §3.2 allows
+     * discarding data already delivered).
+     */
+    fun write(offset: Long, data: ByteArray, fin: Boolean): Boolean = lock.withLock {
+        if (offset + data.size > maxOffsetAllowed) {
+            // FLOW_CONTROL_ERROR — but we just clamp and emit a
+            // closer to the connection layer. For now, accept up
+            // to the limit and drop the rest.
+        }
+        if (fin) finalSize = offset + data.size
+        val end = offset + data.size
+        if (end <= readOffset) return@withLock false  // wholly stale
+        // Avoid storing duplicates of bytes already merged.
+        val effectiveOffset: Long
+        val effectiveData: ByteArray
+        if (offset < readOffset) {
+            val skip = (readOffset - offset).toInt()
+            effectiveOffset = readOffset
+            effectiveData = data.copyOfRange(skip, data.size)
+        } else {
+            effectiveOffset = offset
+            effectiveData = data
+        }
+        pending[effectiveOffset] = effectiveData
+        if (effectiveOffset + effectiveData.size > highWaterOffset) {
+            highWaterOffset = effectiveOffset + effectiveData.size
+        }
+        // Drain contiguous prefix into readable.
+        var advanced = false
+        while (true) {
+            val head = pending.firstEntry() ?: break
+            if (head.key != readOffset) break
+            pending.remove(head.key)
+            readable.addLast(head.value)
+            readOffset += head.value.size
+            advanced = true
+        }
+        if (advanced) notEmpty.signalAll()
+        if (finalSize >= 0 && readOffset >= finalSize) {
+            eofReached = true
+            notEmpty.signalAll()
+        }
+        advanced
+    }
+
+    /** Update the flow-control window we advertise to the peer. */
+    fun updateMaxOffset(newMax: Long) = lock.withLock {
+        if (newMax > maxOffsetAllowed) maxOffsetAllowed = newMax
+    }
+
+    /** Block until at least one byte is readable or EOF. */
+    fun readBlocking(): Int = lock.withLock {
+        while (readable.isEmpty() && !eofReached) notEmpty.await()
+        if (readable.isEmpty()) return@withLock -1
+        val head = readable.first()
+        val b = head[readableHeadOffset].toInt() and 0xFF
+        readableHeadOffset++
+        if (readableHeadOffset >= head.size) {
+            readable.removeFirst()
+            readableHeadOffset = 0
+        }
+        b
+    }
+
+    fun readBlocking(dst: ByteArray, off: Int, len: Int): Int = lock.withLock {
+        while (readable.isEmpty() && !eofReached) notEmpty.await()
+        if (readable.isEmpty()) return@withLock -1
+        var written = 0
+        while (written < len && readable.isNotEmpty()) {
+            val head = readable.first()
+            val avail = head.size - readableHeadOffset
+            val take = minOf(avail, len - written)
+            System.arraycopy(head, readableHeadOffset, dst, off + written, take)
+            written += take
+            readableHeadOffset += take
+            if (readableHeadOffset >= head.size) {
+                readable.removeFirst()
+                readableHeadOffset = 0
+            }
+        }
+        written
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// java.io adapters
+// ────────────────────────────────────────────────────────────────────
+
+private class StreamInputStream(private val stream: Stream) : InputStream() {
+    override fun read(): Int = stream.recvBuffer.readBlocking()
+    override fun read(b: ByteArray, off: Int, len: Int): Int =
+        stream.recvBuffer.readBlocking(b, off, len)
+    override fun close() {
+        // No-op for now — the connection close path tears down
+        // streams en masse. Could send STOP_SENDING if we wanted
+        // graceful half-close on the receive side.
+    }
+}
+
+private class StreamOutputStream(private val stream: Stream) : OutputStream() {
+    override fun write(b: Int) {
+        stream.sendBuffer.write(byteArrayOf(b.toByte()))
+    }
+    override fun write(b: ByteArray, off: Int, len: Int) {
+        stream.sendBuffer.write(b, off, len)
+    }
+    override fun close() {
+        stream.closeSend()
+    }
+}

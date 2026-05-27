@@ -124,7 +124,18 @@ dependencies {
     // desugaring is enabled below to support minSdk 21. When this dependency is
     // removed (e.g. third-party integrators using only the NativeProxyAgent.kt
     // drop-in), the NATIVE engine silently falls back to TCP-only.
+    //
+    // Kwik is being progressively replaced by the in-house QUIC implementation
+    // in `nativeagent/quic/` — once `NativeQuicTransport` is field-validated
+    // (see com.proxyagent.app.nativeagent.quic.DESIGN.md), this dep goes away.
     implementation("tech.kwik:kwik:0.10.10")
+    // BouncyCastle provides the TLS 1.3 building blocks the in-house QUIC
+    // client needs — specifically `TlsClientProtocol` exposes raw handshake
+    // records and the QUIC-specific key exporter that JSSE/Conscrypt do not.
+    // Total APK overhead is ~5 MB (bcprov + bctls); acceptable for parity
+    // with the Go SDK's QUIC throughput.
+    implementation("org.bouncycastle:bcprov-jdk18on:1.79")
+    implementation("org.bouncycastle:bctls-jdk18on:1.79")
     // Desugaring for java.time.* on API < 26 (needed by kwik).
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
 }
