@@ -172,10 +172,10 @@ internal class Connection(
         }
 
         // Start TLS — produces ClientHello, queued for emission.
-        val firstStep = tls.start()
-        for ((level, bytes) in firstStep.outgoing) {
-            queueCryptoData(level, bytes)
-        }
+        // Route via handleTlsStep so the Level→PacketNumberSpace
+        // conversion (and any new secrets, though there are none
+        // at this point) lives in one place.
+        handleTlsStep(tls.start())
         sendQueue.offer(QueuedSendWork.Tick)
 
         // Wait for handshake.
