@@ -1175,6 +1175,11 @@ sure the post-update world doesn't lie about it.
      upside. The most likely throw is
      `ForegroundServiceStartNotAllowedException` if Android tightens
      the FGS-from-broadcast exemption further in a future release.
+     On catch, the receiver posts a fallback notification
+     (`NOTIF_ID_AUTO_RESTART_FAILED = 3`) with a `BigTextStyle`
+     explanation and a tap-target into `MainActivity`. Otherwise the
+     admin would see no visible signal that anything went wrong — the
+     FGS notification just disappears.
 
    After auto-restart, `ProxyService.onStartCommand` runs its normal
    path: writes a fresh `proxy_state="starting"`, fresh `conn_info`
@@ -1182,7 +1187,19 @@ sure the post-update world doesn't lie about it.
    might have read first), and the agent dials uplink. On
    `uplink connected`, `connectedSinceMs = System.currentTimeMillis()`
    — so uptime really does start at zero for the new session, not
-   continue from the old one.
+   continue from the old one. The FGS notification (id=1) reappears
+   within a few hundred ms of the `startForeground` call in
+   `onStartCommand`; the ~1–3 s blank window between the OS killing
+   the old process and the new process attaching its FGS is
+   unavoidable Android behaviour.
+
+### Notification IDs in the shade
+
+| ID | Source | Lifecycle |
+| --- | --- | --- |
+| 1 | `ProxyService.startForeground` / 1Hz refresh in the status updater | Sticky / ongoing while `:proxy` is alive. Removed by `stopForeground(STOP_FOREGROUND_REMOVE)` in `doStop`. Dies with the process on `PACKAGE_REPLACED` kill; OS removes it from the shade. |
+| 2 | `ProxyService.doStop` when `autoStopReason` is non-empty (battery / no-internet) | Non-sticky (`setOngoing(false)`, `setAutoCancel(true)`). Survives `PACKAGE_REPLACED` because it's not bound to the FGS lifecycle — the `PendingIntent` is immutable so the tap-into-MainActivity action still works after the update. |
+| 3 | `PackageReplacedReceiver.postAutoRestartFailedNotification` when `startForegroundService` throws | Non-sticky, auto-cancel. Posted **only** when auto-restart fails (OEM block, Android FGS-restriction tightening). Channel `"proxy"` is created here too — it would otherwise only exist if `:proxy.onCreate` had already run, which it hasn't if the start just failed. |
 
 ### Failure modes worth knowing about
 
