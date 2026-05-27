@@ -34,21 +34,24 @@ isolation, and Wi-Fi-return compatibility.
 
 | File | Owner | Format | Purpose |
 | --- | --- | --- | --- |
-| `proxy_state` | service | text | One of `starting`/`running`/`stopped`/`auto_stopped`/`error`. Written on every transition. |
-| `conn_info` | service | pipe-delimited | Connection state, traffic rates, current rotation stage. Written every 1s + on transitions. Schema below. |
+| `proxy_state` | service | text | One of `starting`/`running`/`stopped`/`auto_stopped`/`error`. Written on every transition. Terminal values (`stopped`/`auto_stopped`/`error`) are sticky across `conn_info` stale-detection — see [Surviving an app update](#surviving-an-app-update). |
+| `conn_info` | service | pipe-delimited | Connection state, traffic rates, current rotation stage, wall-clock heartbeat. Written every 1s + on transitions. Schema below. |
 | `stop_reason` | service | text | Human-readable reason; non-empty only when `proxy_state=auto_stopped`. |
-| `agent.log` | service | text | Timestamped tail of binary stdout. Rotated 30 → 25 MiB on overflow. |
+| `agent.log` | service | text | Timestamped tail of binary stdout. Rotated 30 → 25 MiB on overflow. Each new `:proxy` process stamps a `=== app vX.Y.Z (build N) pid=… ===` line on entry so post-mortem analysis can tell which app version produced which log segment after upgrades. |
 | `nat_ip` | service | text | Last-known public IP (best-effort, refreshed every 5 min and after successful rotation). |
 | `battery_threshold` | UI | int | Auto-stop threshold in percent (0 disables). |
 | `speed_units` | UI | text | `bits`/`bytes` for rate display. |
 | `cycle_cfg.json` | UI writes, both read | JSON | Cross-process mirror of the cycle settings (`apn_swap`, `imei_rotate`, `imei_method`, `imei_cmd`). SharedPreferences are per-process — the REBOOT auto-cycle in `:proxy` would otherwise miss toggle changes made in `:main`. Rewritten on every settings save and re-mirrored on app launch as a back-fill. |
 | `analytics/cycle_events.jsonl` | both write | JSONL | One row per rotation attempt with old/new IP, success flag, attempts and duration. Read by the swipe-panel chart, the analytics screen, and the CSV export. Pruned by the same retention policy as bucket files. |
 | `wifi_info.json` | service | JSON | Latest Wi-Fi return split-routing self-test result + Wi-Fi link snapshot. Keys: `public_ip_wifi`, `public_ip_cell`, `public_ip_default` (process default route, used to detect target-dial leak), `link_speed_mbps`, `frequency_mhz`, `band` (`"2.4 GHz"`/`"5 GHz"`/`"6 GHz"`), `standard` (`"Wi-Fi 5 (802.11ac)"` etc.), `wifi_attached`, `test_result` (`SUCCESS`/`SAME_IP`/`LEAK_DETECTED`/`WIFI_PROBE_FAILED`/`CELL_PROBE_FAILED`/`BOTH_FAILED`), `test_detail`, `test_duration_ms`, `tested_at_ms`. Written by ProxyService after each self-test; read by MainActivity for the widget two-IP block and the log-export header. |
+| `was_running` | service | text (`"1"`) | Auto-restart breadcrumb. Written by `ProxyService.onStartCommand` after `startForeground` and **deleted by `doStop`**. Present-after-kill means the previous session ended unexpectedly (PACKAGE_REPLACED, low-memory kill); `PackageReplacedReceiver` gates auto-restart on this file so an intentional STOP doesn't get resurrected. See [Surviving an app update](#surviving-an-app-update). |
+| `ip_cycle_in_progress` | service | epoch ms (informational) | Crash-recovery breadcrumb for `IpCycle.cycleAndVerify`. Written on entry, deleted in `finally`. A leftover file at app launch means the rotation was killed mid-sequence and `recoverInterruptedCycle` should flip `airplane_mode_on` back to 0. See [IP rotation — interrupted-cycle recovery](#interrupted-cycle-recovery). |
+| `ip_cycle_rat_saved` | service | int (RAT mode) | Holds the pre-rotation `preferred_network_mode` value across the GSM-only RAT switch. Written by `saveAndSetGsmOnly` before the put, deleted by `restoreRat`. Read by `recoverInterruptedCycle` to put the RAT back if we died between save and restore — otherwise the device stays pinned to 2G/3G until the user fixes it manually through system Settings. |
 
 ## `conn_info` schema
 
 One pipe-delimited line written by `writeConnInfo`
-(`ProxyService.kt:126-138`). Nine fields (0-indexed):
+(`ProxyService.kt:198-227`). Twelve fields (0-indexed):
 
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
@@ -61,13 +64,29 @@ One pipe-delimited line written by `writeConnInfo`
 | 6 | `currentUplinkTransport` | string | One of: `QUIC` (all engines) / `TCP (splice)` (BINARY/AAR always, NATIVE when the kernel zero-copy shim activated) / `TCP (NIO)` (NATIVE when splice couldn't be used and the bridge fell back to NIO + DirectByteBuffer) / `TCP` (NATIVE momentary state between `uplink connected` and the first splice/fallback decision — usually invisible thanks to `SpliceShim.warmup()` resolving it before the supervisor dials) / `TCP+yamux` / `WebSocket` (legacy pre-2.0.14 SDKs). Added v2.0.14-quic; splice/NIO distinction added with the NATIVE engine. |
 | 7 | `cycleStage` | string | Non-empty only during REBOOT auto-cycle. UI shows `ROTATING · <stage>`. Added with `IpCycle.cycleAndVerify` rework. |
 | 8 | `wifiReturnStatus` | string | `""` (relay off) / `"wifi"` (uplink on Wi-Fi, split routing verified) / `"wifi_fallback"` (relay up, no Wi-Fi held — flowing through cellular) / `"leak_known"` (BINARY engine: relay running for uplink savings, but target dials leak Wi-Fi IP — expected on BINARY) / `"split_failed"` (sticky: self-test rejected the relay on an in-process engine, relay disabled). UI maps to cyan / amber / amber-warning / red respectively. Added with Wi-Fi return relay. |
+| 9 | `heartbeatMs` | long | Wall-clock epoch ms of the most recent `writeConnInfo` call. Refreshed by the 1Hz status updater + on every transition. `MainActivity.readLiveProxyFiles` treats the file as stale when `now - heartbeatMs > STALE_CONN_INFO_MS` (5 s) — the writer is dead and the file is wiped so the UI doesn't keep showing fake CONNECTED + accumulating uptime. See [Surviving an app update](#surviving-an-app-update). |
+| 10 | `pid` | int | `android.os.Process.myPid()` of the writer. Debug aid: a pid in `conn_info` that doesn't match any live `ProxyService` process is direct proof the file is a leftover from a previous incarnation. Not currently consumed by code — readers gate on the heartbeat alone. |
+| 11 | `schemaVersion` | int | Layout version. v1 = first layout with fields 9–11. Not gated on (readers use positional `getOrNull(N)` for forward/backward compat); recorded so future readers could branch on layout if/when fields get dropped or reordered. |
 
 `MainActivity.refresh()` polls every 3s, reads with `getOrNull(N)` so
 forward-compat survives older downgrades that write fewer fields. `|`
 characters inside `cycleStage` are escaped to `/` so a stray pipe in a
-log line can't shift the field count.
+log line can't shift the field count. Pre-heartbeat snapshots (any
+build before this field set was introduced) get `heartbeatMs=0L` from
+`getOrNull(9)` and are treated as stale on first read — wiped before
+they can poison the UI.
 
 ## Status badge mapping (`MainActivity.refresh`)
+
+Before any of the rules below run, `readLiveProxyFiles()` checks the
+`conn_info` heartbeat (field 9). If `now - heartbeatMs > 5s`, the
+writer is dead — `conn_info` is wiped, and `proxy_state` is wiped
+**only if it doesn't hold a terminal value**. `stopped`/`auto_stopped`/
+`error` stay so the UI keeps showing `AUTO-STOPPED · Battery 5%` or
+`ERROR` after the process has long exited; `running`/`starting` are
+treated as a live-state lie and wiped. Without this gate, a kill mid-
+session (PACKAGE_REPLACED, OOM) would leave the UI stuck on
+`CONNECTED · up Xh` forever.
 
 Priority order — first match wins:
 
@@ -566,6 +585,59 @@ Total budget 180s base; ~50s extra per enabled fallback.
      IMEI). The app only invokes the command — it doesn't ship its
      own IMEI changer.
 
+### Interrupted-cycle recovery
+
+`cycleAndVerify` is wrapped in a `try/finally` that drops an
+`ip_cycle_in_progress` marker file on entry and removes it in
+`finally` (`IpCycle.kt:154-167`). `saveAndSetGsmOnly` writes the
+pre-rotation `preferred_network_mode` to `ip_cycle_rat_saved`
+*before* the GSM-only put; `restoreRat` deletes the file after the
+restore put. These two breadcrumbs let a process kill mid-rotation
+(PACKAGE_REPLACED app update, low-memory kill, force-stop, native
+crash) leave just enough state on disk for the next `:main` launch
+to clean up.
+
+`IpCycle.recoverInterruptedCycle(context, log)` runs on a background
+thread from `MainActivity.onCreate` (no UI delay, no preconditions —
+it's idempotent and a no-op when no markers are present). When called:
+
+1. If neither marker file exists → bail. Common case.
+2. Probe root once via `runRoot("true")` — root is needed for the RAT
+   restore branch, and `airplaneOff` works through both root and
+   `WRITE_SECURE_SETTINGS` paths.
+3. Read `Settings.Global.AIRPLANE_MODE_ON`. If it's `1`, call
+   `airplaneOff(context, rootAvailable)` to put the device back online.
+   Otherwise log "nothing to do" — the cycle may have died after
+   airplane-off but before file cleanup.
+4. If `ip_cycle_rat_saved` exists:
+   - Validate it parses as a positive integer.
+   - Compare against current `preferred_network_mode`. If they match
+     (cycle died after restore but before file delete), just clean up.
+   - If they differ and we have root, `settings put global
+     preferred_network_mode <saved>` to restore it.
+   - If we have **no** root, leave the file behind and skip the put —
+     a future launch with root can still recover. Realistically the
+     user lost root permanently between sessions only if Magisk was
+     uninstalled, and they'll fix RAT through system Settings either
+     way.
+5. Delete both marker files.
+
+What this does **not** recover:
+- **APN swap mid-rotation.** `runApnSwapStep` has its own
+  `try/finally` that always runs `cleanupRotationDuplicates` (removes
+  any `name='ProxyAgent-rotation-tmp'` rows) and `setPreferredApn` to
+  restore the original `_id`, but those run only if the process is
+  still alive. A kill between `setPreferredApn(altApn.id)` and the
+  restore leaves the SIM pointed at the alternate (or our duplicate)
+  APN until the user changes APN through system Settings or re-runs
+  the rotation. This is a known gap; persisting `preferapn` the way
+  we now persist RAT would close it.
+- **IMEI rotation.** By design — the user's custom command made a
+  permanent identity change that we don't have an inverse for.
+  Re-running the rotation is the only "recovery."
+- **Subprocess kill in the BINARY engine.** Handled by Android's
+  process group cleanup, not us.
+
 ### What doesn't work — and why
 
 Operators that pin IP at the **IMSI** level (Lifecell UA is one
@@ -1046,3 +1118,124 @@ cycling.
 Both stop reasons land in `stop_reason` (file) and switch
 `proxy_state` to `auto_stopped`. `MainActivity` surfaces the reason in
 the status badge.
+
+## Surviving an app update
+
+`PACKAGE_REPLACED` is a hard kill from the OS — both `:main` and
+`:proxy` are terminated before any `onDestroy` / `doStop` can run, so
+sockets, uplink, JNI splice fds, the WakeLock, and the FGS
+notification all disappear with the processes. There's no
+Android-supported way to keep a session alive across a package
+upgrade. What we **can** do is detect that we were killed and make
+sure the post-update world doesn't lie about it.
+
+### Three layers of defense
+
+1. **Stale-state detection in the UI** — covered above
+   ([`conn_info` heartbeat](#conn_info-schema) + [Status badge
+   mapping](#status-badge-mapping-mainactivityrefresh)). The
+   `conn_info` file from the killed process still says `CONNECTED |
+   … | <old timestamp>` after the kill; without the heartbeat check,
+   the new `MainActivity` would compute uptime from that old
+   timestamp and accumulate forever. The 5 s staleness threshold
+   wipes `conn_info` and live `proxy_state` values on the first
+   `refresh()` so the UI snaps to `DISCONNECTED`. Terminal
+   `proxy_state` values stay so `AUTO-STOPPED · Battery 5%` and
+   `ERROR` don't get lost.
+
+2. **IP-rotation recovery** — covered above ([Interrupted-cycle
+   recovery](#interrupted-cycle-recovery)). Marker files
+   (`ip_cycle_in_progress`, `ip_cycle_rat_saved`) survive the kill;
+   `recoverInterruptedCycle` runs on a background thread from
+   `MainActivity.onCreate` and flips `airplane_mode` back off + puts
+   the saved RAT back. Without this, a kill during the nuclear
+   ladder strands the device with no cellular path or pinned to 2G.
+
+3. **Auto-restart of the proxy service** —
+   `PackageReplacedReceiver` registered on
+   `android.intent.action.MY_PACKAGE_REPLACED`
+   (`AndroidManifest.xml:103-117`). When the broadcast fires, the
+   receiver:
+
+   - Checks for `filesDir/was_running`. The file is written by
+     `ProxyService.onStartCommand` right after `startForeground` and
+     **deleted by `doStop`**. Its presence post-kill is direct proof
+     the previous session was alive when the update landed; absence
+     means the user (or auto-stop) had already stopped the agent and
+     we must not resurrect it.
+   - Reads `host`/`port`/`key`/`id`/`dns`/`engine`/`mode` from
+     `SharedPreferences("cfg")` — same keys `MainActivity.toggle()`
+     uses. If any of host/port/key is missing (Storage wiped,
+     first-run upgrade), bails with a log line.
+   - Calls `startForegroundService` with an Intent matching the one
+     the manual START button would build, so the new `:proxy`
+     process boots into the same engine and mode.
+   - Catches all throwables and only logs — a broadcast receiver
+     that throws shows the user a "Process has died" dialog with no
+     upside. The most likely throw is
+     `ForegroundServiceStartNotAllowedException` if Android tightens
+     the FGS-from-broadcast exemption further in a future release.
+
+   After auto-restart, `ProxyService.onStartCommand` runs its normal
+   path: writes a fresh `proxy_state="starting"`, fresh `conn_info`
+   with a current heartbeat (clearing any stale snapshot the UI
+   might have read first), and the agent dials uplink. On
+   `uplink connected`, `connectedSinceMs = System.currentTimeMillis()`
+   — so uptime really does start at zero for the new session, not
+   continue from the old one.
+
+### Failure modes worth knowing about
+
+- **OEM auto-start blockers.** Xiaomi MIUI's "Autostart" toggle,
+  Huawei EMUI's "Manage app launch", Samsung OneUI's "Sleeping
+  apps", OnePlus OxygenOS battery optimization — any of these can
+  drop our `MY_PACKAGE_REPLACED` broadcast. There's no
+  app-side workaround; the per-OEM whitelist procedure is documented
+  in `ADMIN_GUIDE.md`.
+- **Android 14+ tightening.** `specialUse` FGS-type currently
+  qualifies for the broadcast-receiver exemption that lets us call
+  `startForegroundService` from `onReceive`. If Google revokes that
+  for `specialUse` later, the receiver will start throwing and the
+  user will need to open the app and press START manually. The
+  user-visible behavior degrades gracefully — no crash, just no
+  auto-restart.
+- **Credentials wiped between sessions.** "Clear Storage" in system
+  settings deletes `filesDir/*` including `was_running`, and clears
+  `SharedPreferences`. The receiver bails cleanly; the next
+  app-launch will land on `NOT CONFIGURED · TAP START TO IMPORT`
+  because `hasConnectionConfig()` returns false.
+- **In-flight IP rotation at the time of update.** The
+  `ip_cycle_in_progress` marker survives the kill, and
+  `recoverInterruptedCycle` flips `airplane_mode` and RAT back on the
+  next `:main` launch (which is also when the auto-restart Receiver
+  fires). `was_running` is still set, so the receiver kicks off a
+  fresh `:proxy` while `:main` separately runs the cycle recovery —
+  both threads share `filesDir` but touch disjoint files, no race.
+- **APN swap interruption.** As called out in
+  [Interrupted-cycle recovery](#interrupted-cycle-recovery), if the
+  kill lands between `setPreferredApn(altApn.id)` and the restore
+  put, the SIM stays on the alternate APN. The auto-restart will
+  succeed (cellular works on whichever APN is selected) but the new
+  session may exit through a different APN than intended.
+- **Subprocess in BINARY engine.** Killed with the parent process by
+  the OS; the new `:proxy` re-execs `libproxyagent.so` from the
+  newly-installed APK's `nativeLibraryDir`. No special handling
+  needed.
+
+### Logs you'll see in `agent.log` after a successful auto-restart
+
+```
+HH:MM:SS === app v1.0.347 (build 347) pid=12345 ===
+HH:MM:SS Engine: NATIVE  Mode: MODEM
+HH:MM:SS Native engine: host=…
+…
+HH:MM:SS recovery: marker=true rat_file=false airplane_mode=false root=true
+HH:MM:SS recovery: airplane_off ok            ← only if airplane was on
+```
+
+The `=== app v… ===` marker is one-shot per `:proxy` process; the
+`recovery:` lines come from `IpCycle.recoverInterruptedCycle` via
+`MainActivity`'s background thread. The receiver itself logs
+through `android.util.Log` with tag `ProxyAgent.PkgReplaced` —
+visible via `adb logcat` but not in `agent.log` (the receiver runs in
+`:main` and doesn't share the log appender).

@@ -189,6 +189,14 @@ class ProxyService : Service() {
     companion object {
         private const val MAX_LOG_BYTES = 30L * 1024 * 1024  // trigger rotation
         private const val KEEP_LOG_BYTES = 25L * 1024 * 1024 // keep this much tail
+        // Identifies the conn_info layout the writer produced. Bumped when
+        // the field set changes incompatibly; not currently consumed (UI
+        // uses positional getOrNull) but recorded so future readers can
+        // branch on layout if/when we ever want to drop or reorder fields.
+        // v1 = first layout with heartbeat (field 9) + pid (field 10) +
+        // schema_version (field 11). Older snapshots have neither and the
+        // heartbeat-stale check naturally treats them as void.
+        private const val CONN_INFO_SCHEMA_VERSION = 1
     }
 
     private fun state(s: String) {
@@ -205,14 +213,20 @@ class ProxyService : Service() {
             // state transition) so MainActivity can detect when this process
             // died without a graceful doStop — typically PACKAGE_REPLACED
             // kill mid-session — and stop trusting the stale file (otherwise
-            // the UI keeps showing CONNECTED + accumulating uptime forever).
-            // Readers must use getOrNull(N) for forward compatibility so the
-            // tail fields stay optional if a downgrade ever writes shorter
-            // rows. `|` is escaped in cycleStage so a stray pipe in a log
-            // line can't shift the field count.
+            // the UI keeps showing CONNECTED + accumulating uptime forever);
+            // field 10 is the writer's pid (debug aid in post-mortem log
+            // analysis — pid in conn_info that doesn't match any live
+            // ProxyService process means the file is a leftover from a
+            // previous incarnation); field 11 is CONN_INFO_SCHEMA_VERSION
+            // so future readers can branch on layout without sniffing field
+            // counts. Readers must use getOrNull(N) for forward compatibility
+            // so the tail fields stay optional if a downgrade ever writes
+            // shorter rows. `|` is escaped in cycleStage so a stray pipe in
+            // a log line can't shift the field count.
             val safeStage = cycleStage.replace('|', '/')
+            val pid = android.os.Process.myPid()
             File(filesDir, "conn_info").writeText(
-                "${connStatus.name}|$rxRate|$txRate|$currentRegistrator|$activeTunnels|$connectedSinceMs|$currentUplinkTransport|$safeStage|$wifiReturnStatus|${System.currentTimeMillis()}"
+                "${connStatus.name}|$rxRate|$txRate|$currentRegistrator|$activeTunnels|$connectedSinceMs|$currentUplinkTransport|$safeStage|$wifiReturnStatus|${System.currentTimeMillis()}|$pid|$CONN_INFO_SCHEMA_VERSION"
             )
         } catch (_: Exception) {}
     }
@@ -630,6 +644,14 @@ class ProxyService : Service() {
             val ch = NotificationChannel("proxy", "Proxy Agent", NotificationManager.IMPORTANCE_LOW)
             nm.createNotificationChannel(ch)
         }
+        // Stamp the log with the running build at process-create time. Cheap
+        // and one-shot per :proxy lifetime. The agent.log file is shared
+        // across upgrades and can accumulate days of lines from older app
+        // versions; without this marker, post-incident debugging guesses at
+        // when each update landed. Surrounding `===` makes the line trivial
+        // to grep for ("=== app v") and clearly separates from regular log.
+        log("=== app v${BuildConfig.VERSION_NAME} (build ${BuildConfig.VERSION_CODE}) " +
+            "pid=${android.os.Process.myPid()} ===")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -683,6 +705,13 @@ class ProxyService : Service() {
         }
         state("starting")
         writeConnInfo()
+        // Persist a "was running" flag so PackageReplacedReceiver can decide
+        // whether to auto-restart after an app update. PACKAGE_REPLACED kills
+        // both processes without ever touching this file, so its presence
+        // post-kill = the previous session was alive when the update landed.
+        // doStop() (user STOP, auto-stop, onDestroy) removes it explicitly so
+        // an intentional stop doesn't get unintentionally resurrected.
+        try { File(filesDir, "was_running").writeText("1") } catch (_: Throwable) {}
 
         // Spin up the analytics recorder before any agent log lines arrive so
         // tunnel-open/close events are counted from the very first connection.
@@ -1828,6 +1857,12 @@ class ProxyService : Service() {
     private fun doStop(autoStopReason: String = "") {
         if (stopRequested) return
         stopRequested = true
+        // Clear the auto-restart flag — any path through doStop is an
+        // intentional shutdown (user STOP, battery auto-stop, onDestroy from
+        // the system, Wi-Fi-return split rollback), and we don't want
+        // PackageReplacedReceiver to resurrect the session if an update
+        // happens to land while we're still cleaning up.
+        try { File(filesDir, "was_running").delete() } catch (_: Throwable) {}
         unregisterNetworkCallback()
         try { analytics?.flush() } catch (_: Throwable) {}
         // Tear down the Wi-Fi return relay before we stop the engine so the

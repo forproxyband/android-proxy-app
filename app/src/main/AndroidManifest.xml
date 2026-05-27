@@ -99,5 +99,22 @@
                 android:value="Proxy agent maintains a persistent WebSocket to the registrator pool" />
         </service>
 
+        <!-- Auto-restart the proxy service after an app upgrade. Fires only
+             when this app's package is replaced — a directed self-broadcast,
+             no data filter needed. The receiver gates on a "was_running"
+             flag so users who'd manually stopped the agent before the
+             update don't get the session resurrected. See
+             PackageReplacedReceiver.kt for the full reasoning + OEM
+             caveats. Runs in the default process (:main) since the receiver
+             only needs SharedPreferences and startForegroundService — no
+             reason to drag :proxy in for a one-shot dispatch. -->
+        <receiver
+            android:name=".PackageReplacedReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
     </application>
 </manifest>

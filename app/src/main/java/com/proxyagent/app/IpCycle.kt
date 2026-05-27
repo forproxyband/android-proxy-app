@@ -92,6 +92,15 @@ object IpCycle {
     // without any cellular path.
     private const val IN_PROGRESS_MARKER = "ip_cycle_in_progress"
 
+    // Holds the pre-rotation `preferred_network_mode` value (RAT preference)
+    // for the duration of saveAndSetGsmOnly → restoreRat. saveAndSetGsmOnly
+    // writes it before flipping the modem to GSM-only; restoreRat deletes it
+    // after putting the original back. If the process dies between those
+    // two calls, the file persists and recoverInterruptedCycle restores the
+    // RAT on the next launch — otherwise the device stays pinned to 2G/3G
+    // until the user manually flips it through Settings.
+    private const val RAT_SAVED_FILE = "ip_cycle_rat_saved"
+
     fun loadConfigFromFile(context: Context): CycleConfig {
         return try {
             val f = File(context.filesDir, CFG_FILE_NAME)
@@ -224,11 +233,11 @@ object IpCycle {
 
             // Save & switch RAT before we kill the radio so the modem comes
             // back in GSM/2G on airplane-off. We restore after the re-attach.
-            val savedRat: String? = if (doRatSwitch) saveAndSetGsmOnly(log) else null
+            val savedRat: String? = if (doRatSwitch) saveAndSetGsmOnly(context, log) else null
 
             if (!airplaneOn(context, rootAvailable)) {
                 log("attempt $attempts: airplane on failed")
-                if (savedRat != null) restoreRat(savedRat)
+                if (savedRat != null) restoreRat(context, savedRat)
                 continue
             }
             toggleEverWorked = true
@@ -236,7 +245,7 @@ object IpCycle {
 
             try { Thread.sleep(waitMs) } catch (_: InterruptedException) {
                 airplaneOff(context, rootAvailable)
-                if (savedRat != null) restoreRat(savedRat)
+                if (savedRat != null) restoreRat(context, savedRat)
                 return CycleResult(
                     oldIp, lastNewIp, false, attempts,
                     System.currentTimeMillis() - start, "interrupted",
@@ -245,7 +254,7 @@ object IpCycle {
 
             if (!airplaneOff(context, rootAvailable)) {
                 log("attempt $attempts: airplane off failed")
-                if (savedRat != null) restoreRat(savedRat)
+                if (savedRat != null) restoreRat(context, savedRat)
                 continue
             }
 
@@ -254,7 +263,7 @@ object IpCycle {
             while (System.currentTimeMillis() < reattachDeadline) {
                 if (hasCellularInternet(context)) break
                 try { Thread.sleep(500) } catch (_: InterruptedException) {
-                    if (savedRat != null) restoreRat(savedRat)
+                    if (savedRat != null) restoreRat(context, savedRat)
                     return CycleResult(
                         oldIp, lastNewIp, false, attempts,
                         System.currentTimeMillis() - start, "interrupted",
@@ -269,7 +278,7 @@ object IpCycle {
             // is half the reason we did the GSM detour in the first place.
             if (savedRat != null) {
                 log("attempt $attempts: restoring RAT to $savedRat, waiting for LTE")
-                restoreRat(savedRat)
+                restoreRat(context, savedRat)
                 val ratDeadline = minOf(System.currentTimeMillis() + RAT_RESTORE_REATTACH_MS, deadline)
                 while (System.currentTimeMillis() < ratDeadline) {
                     if (hasCellularInternet(context)) break
@@ -359,22 +368,29 @@ object IpCycle {
     // Best-effort recovery from a rotation interrupted by process kill (app
     // update via PACKAGE_REPLACED, low-memory kill, force-stop, native crash).
     // The wrapper writes IN_PROGRESS_MARKER on entry to cycleAndVerify and
-    // deletes it in finally, so a leftover marker means we died between
-    // airplaneOn() and the matching airplaneOff() — likely with airplane mode
-    // still enabled, which would otherwise strand the device.
+    // deletes it in finally; saveAndSetGsmOnly writes RAT_SAVED_FILE before
+    // flipping the modem to GSM-only and restoreRat deletes it. Leftover
+    // files mean we died with airplane_mode possibly ON and/or the RAT
+    // possibly pinned to GSM-only — both states strand the user (no signal
+    // / 2G-only) until manually fixed through system Settings.
     //
     // Called from MainActivity.onCreate on a background thread. Idempotent:
-    // no marker → returns false without touching anything; marker present but
-    // airplane already off → just deletes the marker.
+    // no leftover files → returns false; files present but state already
+    // sane → just deletes the files.
     //
-    // Returns true iff a recovery was attempted (marker existed). The caller
-    // doesn't need the result, but it's useful for logs and tests.
+    // Returns true iff a recovery was attempted (any leftover file existed).
     fun recoverInterruptedCycle(
         context: Context,
         log: (String) -> Unit = {},
     ): Boolean {
         val marker = File(context.filesDir, IN_PROGRESS_MARKER)
-        if (!marker.exists()) return false
+        val ratFile = File(context.filesDir, RAT_SAVED_FILE)
+        if (!marker.exists() && !ratFile.exists()) return false
+        // Single root probe shared by the airplane + RAT recovery legs.
+        // runRoot("true") is the cheapest way to find out if we still have
+        // su — used to choose the airplane-off path and gate the RAT
+        // restore (writing preferred_network_mode requires root).
+        val rootAvailable = runRoot("true")
         val airplaneOn = try {
             Settings.Global.getInt(
                 context.contentResolver,
@@ -382,16 +398,35 @@ object IpCycle {
                 0,
             ) == 1
         } catch (_: Throwable) { false }
-        log("recovery: ip_cycle marker found, airplane_mode=$airplaneOn")
+        log("recovery: marker=${marker.exists()} rat_file=${ratFile.exists()} " +
+            "airplane_mode=$airplaneOn root=$rootAvailable")
         if (airplaneOn) {
-            // root path tried first since the cycle that died was likely
-            // using it (cleaner exit, broadcasts the AIRPLANE_MODE_CHANGED
-            // intent that some carrier services need); falls back to
-            // WRITE_SECURE_SETTINGS if root isn't available anymore.
-            val rootAvailable = runRoot("true")
             val ok = airplaneOff(context, rootAvailable)
-            log("recovery: airplane_off ${if (ok) "ok" else "failed"} " +
-                "(root=$rootAvailable)")
+            log("recovery: airplane_off ${if (ok) "ok" else "failed"}")
+        }
+        if (ratFile.exists()) {
+            val saved = try { ratFile.readText().trim() } catch (_: Throwable) { "" }
+            if (!saved.matches(Regex("""\d+"""))) {
+                log("recovery: rat_file contents invalid (\"$saved\"); dropping")
+            } else if (!rootAvailable) {
+                // No way to write preferred_network_mode without root. Leave
+                // the file behind so a future launch with root can still
+                // recover. Realistically: if the user lost root they'll just
+                // change RAT through Settings, so this is a soft floor.
+                log("recovery: rat restore deferred — no root; leaving rat_file in place")
+                try { marker.delete() } catch (_: Throwable) {}
+                return true
+            } else {
+                val current = runRootOutput("settings get global preferred_network_mode")
+                if (current == saved) {
+                    log("recovery: rat already $saved — nothing to do")
+                } else {
+                    val ok = runRoot("settings put global preferred_network_mode $saved")
+                    log("recovery: rat restore ${current ?: "?"} -> $saved " +
+                        "${if (ok) "ok" else "failed"}")
+                }
+            }
+            try { ratFile.delete() } catch (_: Throwable) {}
         }
         try { marker.delete() } catch (_: Throwable) {}
         return true
@@ -511,8 +546,11 @@ object IpCycle {
 
     // Reads `settings get global preferred_network_mode` (RAT preference) and
     // switches to GSM-only (mode 1). Returns the original numeric mode for
-    // restoreRat to put back, or null if we couldn't read/write.
-    private fun saveAndSetGsmOnly(log: (String) -> Unit): String? {
+    // restoreRat to put back, or null if we couldn't read/write. Persists
+    // the original to RAT_SAVED_FILE before the switch so recoverInterrupted
+    // Cycle can put it back if we die before reaching restoreRat — without
+    // that, a crash mid-rotation leaves the device pinned to 2G/3G.
+    private fun saveAndSetGsmOnly(context: Context, log: (String) -> Unit): String? {
         val original = runRootOutput("settings get global preferred_network_mode")
         if (original == null || !original.matches(Regex("""\d+"""))) {
             log("RAT switch skipped — couldn't read current mode (got \"${original ?: "null"}\")")
@@ -522,15 +560,23 @@ object IpCycle {
             log("RAT switch skipped — already GSM-only")
             return null
         }
+        // Write the persistence file BEFORE flipping the RAT. If the order
+        // were reversed and we crashed between the put and the writeText,
+        // recoverInterruptedCycle wouldn't know what to restore to.
+        try {
+            File(context.filesDir, RAT_SAVED_FILE).writeText(original)
+        } catch (_: Throwable) {}
         if (!runRoot("settings put global preferred_network_mode 1")) {
             log("RAT switch skipped — write failed")
+            try { File(context.filesDir, RAT_SAVED_FILE).delete() } catch (_: Throwable) {}
             return null
         }
         return original
     }
 
-    private fun restoreRat(originalMode: String) {
+    private fun restoreRat(context: Context, originalMode: String) {
         runRoot("settings put global preferred_network_mode $originalMode")
+        try { File(context.filesDir, RAT_SAVED_FILE).delete() } catch (_: Throwable) {}
     }
 
     // ── Shared inner cycle for fallback steps ──────────────────────────

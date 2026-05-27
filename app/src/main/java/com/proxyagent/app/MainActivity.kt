@@ -1984,9 +1984,21 @@ class MainActivity : AppCompatActivity() {
         val stale = heartbeatMs == 0L ||
             (System.currentTimeMillis() - heartbeatMs) > STALE_CONN_INFO_MS
         if (!stale) return proxyState to parts
+        // conn_info is stale → the live fields (connectedSinceMs, rates,
+        // tunnel count) no longer match reality, drop them. proxy_state is
+        // kept iff it holds a terminal value that the writer set as its
+        // last act before dying ("stopped" / "auto_stopped" / "error") —
+        // those are sticky on purpose so the UI keeps showing "AUTO-
+        // STOPPED · Battery 5%" or "ERROR" after the process has long
+        // exited. "running" / "starting" get wiped because they're live-
+        // state markers the writer never got to retire (typical case
+        // after a PACKAGE_REPLACED kill of an active session).
         try { File(filesDir, "conn_info").delete() } catch (_: Throwable) {}
-        try { File(filesDir, "proxy_state").delete() } catch (_: Throwable) {}
-        return "" to emptyList()
+        val keepState = proxyState in TERMINAL_PROXY_STATES
+        if (!keepState) {
+            try { File(filesDir, "proxy_state").delete() } catch (_: Throwable) {}
+        }
+        return (if (keepState) proxyState else "") to emptyList()
     }
 
     companion object {
@@ -1997,5 +2009,12 @@ class MainActivity : AppCompatActivity() {
         // during long GC pauses; setting it too low would risk wiping a
         // live state on a temporarily-blocked writer.
         private const val STALE_CONN_INFO_MS = 5_000L
+
+        // proxy_state values the writer chose deliberately as its final
+        // state. readLiveProxyFiles keeps these even when the heartbeat is
+        // stale so the UI can show "AUTO-STOPPED · Battery 5%" / "ERROR"
+        // after the process has exited; non-terminal "running"/"starting"
+        // get wiped as a live-state lie.
+        private val TERMINAL_PROXY_STATES = setOf("stopped", "auto_stopped", "error")
     }
 }
