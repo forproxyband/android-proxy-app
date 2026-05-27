@@ -117,7 +117,15 @@ internal class Connection(
 
     // ── Subsystems ────────────────────────────────────────────
 
-    private val tls = TlsClient(serverHost, alpn, ourTransportParameters)
+    // Inject our sourceCid into the TPs we advertise — RFC 9000 §18.2
+    // makes initial_source_connection_id (TP 0x0f) MANDATORY for QUIC
+    // v1 clients. Omitting it causes a TRANSPORT_PARAMETER_ERROR close
+    // from quic-go before the handshake completes.
+    private val tls = TlsClient(
+        serverHost,
+        alpn,
+        ourTransportParameters.copy(initialSourceConnectionId = sourceCid),
+    )
     private val cc = BrutalCongestionControl(ccTargetMbps)
     private val flow = ConnectionFlowControl(
         initialPeerMaxData = 0L,  // will be set from peer's TP
@@ -282,6 +290,16 @@ internal class Connection(
             val space = info.type.toPacketNumberSpace()
             val cs = spaceFor(space)
             val hp = cs.receiveHp ?: return -1  // we don't have keys yet (shouldn't happen for Initial)
+
+            // Update destinationCid from server's SCID on the very first
+            // Initial response (RFC 9000 §7.2 — once the server picks its
+            // own connection ID, the client uses that for the rest of the
+            // connection). We can detect "first time" by checking if our
+            // current dcid still matches the random one we originally chose.
+            if (info.type == LongPacketType.INITIAL && destinationCid.contentEquals(originalDcid) && !info.scid.contentEquals(originalDcid)) {
+                destinationCid = info.scid
+                log("recv: adopt server SCID as dcid = ${info.scid.toHex()}")
+            }
             // Header protection: sample at info.packetNumberOffset + 4.
             val sampleOffset = info.packetNumberOffset + 4
             if (sampleOffset + 16 > datagramEnd) return -1
@@ -563,10 +581,13 @@ internal class Connection(
         // Build payload.
         var payloadSize = 0
         for (f in frames) payloadSize += f.encodedSize()
-        // Initial packets MUST be padded to min 1200 bytes total.
+        // Initial packets MUST be padded to ≥1200 bytes total UDP
+        // payload (RFC 9000 §14.1). Target 1240 to give 40-byte
+        // headroom over the rough header-size estimate; sub-1200 →
+        // server silently drops.
         val initialPadding = if (space == PacketNumberSpace.INITIAL) {
             val totalSoFar = payloadSize + 16 /* AEAD tag */ + pnLen + roughHeaderSize(space)
-            maxOf(1200 - totalSoFar, 0)
+            maxOf(1240 - totalSoFar, 0)
         } else 0
         val paddedFrames = if (initialPadding > 0) frames + Padding(initialPadding) else frames
 
@@ -651,8 +672,16 @@ internal class Connection(
         joinToString("") { "%02x".format(it) }
 
     private fun roughHeaderSize(space: PacketNumberSpace): Int = when (space) {
-        PacketNumberSpace.INITIAL -> 1 + 4 + 1 + destinationCid.size + 1 + sourceCid.size + 1 + 4  // ~rough
-        PacketNumberSpace.HANDSHAKE -> 1 + 4 + 1 + destinationCid.size + 1 + sourceCid.size + 4
+        // Long header fixed parts: 1 (first) + 4 (version) + 1 (dcidLen)
+        // + dcid + 1 (scidLen) + scid + varint(length). Initial adds 1
+        // byte for the (empty) token length varint. We intentionally
+        // UNDER-estimate the length varint at 2 bytes (it's typically 2
+        // for our packet sizes around 1200, but can be 4 if payload >
+        // 16383); under-estimation makes us over-pad rather than under-
+        // pad — Initial packets MUST be ≥1200 bytes per RFC 9000 §14.1
+        // or the server silently drops them.
+        PacketNumberSpace.INITIAL -> 1 + 4 + 1 + destinationCid.size + 1 + sourceCid.size + 1 + 2
+        PacketNumberSpace.HANDSHAKE -> 1 + 4 + 1 + destinationCid.size + 1 + sourceCid.size + 2
         PacketNumberSpace.ONE_RTT -> 1 + destinationCid.size
     }
 
