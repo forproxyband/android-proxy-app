@@ -58,7 +58,7 @@ One pipe-delimited line written by `writeConnInfo`
 | 3 | `currentRegistrator` | string | `host:port` of the selected registrator. |
 | 4 | `activeTunnels` | int | Currently open tunnel count. |
 | 5 | `connectedSinceMs` | long | Epoch ms of last successful AUTH; 0 when not CONNECTED. |
-| 6 | `currentUplinkTransport` | string | `QUIC` / `TCP (splice)` / `TCP+yamux` / `WebSocket`. Added v2.0.14-quic. |
+| 6 | `currentUplinkTransport` | string | One of: `QUIC` (all engines) / `TCP (splice)` (BINARY/AAR always, NATIVE when the kernel zero-copy shim activated) / `TCP (NIO)` (NATIVE when splice couldn't be used and the bridge fell back to NIO + DirectByteBuffer) / `TCP` (NATIVE momentary state between `uplink connected` and the first splice/fallback decision — usually invisible thanks to `SpliceShim.warmup()` resolving it before the supervisor dials) / `TCP+yamux` / `WebSocket` (legacy pre-2.0.14 SDKs). Added v2.0.14-quic; splice/NIO distinction added with the NATIVE engine. |
 | 7 | `cycleStage` | string | Non-empty only during REBOOT auto-cycle. UI shows `ROTATING · <stage>`. Added with `IpCycle.cycleAndVerify` rework. |
 | 8 | `wifiReturnStatus` | string | `""` (relay off) / `"wifi"` (uplink on Wi-Fi, split routing verified) / `"wifi_fallback"` (relay up, no Wi-Fi held — flowing through cellular) / `"leak_known"` (BINARY engine: relay running for uplink savings, but target dials leak Wi-Fi IP — expected on BINARY) / `"split_failed"` (sticky: self-test rejected the relay on an in-process engine, relay disabled). UI maps to cyan / amber / amber-warning / red respectively. Added with Wi-Fi return relay. |
 
@@ -130,12 +130,16 @@ with any of them interchangeably. `engine` pref selects which one
   cause is under investigation. Until that's resolved, AAR shouldn't
   be assumed to work end-to-end in any mode.
 - **NATIVE** runs in `:proxy` so process bind sticks for target
-  dials; has no JNI/Go runtime quirks; can be dropped into
-  third-party apps as a small Kotlin module.
+  dials; has no Go runtime to wrestle with (vs AAR's `JNI_OnLoad`
+  env caching, vs BINARY's subprocess pipes). Uses a tiny optional
+  JNI shim (`libagentsplice.so`, ~15 KiB per ABI) for the TCP
+  zero-copy fast path; the agent runs fine without it too. Can be
+  dropped into third-party apps as a small Kotlin module — see
+  [Drop-in for third-party apps](#drop-in-for-third-party-apps).
 
 | Engine | Where it lives | Process | Notes |
 | --- | --- | --- | --- |
-| `NATIVE` (default) | `app/src/main/java/com/proxyagent/app/nativeagent/` | In-process (`:proxy`) | Pure-Kotlin port of the Go SDK. No JNI, no subprocess, no Go runtime. Drop-in reusable in third-party apps — see [Drop-in for third-party apps](#drop-in-for-third-party-apps) below. |
+| `NATIVE` (default) | `app/src/main/java/com/proxyagent/app/nativeagent/` + `app/src/main/cpp/` | In-process (`:proxy`) | Pure-Kotlin port of the Go SDK. No subprocess, no Go runtime. Optional ~15 KiB JNI shim for kernel `splice(2)` zero-copy on the TCP fast path — automatic NIO fallback if the .so isn't present or fd extraction fails. Drop-in reusable in third-party apps — see [Drop-in for third-party apps](#drop-in-for-third-party-apps) below. |
 | `BINARY` | `proxy-agent-linux-{arm64,x86}` packed as `libproxyagent.so` (see [BINARIES.md]) | Subprocess via `ProcessBuilder` | Forked `:proxy` child runs the Go SDK as an unmanaged ELF; we parse its stdout. Wi-Fi return cannot bind it to cellular (`bindProcessToNetwork` doesn't survive `fork+exec`), so Wi-Fi-return target dials leak — UI shows `leak_known`. |
 | `AAR` | `proxyagent.aar` (gomobile-built) at repo root | In-process (`:proxy`) | Loaded via `Class.forName("proxyagent.sdk.agent.Agent")` after `Os.setenv` so the Go runtime sees our config at `JNI_OnLoad`. Cannot be cleanly re-initialised in-process — service kills `:proxy` on stop so the next start gets a fresh Go runtime. **Modem-mode reliability issue currently observed** — see the trade-off matrix at [Engine-vs-Wi-Fi-return trade-off matrix](#engine-vs-wi-fi-return-trade-off-matrix-current-sdk). |
 
@@ -152,9 +156,10 @@ internal helpers laid out to mirror the Go SDK:
 | `FallbackSelector` | `internal/registrator/fallback.go` | Downloads the fallback list, probes each `/health`, picks the best via the same comparator (ready > free_sockets > cpu > ram > agent_count). |
 | `ExponentialJitterBackoff` | `internal/backoff/backoff.go` | 250ms → 10s with full jitter. |
 | `DnsConfig` + `MiniDnsClient` | `internal/dnsconfig/dnsconfig.go` | DNS override (`Config.dnsServers`) — falls back to the JVM resolver when no override is set, otherwise issues UDP A-record queries directly to the configured servers. |
-| `Uplink` (TCP path) | `internal/netagent/uplink.go` startTCP + control loop | Magic `TUNL` + version + connType handshake, AUTH/AUTH_OK on a newline-JSON control channel, warm pool of 8 pre-handshaked data sockets, `OPEN`/`OPEN_FAIL`/`REBOOT` dispatch, two-thread bridge (`shutdownOutput` on completion). |
-| `Uplink.DataPool` | `internal/netagent/pool.go` | Refills to 8 sockets on a 5s tick; `take()` pulls one and wakes the refiller. |
-| `Uplink` (QUIC path) + `QuicTransport` SPI | `internal/netagent/uplink.go` startQUIC + accept loop | Opens the first stream as control, accepts server-initiated streams in parallel via a separate thread, reads JSON tunnel header (`{host,port}\n`) and bridges to a fresh TCP target dial. |
+| `Uplink` (TCP path) | `internal/netagent/uplink.go` startTCP + control loop | Magic `TUNL` + version + connType handshake, AUTH/AUTH_OK on a newline-JSON control channel, warm pool of 8 pre-handshaked data sockets, `OPEN`/`OPEN_FAIL`/`REBOOT` dispatch, two-thread bridge with half-close on EOF. |
+| `Uplink.DataPool` | `internal/netagent/pool.go` | Refills to 8 sockets on a 5s tick; `take()` pulls one and wakes the refiller. Stores `SocketChannel` rather than `Socket` so the hot bridge path feeds straight into NIO without a wrap/unwrap step. |
+| `Uplink.copyChannel` + `SpliceShim` | Go stdlib `io.Copy` splice fast path | Kernel zero-copy bridge between two TCP `SocketChannel`s — see [NATIVE engine TCP fast path](#native-engine-tcp-fast-path) below for the splice → NIO ladder. |
+| `Uplink` (QUIC path) + `QuicTransport` SPI | `internal/netagent/uplink.go` startQUIC + accept loop | Opens the first stream as control, accepts server-initiated streams in parallel via a separate thread, reads JSON tunnel header (`{host,port}\n`) and bridges to a fresh TCP target dial. QUIC bridges stay in userspace — splice doesn't apply because QUIC streams aren't kernel fds. |
 | Transport cache file | `internal/netagent/transport_cache.go` | `Config.workDir/.proxyagent_transport` remembers `tcp` / `quic` so reconnects skip the failing probe. |
 | `MiniJson` | (stdlib `encoding/json`) | Tiny parser/emitter for objects/arrays/strings/numbers/booleans — just enough for balancer responses + control envelopes. No third-party deps. |
 
@@ -187,6 +192,147 @@ When `Config.quicTransportFactory` is `null`, the QUIC half is
 skipped entirely — the agent runs TCP-only and `chooseTransportOrder`
 returns `["tcp"]`. This is the path third-party integrators who
 don't want the kwik dependency take.
+
+### NATIVE engine TCP fast path
+
+The TCP bridge between a registrator-side data socket and the dialed
+target socket is the agent's hot path — every byte of tunneled
+traffic flows through it. To match the Go SDK's splice-based
+zero-copy, the NATIVE engine bridges in three tiers, falling through
+to the next if the previous can't be used:
+
+1. **`splice(2)` via `libagentsplice.so`** (JNI shim, `app/src/main/cpp/`).
+   Kernel-level zero-copy: bytes never enter userspace. Implementation
+   uses a temporary pipe and two `splice()` syscalls per chunk — the
+   standard Linux idiom because the kernel doesn't allow direct
+   socket-to-socket splice. CPU cost at 50 Mbps drops to ~1-3% of one
+   core, vs ~10-15% for the userspace paths below.
+
+2. **NIO + DirectByteBuffer** (Kotlin `SocketChannel.read/write` with
+   off-heap buffer). Two userspace copies per chunk (kernel → off-heap
+   buffer → kernel) but no JVM heap allocation and no GC pressure.
+   Used when splice can't be (see fd extraction below). At 50 Mbps
+   costs ~10-15% of one core — acceptable for typical mobile uplinks
+   where the radio is the limiter anyway.
+
+3. **InputStream/OutputStream + byte[]** — only used as the QUIC
+   bridge's target-side path, since kwik exposes streams not
+   channels. Same number of userspace copies as #2 but with JVM
+   heap byte[] (~6 MB/s allocated at 50 Mbps, GC pressure on long
+   sessions).
+
+#### Why splice needs a workaround for Android
+
+`splice(2)` between two TCP sockets requires their POSIX int fds.
+Java NIO doesn't expose those — `SocketChannel.socket().getFileDescriptor$()`
+is hidden API, and modern Android (API 28+, hard block on API 30+
+targets) blocks reflection/JNI access to it. The NATIVE engine ships
+its own `SpliceShim` (see `nativeagent/SpliceShim.kt`) that tries
+five strategies in order, returning the first that yields a working
+int fd:
+
+| ID | Strategy | Path | Hidden-API status |
+| --- | --- | --- | --- |
+| 0 | `ParcelFileDescriptor.fromSocket(socket).detachFd()` | Public API — framework calls hidden `getFileDescriptor$()` internally, where the hidden-API check uses the framework caller (allowed) instead of our app | **Public, always allowed** |
+| 1 | `SocketChannelImpl.fdVal: int` | JNI `GetFieldID` direct read | Subject to hidden-API enforcement on API 30+ |
+| 2 | `FileDescriptor.fd: int` | JNI `GetObjectField` → `GetIntField` | Same |
+| 3 | `FileDescriptor.descriptor: int` (older AOSP libcore name) | Same as 2 | Same |
+| 4 | `FileDescriptor.getInt$(): int` (Android `@hide` accessor) | JNI `GetMethodID` + `CallIntMethod` | Same |
+
+Strategy 0 (`ParcelFileDescriptor`) is the supported path on Android
+14+ — it works irrespective of `targetSdkVersion` or non-SDK
+enforcement state because every call we make is to public API.
+Strategies 1-4 are kept as fallbacks for older Android versions and
+the unlikely case where PFD refuses (e.g. a SocketAdaptor that
+doesn't expose its FD).
+
+#### Pre-flight warmup (`SpliceShim.warmup()`)
+
+`NativeProxyAgent.start()` calls `SpliceShim.warmup()` synchronously,
+BEFORE spawning the supervisor thread. The warmup:
+
+1. Loads `libagentsplice.so` (one-time `dlopen`, ~10-50 ms — biggest
+   cold-start cost).
+2. Opens a throwaway `SocketChannel`, attempts fd extraction via the
+   strategies above to detect which one works on this device.
+3. Caches the result (`winningStrategy`) and pre-emits the canonical
+   `splice: kernel zero-copy active` or `splice: NIO fallback engaged`
+   log line, so the widget badge refines from generic `TCP` to
+   `TCP (splice)` / `TCP (NIO)` *before* the uplink dials.
+
+Without warmup, every reconnect after a server-side restart or app
+update would race a dozen-plus simultaneous OPEN-driven bridge
+threads through the cold splice path (`System.loadLibrary` serialised
+across them, strategy probing redone on each call). Adding ~10-50 ms
+to `start()` is a fair trade for a clean first burst.
+
+#### TCP socket tuning
+
+Every TCP socket the NATIVE engine opens — control, data pool,
+target dials — gets a 4 MiB hint applied to `SO_RCVBUF` and
+`SO_SNDBUF` BEFORE `connect()`:
+
+- **Why before connect**: on Linux the TCP window scaling is decided
+  during the SYN handshake based on the receive buffer size at that
+  moment. Setting it after connect is a no-op for the connection's
+  effective window.
+- **Why 4 MiB**: bandwidth × RTT defines max in-flight bytes. At
+  RTT = 200 ms (cellular or trans-continental Wi-Fi path to a
+  datacenter registrator), the Android default receive buffer of
+  ~208 KiB caps a single TCP flow at ~8 Mbps. 4 MiB raises the cap
+  to ~160 Mbps per flow.
+- **Why ask for more than Android typically grants**: the kernel may
+  clamp to `net.core.rmem_max` / `wmem_max` (often 4–8 MiB on modern
+  ROMs). Asking for 4 MiB and accepting whatever the OS gives is
+  cheaper than per-device tuning.
+
+This was the root cause of an early NATIVE-engine bug where upload
+throughput hit ~7 Mbps on high-RTT paths — Go's BINARY engine
+happened to use socket sizes that triggered different kernel
+auto-tuning behaviour. The explicit hint normalises behaviour.
+
+#### Native build
+
+The JNI shim is built by AGP's CMake integration. Relevant files:
+
+- `app/src/main/cpp/splice_shim.c` — the C source (`extractFd` +
+  `spliceLoop` JNI functions). ~30 lines of business logic.
+- `app/src/main/cpp/CMakeLists.txt` — minimal CMake project. C11,
+  `-O2 -ffunction-sections`, `-Wl,--gc-sections` to keep the output
+  ≤ 15 KiB per ABI.
+- `app/build.gradle.kts` — `android.externalNativeBuild.cmake` block
+  points at the CMakeLists; `defaultConfig.ndk.abiFilters` is
+  `["arm64-v8a", "x86"]` to match the pre-built `libproxyagent.so`
+  in `app/src/main/jniLibs/`. `ndkVersion = "26.3.11579264"`,
+  `cmake.version = "3.22.1"` — both pinned and matched in
+  `.github/workflows/build.yml` so CI uses the same toolchain.
+
+If the user runs on an ABI without a matching `.so` (e.g. armv7
+device on this build), `System.loadLibrary` fails, warmup logs
+`splice: libagentsplice.so unavailable, NIO fallback only`, and
+every tunnel goes through NIO. No crash, just lost optimisation.
+
+### Splice telemetry
+
+Every splice event is logged through `NativeProxyAgent`'s log sink,
+so it lands in `agent.log` alongside the rest of the native-engine
+output. Each event fires at most once per process via
+`AtomicBoolean.compareAndSet`, so the log isn't chatty:
+
+| Log line | When |
+| --- | --- |
+| `splice: libagentsplice.so loaded` | First successful `System.loadLibrary`. |
+| `splice: libagentsplice.so unavailable, NIO fallback only` | `loadLibrary` threw (ABI mismatch / stripped APK). |
+| `splice: kernel zero-copy active` (with `strategy=...`, `via=warmup`) | Warmup probe succeeded — fd extraction works on this device. |
+| `splice: NIO fallback engaged` (with `reason=...`) | All fd-extraction strategies refused; subsequent tunnels will use the NIO bridge. The `reason` field tells you exactly which step failed (`library_not_loaded`, `fd_extraction_failed_src:hidden_api_blocked`, `fd_extraction_failed_src:fd_field_not_found`, `fd_extraction_failed_src:fd_object_null`, `spliceLoop_threw:<ExceptionClass>`, `native_setup_failed`). |
+| `splice: session summary` (on supervisor stop) | `strategy=<name|none>`, `tunnels_spliced=N`, `tunnels_fallback=N`, `bytes_spliced=N`, `mib_spliced=N.NN`. Counters are process-wide across agent restarts within the same `:proxy` lifetime — a feature for diagnosing uptime-level throughput without per-restart noise. |
+
+`ProxyService.parseAgentLine` watches the `kernel zero-copy active`
+and `NIO fallback engaged` lines and refines the widget transport
+badge accordingly (see [`conn_info` schema](#conn_info-schema) field
+6). The badge is sticky: once `TCP (splice)` is shown, a later
+fallback log line doesn't downgrade it — the assumption being that
+some splice activity is better than none.
 
 ### REBOOT path differences
 
@@ -223,9 +369,17 @@ direct pref tampering). See the trade-off matrix below.
 
 ### Drop-in for third-party apps
 
-`NativeProxyAgent.kt` + `QuicTransport.kt` form a self-contained,
-stdlib-only drop-in. Copy them into any Android (or plain JVM)
-project:
+The NATIVE engine ships as a small set of files designed to be
+copy-pasted into another Android (or plain JVM) project. Three
+tiers, pick what you want:
+
+| Tier | Files to copy | What you get | Extra deps |
+| --- | --- | --- | --- |
+| **Minimum** | `nativeagent/NativeProxyAgent.kt` + `nativeagent/QuicTransport.kt` | TCP-only agent with NIO + DirectByteBuffer bridge. Works on any Android / JVM. | None — stdlib only. |
+| **+ QUIC** | Above + `nativeagent/KwikQuicTransport.kt` | Adds QUIC uplink as an auto-negotiated fallback to TCP. | `tech.kwik:kwik:0.10.10` and core library desugaring for `java.time.Duration` (Android minSdk 21..25). Wire `quicTransportFactory = KwikQuicTransport.Factory()`. |
+| **+ splice zero-copy** | Above + `nativeagent/SpliceShim.kt` + `cpp/splice_shim.c` + `cpp/CMakeLists.txt` | TCP fast path becomes kernel `splice(2)` when supported (Linux, including Android). Userspace NIO is the automatic fallback. | AGP `externalNativeBuild` + NDK; see `app/build.gradle.kts` for the exact config. Adds ~15 KiB per ABI to the APK. |
+
+Usage:
 
 ```kotlin
 val agent = NativeProxyAgent()
@@ -239,25 +393,33 @@ agent.start(NativeProxyAgent.Config(
     registratorHost = "registrator.example.com",
     registratorPort = 8443,
     agentKey = "your-key",
-    workDir = filesDir,
+    workDir = filesDir,                                  // for transport cache
+    quicTransportFactory = KwikQuicTransport.Factory(),  // optional
 ))
 // ...
 agent.stop()
 ```
 
-TCP works out of the box with no extra dependencies. To enable QUIC,
-add `tech.kwik:kwik:0.10.10` + core library desugaring (for
-`java.time.Duration` on minSdk 21..25) and drop `KwikQuicTransport.kt`
-in too:
+Behaviour notes for integrators:
 
-```kotlin
-quicTransportFactory = KwikQuicTransport.Factory()
-```
-
-The agent honours `Config.dnsServers` (CSV: `"8.8.8.8,1.1.1.1"`) and
-`setDnsServers(...)` at runtime — useful when `/etc/resolv.conf` is
-unreachable from a sandboxed app, or when the integrator wants
-egress through a specific resolver.
+- Splice attempts loading `libagentsplice.so` lazily on first
+  bridge call, or eagerly via `SpliceShim.warmup()` which we
+  recommend calling once at start. Either way, if the .so isn't
+  present (because you didn't bundle it, or no ABI match), the
+  NATIVE engine silently uses the NIO bridge. No crash, no
+  configuration needed.
+- `SpliceShim.setLogger { level, msg, fields -> ... }` lets you
+  route splice diagnostic lines into your own log infrastructure.
+  Defaults to silent.
+- `Config.dnsServers` (CSV: `"8.8.8.8,1.1.1.1"`) and
+  `setDnsServers(...)` at runtime let you override DNS — useful
+  when `/etc/resolv.conf` is unreachable from a sandboxed app, or
+  when egress should go through a specific resolver. When empty,
+  the JVM's default resolver is used.
+- `setRebootListener` is the typed alternative to parsing the
+  `"REBOOT received from registrator"` log line. Use whichever fits
+  your IPC story; don't use both unless you handle idempotency
+  yourself (the line is also emitted to the log sink).
 
 ## Connection modes
 

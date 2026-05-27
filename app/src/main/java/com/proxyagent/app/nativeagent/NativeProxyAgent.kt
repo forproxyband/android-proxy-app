@@ -207,6 +207,17 @@ class NativeProxyAgent {
                 else -> logInfo(msg, *pairs)
             }
         }
+        // Pre-flight splice probe — synchronous because the cost is
+        // negligible (~5-20ms total: one dlopen + one throwaway socket
+        // + one fd extraction attempt) and we want the result
+        // available before the supervisor opens its first OPEN-driven
+        // tunnel. Without this, after a server-side restart or app
+        // update everybody's first dozen tunnels would race through
+        // the cold splice path (dlopen serialised across threads,
+        // strategy probing redone on each call). Now the agent says
+        // "I'm using splice" the moment it goes live, and the hot
+        // path is just two PFD calls + the splice(2) syscall pair.
+        try { SpliceShim.warmup() } catch (_: Throwable) {}
         val t = Thread({ supervisorMain(config) }, "NativeProxyAgent-Supervisor").apply {
             isDaemon = true
         }

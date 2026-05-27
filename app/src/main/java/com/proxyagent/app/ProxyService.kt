@@ -289,10 +289,20 @@ class ProxyService : Service() {
                 //   • v2.0.10..v2.0.13 logged the same "uplink connected" line
                 //     without the key — always TCP+yamux there.
                 //   • pre-v2.0.10 logged "ws connected" with no key — WebSocket.
+                //
+                // For the NATIVE engine the TCP fast path may or may not use
+                // kernel splice — depends on whether libagentsplice.so loaded
+                // and fd extraction works on this device. We can't tell yet
+                // at "uplink connected" time (the first tunnel hasn't opened),
+                // so we start with a neutral "TCP" and refine to either
+                // "TCP (splice)" or "TCP (NIO)" when the splice subsystem
+                // reports its outcome on the first bridge call. BINARY/AAR
+                // engines reliably do splice via Go's io.Copy on TCPConn,
+                // so for them we keep "TCP (splice)" as before.
                 currentUplinkTransport = if (line.contains("uplink connected")) {
                     when (transportRe.find(line)?.groupValues?.get(1)?.lowercase(Locale.US)) {
                         "quic" -> "QUIC"
-                        "tcp" -> "TCP (splice)"
+                        "tcp" -> if (engine == Engine.NATIVE) "TCP" else "TCP (splice)"
                         null -> "TCP+yamux"
                         else -> transportRe.find(line)?.groupValues?.get(1)?.uppercase(Locale.US).orEmpty()
                     }
@@ -368,6 +378,28 @@ class ProxyService : Service() {
             line.contains("REBOOT received from registrator") -> {
                 val reason = rebootReasonRe.find(line)?.groupValues?.get(1).orEmpty().trim()
                 triggerAutoIpCycle(reason)
+            }
+            // NATIVE engine splice diagnostics — refine the "TCP" badge
+            // into either "TCP (splice)" or "TCP (NIO)" depending on
+            // whether the kernel zero-copy shim activated. We only
+            // touch the label when the current value is the bare "TCP"
+            // we set in the "uplink connected" branch, OR when an
+            // earlier fallback decision is being upgraded to splice.
+            //
+            // Ordering policy: success wins over fallback. If splice
+            // ever activates this session, the badge becomes
+            // "TCP (splice)" and STAYS there — even if some later
+            // tunnel hits NIO fallback (which shouldn't happen given
+            // SpliceShim's once-per-process strategy caching, but
+            // we're defensive in case future Android versions cause
+            // partial breakage).
+            line.contains("splice: kernel zero-copy active") -> {
+                if (engine == Engine.NATIVE) currentUplinkTransport = "TCP (splice)"
+            }
+            line.contains("splice: NIO fallback engaged") -> {
+                if (engine == Engine.NATIVE && currentUplinkTransport != "TCP (splice)") {
+                    currentUplinkTransport = "TCP (NIO)"
+                }
             }
         }
     }

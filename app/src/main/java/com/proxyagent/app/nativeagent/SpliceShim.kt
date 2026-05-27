@@ -85,6 +85,80 @@ internal class SpliceShim {
             logger = fn
         }
 
+        /**
+         * Pre-flight splice readiness check. Loads the native library
+         * AND probes which fd-extraction strategy works on this
+         * device — both on a throwaway [SocketChannel] so the first
+         * real tunnel doesn't pay the cold-start cost. Emits the
+         * usual "splice: kernel zero-copy active" or "splice: NIO
+         * fallback engaged" line through the registered [Logger]
+         * so [ProxyService.parseAgentLine] can update the widget
+         * badge BEFORE the uplink even connects.
+         *
+         * Effect on the hot path:
+         *  - `loggedFirstSuccess` / `loggedFallback` flags get
+         *    flipped here, so the same lines aren't re-emitted
+         *    when actual tunnels hit [copy].
+         *  - `winningStrategy` is cached, so [copy] doesn't have to
+         *    re-determine which extraction path works on every
+         *    tunnel direction.
+         *
+         * Why we use a throwaway SocketChannel for probing:
+         *  - `SocketChannelImpl` opens a kernel fd in its constructor
+         *    (before connect), so unconnected channels have a valid
+         *    FileDescriptor. That's enough for fd extraction tests.
+         *  - We close the throwaway after the probe, so we leak
+         *    nothing.
+         *
+         * Idempotent — safe to call multiple times. After the first
+         * call sets the flags, subsequent calls are nearly no-ops.
+         */
+        fun warmup() {
+            if (!ensureLoaded()) return  // already logged in ensureLoaded
+
+            var ch: SocketChannel? = null
+            val packed = try {
+                ch = SocketChannel.open()
+                // Try PFD first; fall through to JNI strategies if it
+                // doesn't yield a usable fd (e.g. SocketAdaptor on a
+                // future Android refusing to expose its FileDescriptor).
+                val viaPfd = fdViaPfd(ch)
+                if (viaPfd >= 0) viaPfd else fdOf(ch)
+            } catch (t: Throwable) {
+                logFallbackOnce("warmup_exception:${t.javaClass.simpleName}")
+                try { ch?.close() } catch (_: Throwable) {}
+                return
+            }
+            try { ch?.close() } catch (_: Throwable) {}
+
+            if (packed >= 0) {
+                val strategy = ((packed shr 32) and 0xFFL).toInt()
+                cacheStrategyOnce(strategy)
+                // Emit the canonical "active" line so the UI badge
+                // refines from "TCP" → "TCP (splice)" before the
+                // first real tunnel opens. Per-copy invocations will
+                // see loggedFirstSuccess already set and skip the
+                // duplicate log.
+                if (loggedFirstSuccess.compareAndSet(false, true)) {
+                    logger?.invoke(
+                        "INFO",
+                        "splice: kernel zero-copy active",
+                        mapOf(
+                            "strategy" to (winningStrategy ?: strategyName(strategy)),
+                            "via" to "warmup",
+                        ),
+                    )
+                }
+            } else {
+                // Pre-emptive fallback decision — extraction failed
+                // on a virgin SocketChannel, so it's not going to work
+                // for real tunnels either. Log the reason once now;
+                // copy() will silently take the NIO path without
+                // re-logging.
+                logFallbackOnce("warmup:${decodeFdError(packed)}")
+            }
+        }
+
         /** Snapshot of total bytes moved through kernel splice across
          *  all tunnels in this process. Useful for surfacing in a
          *  diagnostics panel or "Save log" footer. Resets only when
@@ -170,6 +244,21 @@ internal class SpliceShim {
             val strategy = ((srcPacked shr 32) and 0xFFL).toInt()
             cacheStrategyOnce(strategy)
 
+            // Emit the "active" line BEFORE entering spliceLoop —
+            // that syscall blocks until either side EOFs, which on
+            // a long-lived tunnel can mean many minutes of silence.
+            // The user wants to know "is splice engaged right now",
+            // not "did splice eventually complete", so we log as
+            // soon as we have valid fds and are about to hand off
+            // to the kernel.
+            if (loggedFirstSuccess.compareAndSet(false, true)) {
+                logger?.invoke(
+                    "INFO",
+                    "splice: kernel zero-copy active",
+                    mapOf("strategy" to (winningStrategy ?: strategyName(strategy))),
+                )
+            }
+
             val result = try {
                 singleton.spliceLoop(fdSrc, fdDst, CHUNK_BYTES)
             } catch (t: Throwable) {
@@ -185,21 +274,11 @@ internal class SpliceShim {
                 logFallbackOnce("native_setup_failed")
                 return false
             }
-            // Success — accumulate bytes and emit a one-shot "active"
-            // line on first transfer of this process.
+            // Direction completed successfully — accumulate counters
+            // for the session summary line.
             tunnelsSpliced.incrementAndGet()
             if (result > 0) {
                 totalSplicedBytes.addAndGet(result)
-            }
-            if (loggedFirstSuccess.compareAndSet(false, true)) {
-                logger?.invoke(
-                    "INFO",
-                    "splice: kernel zero-copy active",
-                    mapOf(
-                        "strategy" to (winningStrategy ?: strategyName(strategy)),
-                        "first_bytes" to result,
-                    ),
-                )
             }
             return true
         }
