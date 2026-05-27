@@ -218,6 +218,7 @@ internal class Connection(
             ourInitialMaxStreamData = ourTransportParameters.initialMaxStreamDataBidiLocal,
             peerMaxStreamData = peerTransportParameters?.initialMaxStreamDataBidiRemote ?: 0L,
         )
+        s.sendWakeup = { sendQueue.offer(QueuedSendWork.Tick) }
         streams[id] = s
         return s
     }
@@ -257,7 +258,7 @@ internal class Connection(
             try {
                 socket.receive(pkt)
                 packetCount++
-                log("recv: pkt#$packetCount size=${pkt.length} firstByte=0x${(buf[0].toInt() and 0xFF).toString(16)}")
+                if (verboseWire) log("recv: pkt#$packetCount size=${pkt.length} firstByte=0x${(buf[0].toInt() and 0xFF).toString(16)}")
                 processDatagram(buf, pkt.length)
             } catch (_: java.net.SocketTimeoutException) {
                 // Normal — loop polls closed flag.
@@ -421,7 +422,7 @@ internal class Connection(
                     // whether the server is acking our packets — particularly
                     // our PING keepalives. `acked_now` is how many of OUR sent
                     // packets this ACK newly covered.
-                    if (space == PacketNumberSpace.ONE_RTT) {
+                    if (verboseWire && space == PacketNumberSpace.ONE_RTT) {
                         log("recv ACK: largest=${frame.largestAcked} ranges=${frame.ranges.size} acked_now=${acked.size} cc.in_flight=${cc.bytesInFlight}")
                     }
                 }
@@ -444,6 +445,7 @@ internal class Connection(
                             ourInitialMaxStreamData = ourTransportParameters.initialMaxStreamDataBidiRemote,
                             peerMaxStreamData = peerTransportParameters?.initialMaxStreamDataBidiLocal ?: 0L,
                         )
+                        ns.sendWakeup = { sendQueue.offer(QueuedSendWork.Tick) }
                         incomingServerStreams.offer(ns)
                         statsNewServerStreams.incrementAndGet()
                         ns
@@ -451,14 +453,18 @@ internal class Connection(
                     if (isNew) log("recv STREAM: NEW server stream id=${frame.streamId} peer_max=${s.peerMaxStreamData} queue_size=${incomingServerStreams.size}")
                     s.acceptStreamFrame(frame)
                     flow.onBytesReceived(frame.data.size)
-                    log("recv STREAM: id=${frame.streamId} offset=${frame.offset} len=${frame.data.size} fin=${frame.fin} readOffset=${s.recvBuffer.readOffset}")
+                    if (verboseWire) log("recv STREAM: id=${frame.streamId} offset=${frame.offset} len=${frame.data.size} fin=${frame.fin} readOffset=${s.recvBuffer.readOffset}")
                 }
                 is MaxData -> {
                     flow.applyPeerMaxData(frame.maxData)
-                    log("recv MAX_DATA: $frame.maxData")
+                    // The peer just widened our connection send window — a
+                    // sender parked on flow control can resume now, so wake it.
+                    sendQueue.offer(QueuedSendWork.Tick)
+                    log("recv MAX_DATA: ${frame.maxData}")
                 }
                 is MaxStreamData -> {
                     streams[frame.streamId]?.applyMaxStreamData(frame.maxStreamData)
+                    sendQueue.offer(QueuedSendWork.Tick)  // may unblock a stream's send
                     log("recv MAX_STREAM_DATA: id=${frame.streamId} max=${frame.maxStreamData}")
                 }
                 is MaxStreams -> { log("recv MAX_STREAMS: bidi=${frame.bidi} max=${frame.maxStreams}") }
@@ -532,6 +538,61 @@ internal class Connection(
     @Volatile private var lastAckElicitingSendNanos: Long = System.nanoTime()
     private val keepAliveIntervalNanos: Long = 15_000_000_000L  // 15 s
 
+    // ── Send pacing (token bucket) ────────────────────────────
+    //
+    // Why a token bucket instead of Brutal CC's per-packet
+    // `nextSendTimeNanos` gate: that gate requires the sender to
+    // wait precisely ~88 µs between 1200-byte packets to hit
+    // 100 Mbps. Android's sleep/park granularity is coarse (often
+    // 1-15 ms), so per-packet waiting either over-sleeps (→ a tiny
+    // fraction of target throughput) or, as the OLD drainStreams
+    // did, computed `Thread.sleep(88000 / 1_000_000)` == sleep(0)
+    // and so sent exactly ONE frame per 20 ms sender tick — about
+    // 440 Kbps for the WHOLE connection, which is why the in-house
+    // QUIC "loaded nothing" while kwik worked. A wall-clock-refilled
+    // byte budget is immune to sleep granularity (it measures
+    // elapsed time, not sleep duration) and mirrors quic-go's
+    // pacer.Budget() far more closely than the timestamp gate. Only
+    // the sender thread touches these, so no synchronization.
+    private var paceBudgetBytes: Long = 0L
+    private var lastPaceRefillNanos: Long = System.nanoTime()
+    /** Burst cap (bytes). Bounds how much a long-idle connection may
+     *  dump at once and bounds the latency control frames wait behind
+     *  one drain pass. ~5 ms of data at 100 Mbps. */
+    private val paceMaxBurstBytes: Long = 64 * 1024L
+    /** Per-packet wire overhead (short header + PN + AEAD tag + STREAM
+     *  frame header) charged against the budget so we pace wire bytes,
+     *  not just payload. */
+    private val streamFrameWireOverhead = 40
+    /** cwnd-gate probe size — one full ~1200-byte packet. */
+    private val probePacketSize = 1200
+    /** Max STREAM-frame payload per packet (room for header + tag in a
+     *  1200-byte datagram). */
+    private val maxStreamFramePayload = 1100L
+
+    /** Gate for high-frequency wire logs (per-packet send/recv,
+     *  per-ACK, per-STREAM-frame). OFF by default: at 100 Mbps these
+     *  fire ~10k×/s and both flood logcat and throttle the sender. Flip
+     *  to true only for deep wire debugging — the 5-second `stats:`
+     *  line stays on and is the normal diagnostic. */
+    private val verboseWire = false
+
+    /** Refill [paceBudgetBytes] from wall-clock elapsed time at the
+     *  CC's target rate, capped at [paceMaxBurstBytes]. */
+    private fun refillPaceBudget() {
+        val now = System.nanoTime()
+        val elapsed = now - lastPaceRefillNanos
+        if (elapsed <= 0L) return
+        lastPaceRefillNanos = now
+        val add = cc.targetBytesPerSecond * elapsed / 1_000_000_000L
+        if (add > 0L) paceBudgetBytes = (paceBudgetBytes + add).coerceAtMost(paceMaxBurstBytes)
+    }
+
+    /** True if any stream still has queued payload or an unsent FIN. */
+    private fun anyStreamHasData(): Boolean = streams.values.any {
+        it.sendBuffer.queuedBytes > 0 || (it.sendBuffer.closed && !it.sentFin)
+    }
+
     private fun queueCryptoData(space: PacketNumberSpace, data: ByteArray) {
         pendingCrypto.merge(space, data) { a, b -> a + b }
     }
@@ -550,9 +611,15 @@ internal class Connection(
     private fun senderLoop() {
         log("senderLoop: started")
         var lastStatsLogNanos = System.nanoTime()
+        // Adaptive wait: short (2 ms) while streams still have buffered
+        // data so the pace bucket keeps flowing; long (20 ms) when idle.
+        // A write to any stream offers a Tick that cuts the idle wait
+        // short, so the first byte of a new response goes out promptly
+        // instead of waiting up to 20 ms.
+        var nextPollMs = 20L
         while (!closed.get()) {
             try {
-                sendQueue.poll(20, TimeUnit.MILLISECONDS)  // wait up to 20ms
+                sendQueue.poll(nextPollMs, TimeUnit.MILLISECONDS)
 
                 // Periodic stats — every 5 seconds. Helps see at a
                 // glance whether we're getting STREAM frames at all,
@@ -600,8 +667,26 @@ internal class Connection(
                     }
                 }
 
-                // Priority 4: STREAM frames, paced.
-                if (oneRttSpace.ready()) drainStreams()
+                // Priority 3b: per-stream MAX_STREAM_DATA window-updates.
+                // The connection-level MAX_DATA above is necessary but NOT
+                // sufficient — the peer is bounded by BOTH the connection
+                // window and each individual stream's window. Without these
+                // per-stream bumps a download stalls once the peer fills the
+                // initial per-stream credit (fine for a page load, fatal for
+                // a download speed test). Emitted on this same control-
+                // priority tick — ahead of STREAM draining — so a busy
+                // data-sending pass can never starve credit extension.
+                if (oneRttSpace.ready()) {
+                    for ((id, stream) in streams) {
+                        stream.maybeExtendRecvWindow()?.let { newMax ->
+                            log("send MAX_STREAM_DATA: id=$id max=$newMax")
+                            emitOneRttPacket(listOf(MaxStreamData(id, newMax)))
+                        }
+                    }
+                }
+
+                // Priority 4: STREAM frames, paced via the token bucket.
+                val workRemains = if (oneRttSpace.ready()) drainStreams() else false
 
                 // Priority 5: PING keepalive. ACK frames are not
                 // ack-eliciting; if we send only ACKs for too long, the
@@ -613,6 +698,10 @@ internal class Connection(
                     log("send PING (keepalive after ${(System.nanoTime() - lastAckElicitingSendNanos) / 1_000_000}ms idle)")
                     emitOneRttPacket(listOf(Ping))
                 }
+
+                // Keep topping up the pace bucket while data remains;
+                // fall back to the idle cadence otherwise.
+                nextPollMs = if (workRemains) 2L else 20L
             } catch (t: Throwable) {
                 if (!closed.get()) {
                     // SURFACE these — silent swallow hides bugs like
@@ -625,34 +714,50 @@ internal class Connection(
         log("senderLoop: exit")
     }
 
-    private fun drainStreams() {
-        // Round-robin streams; each gets one packet's worth per pass.
-        for ((_, stream) in streams) {
-            val budget = 1100  // approx room for one STREAM frame's payload in a 1200-byte packet
-            if (!cc.canSendNow(budget)) {
-                val wait = cc.waitNanos(budget)
-                if (wait > 0 && wait != Long.MAX_VALUE) {
-                    try { Thread.sleep(wait / 1_000_000L) } catch (_: InterruptedException) {}
-                }
-                if (!cc.canSendNow(budget)) break
+    /**
+     * Drain buffered STREAM data onto the wire, paced by the token
+     * bucket and gated by congestion + flow control. Returns true if
+     * any stream still has data we couldn't send this pass (budget
+     * spent, cwnd full, or flow-control-blocked) so the sender loop
+     * tightens its poll interval and comes back promptly.
+     *
+     * Round-robin across streams: one frame per stream per inner pass,
+     * looping until the pace budget is spent or no stream can make
+     * progress. The OLD version sent ~1 frame per 20 ms tick (see the
+     * pacing note above) — this one sustains the CC's target rate.
+     */
+    private fun drainStreams(): Boolean {
+        refillPaceBudget()
+        outer@ while (paceBudgetBytes > 0L) {
+            var sentThisPass = false
+            for ((_, stream) in streams) {
+                val hasData = stream.sendBuffer.queuedBytes > 0 ||
+                              (stream.sendBuffer.closed && !stream.sentFin)
+                if (!hasData) continue
+                // Congestion-window gate (bytes-in-flight ceiling). cwnd
+                // is connection-wide, so once it's full no stream sends.
+                if (cc.bytesInFlight + probePacketSize > cc.congestionWindow) break@outer
+                // Connection-level flow control: budget the poll by the
+                // available credit so we NEVER drain more from the send
+                // buffer than we're allowed to send. The OLD code polled
+                // first and then `break`-ed on insufficient credit,
+                // silently DROPPING the already-dequeued frame — a hole in
+                // the stream's byte sequence that corrupts the transfer.
+                // budget==0 still lets a closing stream emit a zero-length
+                // FIN (carries no data, so needs no flow credit).
+                val connCredit = flow.sendCredit()
+                val budget = connCredit.coerceIn(0L, maxStreamFramePayload).toInt()
+                val frame = stream.pollSendFrame(budget) ?: continue  // per-stream/conn flow-blocked
+                flow.onBytesSent(frame.data.size)
+                emitOneRttPacket(listOf(frame))
+                paceBudgetBytes -= (frame.data.size + streamFrameWireOverhead)
+                sentThisPass = true
+                if (verboseWire) log("send STREAM: id=${frame.streamId} offset=${frame.offset} len=${frame.data.size} fin=${frame.fin}")
+                if (paceBudgetBytes <= 0L) break@outer
             }
-            val queuedBefore = stream.sendBuffer.queuedBytes
-            val frame = stream.pollSendFrame(budget)
-            if (frame == null) {
-                // Log only if there's buffered data we couldn't send (flow-control stall).
-                if (queuedBefore > 0) {
-                    log("drainStreams: stream id=${stream.streamId} STALLED queued=${queuedBefore} sendOffset=${stream.sendOffset} peerMax=${stream.peerMaxStreamData}")
-                }
-                continue
-            }
-            if (!flow.canSend(frame.data.size)) {
-                log("drainStreams: connection-level FLOW STALL: sendCredit=${flow.sendCredit()} needed=${frame.data.size}")
-                break
-            }
-            flow.onBytesSent(frame.data.size)
-            log("send STREAM: id=${frame.streamId} offset=${frame.offset} len=${frame.data.size} fin=${frame.fin}")
-            emitOneRttPacket(listOf(frame))
+            if (!sentThisPass) break  // no stream could make progress this pass
         }
+        return anyStreamHasData()
     }
 
     // ── Packet emission ────────────────────────────────────────
@@ -777,7 +882,7 @@ internal class Connection(
         // Send on wire.
         try {
             socket.send(DatagramPacket(fullPacket, fullPacket.size, resolvedAddress))
-            log("send: space=$space pn=$pn size=${fullPacket.size}B frames=${frames.joinToString { it.javaClass.simpleName }}")
+            if (verboseWire) log("send: space=$space pn=$pn size=${fullPacket.size}B frames=${frames.joinToString { it.javaClass.simpleName }}")
         } catch (t: Throwable) {
             log("send: ${t.javaClass.simpleName}: ${t.message}")
         }

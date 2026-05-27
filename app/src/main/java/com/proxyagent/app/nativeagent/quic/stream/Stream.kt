@@ -75,6 +75,15 @@ internal class Stream(
     val input: InputStream = StreamInputStream(this)
     val output: OutputStream = StreamOutputStream(this)
 
+    /** Optional hook the connection installs so a write to this
+     *  stream's [output] promptly wakes the sender loop instead of
+     *  waiting out its idle poll (≤20 ms). Invoked on the writing
+     *  (bridge) thread, so keep it cheap — just an offer to the send
+     *  queue. Without it, the first byte of every server response
+     *  would sit buffered up to one idle tick before going on the
+     *  wire, adding latency to every tunnel. */
+    @Volatile var sendWakeup: (() -> Unit)? = null
+
     /**
      * Called by the sender thread to drain up to [maxBytes]
      * of pending data plus a FIN flag if the send side is
@@ -153,6 +162,17 @@ internal class Stream(
     fun applyMaxStreamData(newMax: Long) = lock.withLock {
         if (newMax > peerMaxStreamData) peerMaxStreamData = newMax
     }
+
+    /**
+     * Returns a new MAX_STREAM_DATA value to advertise to the peer
+     * if the application has drained enough of this stream's
+     * receive window to warrant extending credit, else null.
+     * Called by the connection sender loop on each tick; the
+     * caller emits a MAX_STREAM_DATA frame for any non-null value.
+     * Delegates to [ReceiveBuffer.maybeExtendWindow], which takes
+     * its own lock — no need to hold the Stream lock here.
+     */
+    fun maybeExtendRecvWindow(): Long? = recvBuffer.maybeExtendWindow()
 
     /** Mark send side closed (FIN to be set on next/last frame). */
     fun closeSend() = lock.withLock { sendBuffer.close() }
@@ -252,8 +272,20 @@ internal class ReceiveBuffer(initialMaxOffset: Long) {
     private var finalSize: Long = -1L
     @Volatile var maxOffsetAllowed: Long = initialMaxOffset
         private set
+    /** The initial window size, retained so [maybeExtendWindow]
+     *  can re-grant a full window each time the consumed prefix
+     *  crosses the half-window mark. */
+    private val initialWindow: Long = initialMaxOffset
     private val readable = ArrayDeque<ByteArray>()
     private var readableHeadOffset = 0
+    /** Total bytes the application has actually drained via
+     *  [readBlocking]. Distinct from [readOffset], which advances
+     *  as soon as contiguous bytes are promoted into [readable]
+     *  (i.e. *received*, not yet *read*). Flow-control window
+     *  extension keys off THIS so a slow downstream applies real
+     *  backpressure instead of letting [readable] grow unbounded. */
+    @Volatile var consumedOffset: Long = 0L
+        private set
     private val lock = ReentrantLock()
     private val notEmpty = lock.newCondition()
 
@@ -283,18 +315,36 @@ internal class ReceiveBuffer(initialMaxOffset: Long) {
             effectiveOffset = offset
             effectiveData = data
         }
-        pending[effectiveOffset] = effectiveData
+        // Insert, keeping the LONGER frame on a same-offset collision.
+        // A shorter retransmit must not clobber a longer one already
+        // buffered (that would silently drop the tail bytes).
+        val existing = pending[effectiveOffset]
+        if (existing == null || effectiveData.size > existing.size) {
+            pending[effectiveOffset] = effectiveData
+        }
         if (effectiveOffset + effectiveData.size > highWaterOffset) {
             highWaterOffset = effectiveOffset + effectiveData.size
         }
-        // Drain contiguous prefix into readable.
+        // Drain everything contiguous (or overlapping) with readOffset.
+        // CRITICAL: the head entry's key can be < readOffset when an
+        // out-of-order frame was buffered before readOffset advanced
+        // past its start (e.g. [50:150] arrives, then [0:80] drains
+        // readOffset to 80, leaving [50:150] with key 50 < 80). The
+        // old `key != readOffset` break stranded those bytes forever
+        // and stalled the stream. We now trim the already-read prefix
+        // and only stop at a genuine gap (key > readOffset).
         var advanced = false
         while (true) {
             val head = pending.firstEntry() ?: break
-            if (head.key != readOffset) break
+            if (head.key > readOffset) break  // genuine hole — wait for it to fill
             pending.remove(head.key)
-            readable.addLast(head.value)
-            readOffset += head.value.size
+            val entryEnd = head.key + head.value.size
+            if (entryEnd <= readOffset) continue  // wholly stale duplicate — drop
+            val skip = (readOffset - head.key).toInt()  // ≥ 0
+            val fresh = if (skip == 0) head.value
+                        else head.value.copyOfRange(skip, head.value.size)
+            readable.addLast(fresh)
+            readOffset += fresh.size
             advanced = true
         }
         if (advanced) notEmpty.signalAll()
@@ -310,6 +360,40 @@ internal class ReceiveBuffer(initialMaxOffset: Long) {
         if (newMax > maxOffsetAllowed) maxOffsetAllowed = newMax
     }
 
+    /**
+     * Auto-tuning receive-window update. Returns a new
+     * MAX_STREAM_DATA value to advertise when the application has
+     * consumed (read) more than half the current window, else
+     * null. The connection sender loop calls this each tick and
+     * emits a MAX_STREAM_DATA frame for any non-null result.
+     *
+     * Keyed off [consumedOffset] (bytes the application has
+     * actually drained via readBlocking), NOT [readOffset] (bytes
+     * promoted to readable) and NOT [highWaterOffset] (bytes
+     * received off the wire). Consuming-side tuning bounds our
+     * buffering to ~1.5x the initial window and applies correct
+     * backpressure: if the downstream TCP socket stalls, the proxy
+     * bridge stops reading, consumedOffset stops advancing, and we
+     * stop extending credit — which is exactly what flow control is
+     * for. (Connection-level MAX_DATA keys off received-bytes as a
+     * pragmatic shortcut because nothing tracked consumed bytes
+     * there; per-stream we have the true consume cursor, so we do
+     * it the RFC-9000-§4.1-correct way.)
+     *
+     * Without this, every download stream stalls once the peer
+     * fills the initial per-stream window — the connection-level
+     * MAX_DATA bump alone is necessary but NOT sufficient (the
+     * peer is bounded by the MIN of the two windows).
+     */
+    fun maybeExtendWindow(): Long? = lock.withLock {
+        val cur = maxOffsetAllowed
+        if (consumedOffset > cur - initialWindow / 2) {
+            val next = consumedOffset + initialWindow
+            maxOffsetAllowed = next
+            next
+        } else null
+    }
+
     /** Block until at least one byte is readable or EOF. */
     fun readBlocking(): Int = lock.withLock {
         while (readable.isEmpty() && !eofReached) notEmpty.await()
@@ -317,6 +401,7 @@ internal class ReceiveBuffer(initialMaxOffset: Long) {
         val head = readable.first()
         val b = head[readableHeadOffset].toInt() and 0xFF
         readableHeadOffset++
+        consumedOffset++
         if (readableHeadOffset >= head.size) {
             readable.removeFirst()
             readableHeadOffset = 0
@@ -340,6 +425,7 @@ internal class ReceiveBuffer(initialMaxOffset: Long) {
                 readableHeadOffset = 0
             }
         }
+        consumedOffset += written
         written
     }
 }
@@ -362,11 +448,14 @@ private class StreamInputStream(private val stream: Stream) : InputStream() {
 private class StreamOutputStream(private val stream: Stream) : OutputStream() {
     override fun write(b: Int) {
         stream.sendBuffer.write(byteArrayOf(b.toByte()))
+        stream.sendWakeup?.invoke()
     }
     override fun write(b: ByteArray, off: Int, len: Int) {
         stream.sendBuffer.write(b, off, len)
+        stream.sendWakeup?.invoke()
     }
     override fun close() {
         stream.closeSend()
+        stream.sendWakeup?.invoke()  // flush the FIN promptly
     }
 }

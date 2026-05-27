@@ -252,6 +252,60 @@ skipped entirely — the agent runs TCP-only and `chooseTransportOrder`
 returns `["tcp"]`. This is the path third-party integrators who
 don't want the kwik dependency take.
 
+### In-house QUIC (`NativeQuicTransport`) — send-path regression guards
+
+The second `QuicTransport.Factory`, `NativeQuicTransport`, is our
+hand-rolled QUIC v1 client (`nativeagent/quic/`), selectable at runtime
+via the Settings `quic_impl` toggle (`native` vs `kwik`). It exists so
+we can ship Brutal CC and prioritise control-frame emission — the two
+things kwik couldn't give us (see the do-not-revisit note above). Full
+design is in `nativeagent/quic/DESIGN.md`; the load-bearing invariants
+that are easy to regress:
+
+- **Send pacing is a wall-clock token bucket, NOT per-packet sleeps.**
+  `Connection.drainStreams` drains continuously, charging wire bytes
+  against `paceBudgetBytes` (refilled from elapsed-time × the CC target
+  rate, capped at a 64 KB burst). The earlier version gated each packet
+  on Brutal CC's `nextSendTimeNanos` plus `Thread.sleep(delayNanos/1e6)`
+  — which on Android rounds an 88 µs pacing delay to `sleep(0)` and so
+  sent **one frame per 20 ms sender tick (~440 Kbps for the entire
+  connection)**. That — not a throughput "gap" — is why the in-house
+  path appeared to "load nothing" while kwik worked. Do not reintroduce
+  per-packet sleeping; Android's sleep granularity makes it unusable.
+  The bucket measures elapsed time, so it is immune to sleep precision
+  and mirrors quic-go's `pacer.Budget()`.
+
+- **The sender loop must be woken on writes and window grants.** It
+  otherwise idle-polls at 20 ms, adding latency to every response.
+  `Stream.sendWakeup` (installed by `Connection` on both stream-creation
+  paths) offers a `Tick` when the bridge writes; receiving
+  `MAX_DATA` / `MAX_STREAM_DATA` also offers one so a flow-blocked
+  sender resumes at once. While data remains the loop polls at 2 ms.
+
+- **Never `pollSendFrame` then drop the frame.** `pollSendFrame`
+  dequeues from the send buffer and advances `sendOffset`; declining to
+  send it afterwards (e.g. on short connection credit) punches a hole in
+  the stream's byte sequence and corrupts the transfer. Budget the poll
+  by `flow.sendCredit()` up front instead — budget 0 still lets a
+  closing stream emit a zero-length FIN.
+
+- **Window updates ride the control-priority tick, keyed off CONSUMED
+  bytes.** `ReceiveBuffer.maybeExtendWindow()` re-grants a full window
+  when `consumedOffset` (advanced only in `readBlocking` — bytes the
+  bridge actually drained, not bytes merely received) crosses the
+  half-window mark. This bounds buffering and gives correct
+  backpressure: a slow downstream stops the bridge reading, which stops
+  credit extension. Connection-level `MAX_DATA` uses a coarser
+  received-bytes heuristic (nothing tracked consumed bytes there). The
+  peer is bounded by the MIN of the connection and per-stream windows,
+  so BOTH must be extended or a download stalls once one fills.
+
+- **Per-packet wire logs are gated behind `Connection.verboseWire`
+  (default off).** At line rate the per-send / per-ACK / per-STREAM
+  logs fire ~10k×/s, flooding logcat and throttling the sender thread.
+  The 5-second `stats:` line is the always-on diagnostic; flip
+  `verboseWire` on only for deep wire debugging.
+
 ### NATIVE engine TCP fast path
 
 The TCP bridge between a registrator-side data socket and the dialed

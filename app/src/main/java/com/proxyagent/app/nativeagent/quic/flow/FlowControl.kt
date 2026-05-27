@@ -56,16 +56,24 @@ internal class ConnectionFlowControl(
     fun onBytesConsumed(bytes: Int) { bytesConsumed.addAndGet(bytes.toLong()) }
 
     /**
-     * Returns a new MAX_DATA value to advertise if the consumed
-     * prefix has crossed half of the currently-advertised window,
-     * else null. Caller emits a MAX_DATA frame and updates the
-     * peer's perception.
+     * Returns a new connection-level MAX_DATA value to advertise if
+     * the peer has filled more than half the current window, else
+     * null. Caller emits a MAX_DATA frame.
+     *
+     * Keyed off [bytesReceived] (total the peer has sent us), NOT
+     * consumed: our proxy bridge drains received bytes straight into
+     * the target TCP socket, so "received" tracks usage closely
+     * enough and we never need a separate consume hook. The old
+     * implementation used `bytesConsumed`, which nothing ever
+     * incremented, so MAX_DATA was never sent and the peer stalled
+     * at the initial 12 MB window — fine for a page load, fatal for
+     * a download speed test.
      */
     fun shouldAdvertiseMaxData(): Long? {
         val cur = ourAdvertisedMaxData.get()
-        val consumed = bytesConsumed.get()
-        return if (consumed > cur - initialOurMaxData / 2) {
-            val next = consumed + initialOurMaxData
+        val received = bytesReceived.get()
+        return if (received > cur - initialOurMaxData / 2) {
+            val next = received + initialOurMaxData
             ourAdvertisedMaxData.set(next)
             next
         } else null
