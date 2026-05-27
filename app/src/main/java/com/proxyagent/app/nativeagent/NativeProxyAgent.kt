@@ -1444,10 +1444,33 @@ internal class Uplink(
      *  closes both ends so the other thread unblocks via EOF/EPIPE.
      *  Matches Go's pipeQUIC behaviour. */
     private fun bridgeStreams(input: InputStream, output: OutputStream, sock: Socket) {
-        // CountDownLatch(2): wait for both directions. Same reasoning
-        // as bridge() above — latch of 1 cuts the busy direction off
-        // when the quiet one half-closes first.
-        val done = java.util.concurrent.CountDownLatch(2)
+        // CountDownLatch(1) is intentional here, NOT (2) like bridge()
+        // above. Mirrors Go's pipeQUIC (uplink.go:622-636) which waits
+        // for exactly one direction.
+        //
+        // The TCP bridge() can wait for both because each copyChannel
+        // half-closes (shutdownOutput) on completion — that propagates
+        // FIN to the peer, so the OTHER direction's read returns EOF
+        // naturally and the second countDown fires.
+        //
+        // QUIC streams have no equivalent half-close that survives
+        // across this bridge: closing kwik's QuicStream output does
+        // not consistently unblock a paired read on the TCP target
+        // socket, and we have no way to half-close one direction of
+        // a QUIC stream without tearing down the whole stream. So we
+        // wait for ONE direction to finish, then the unconditional
+        // close pair below force-terminates the other thread's
+        // blocking read via socket close. The other thread's copy
+        // throws, its `catch (_: Throwable) {}` swallows it, and
+        // both threads exit. Same teardown semantics as Go's pattern
+        // of `<-done` then `defer Close()`.
+        //
+        // Trade-off: a few bytes in flight on the still-active
+        // direction may be lost on close. For QUIC speedtest /
+        // request-response traffic this is invisible; for protocols
+        // that depend on a clean FIN-on-both-sides this isn't the
+        // right primitive.
+        val done = java.util.concurrent.CountDownLatch(1)
         bridgeExecutor.execute {
             try { copyStream(input, sock.getOutputStream()) } catch (_: Throwable) {}
             finally { done.countDown() }

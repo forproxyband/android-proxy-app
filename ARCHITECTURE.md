@@ -258,12 +258,19 @@ int fd:
 | 3 | `FileDescriptor.descriptor: int` (older AOSP libcore name) | Same as 2 | Same |
 | 4 | `FileDescriptor.getInt$(): int` (Android `@hide` accessor) | JNI `GetMethodID` + `CallIntMethod` | Same |
 
-Strategy 0 (`ParcelFileDescriptor`) is the supported path on Android
-14+ — it works irrespective of `targetSdkVersion` or non-SDK
-enforcement state because every call we make is to public API.
-Strategies 1-4 are kept as fallbacks for older Android versions and
-the unlikely case where PFD refuses (e.g. a SocketAdaptor that
-doesn't expose its FD).
+**Order tried on the hot path**: 1 → 2 → 3 → 4 → 0. JNI strategies
+go first because they only *read* fields (no side effects). PFD goes
+last because `pfd.detachFd()` → `IoUtils.acquireRawFd()` calls
+`fd.setInt$(-1)` on the SOURCE Socket's `FileDescriptor`, invalidating
+the field for any concurrent caller — see the regression guard below.
+PFD remains in the chain as a safety net: it's the only path that
+survives a hypothetical future Android where even JNI field reads
+of `FileDescriptor` are blocked.
+
+Strategy IDs in the table are stable telemetry identifiers (the
+`strategy=` field in the `splice: kernel zero-copy active` log line),
+NOT the trial order — `winningStrategy` reflects whichever path
+actually yielded the fd.
 
 #### Pre-flight warmup (`SpliceShim.warmup()`)
 
@@ -330,6 +337,69 @@ If the user runs on an ABI without a matching `.so` (e.g. armv7
 device on this build), `System.loadLibrary` fails, warmup logs
 `splice: libagentsplice.so unavailable, NIO fallback only`, and
 every tunnel goes through NIO. No crash, just lost optimisation.
+
+#### Regression guards (read this before touching the bridge)
+
+Three subtle invariants are load-bearing for the splice fast path.
+All three were violated at various points in development and produced
+the same observable symptom — fast download, broken upload — so they
+share a guard section here. Reference: `48c22d0..fea8b2d`.
+
+1. **NEVER set `SPLICE_F_MORE` on the destination `splice()` call**
+   (`app/src/main/cpp/splice_shim.c`). `SPLICE_F_MORE` is documented
+   as a TCP_CORK-style "more data coming" hint, but the kernel honors
+   it across consecutive calls — every `splice()` we issue with MORE
+   set re-arms the cork, and the cork releases only on a call WITHOUT
+   the flag or after the 200 ms ceiling. For a continuously-flowing
+   stream this caps the destination at `pipe_buf / 200 ms ≈ 320 KB/s`
+   (≈ 2.5 Mbps), which is exactly what we observed before removal.
+   Use `SPLICE_F_MOVE` and nothing else — matches Go's stdlib path
+   in `runtime/internal/poll/splice_linux.go`. The MORE flag has NO
+   effect on the source-side `splice()` (its `fd_out` is a pipe, not
+   a socket), so adding it there is harmless but pointless.
+
+2. **Latch arity is transport-specific — `(2)` for TCP, `(1)` for QUIC.**
+   - `NativeProxyAgent.bridge()` (TCP) uses `CountDownLatch(2)`. Each
+     `copyChannel` calls `shutdownOutput()` on completion, propagating
+     FIN to the peer so the OTHER direction's read returns EOF
+     naturally. Waiting for both gives a clean graceful close. Latch
+     of 1 here cuts the still-draining direction down mid-flight when
+     the quiet direction half-closes first. Matches Go's
+     `Uplink.bridge` in `internal/netagent/uplink.go` which reads
+     from `done` twice before letting `defer Close()` run.
+   - `NativeProxyAgent.bridgeStreams()` (QUIC) uses `CountDownLatch(1)`.
+     QUIC streams have no half-close that propagates across this
+     bridge: closing kwik's `QuicStream` output does not unblock a
+     paired read on the TCP target socket, and we can't half-close
+     one direction of a QUIC stream without tearing the whole stream
+     down. So we wait for ONE direction to finish, then the
+     unconditional `sock.close() + output.close()` pair below force-
+     terminates the other thread's blocking read. Matches Go's
+     `pipeQUIC` (uplink.go:622-636) which does `<-done` once and
+     relies on each goroutine's internal `Close` on the opposite
+     side. Latch of 2 here hangs the bridge forever — neither direction
+     receives a FIN equivalent, so the second `countDown` never fires.
+
+3. **fd extraction MUST try JNI before PFD** (`SpliceShim.copy()` and
+   `SpliceShim.warmup()`). `pfd.detachFd()` invalidates the source
+   `FileDescriptor.fd → -1` via `IoUtils.acquireRawFd()`. The bridge
+   spawns the two direction-copies in parallel, both call
+   `SpliceShim.copy(src, dst)`, and they call `fdViaPfd()` on the
+   SAME socket pair. Whichever thread loses the race sees an
+   invalidated FD and falls back to NIO with `BRIDGE_BUFFER_BYTES`
+   (256 KiB) — yielding the asymmetric "one direction at full splice
+   speed, other at 3-4 Mbps over NIO" failure mode. Since JNI field
+   reads are pure observers, trying them first lets both threads
+   race safely; PFD's side effect is paid only when JNI is fully
+   blocked (no Android version in production triggers this).
+
+If you're touching `splice_shim.c` or the bridge in `NativeProxyAgent.kt`:
+run a Speedtest in Multi-Connection mode (≥ 4 streams) BEFORE and
+AFTER — single-stream tests can mask all three of these bugs because
+the half-duplex symmetry hides corking, the latch race depends on
+direction-specific FIN timing, and the fd race needs concurrent
+bridge threads to trigger. The canonical regression check is
+`upload ≥ 0.7 × download` on a same-city test path.
 
 ### Splice telemetry
 
