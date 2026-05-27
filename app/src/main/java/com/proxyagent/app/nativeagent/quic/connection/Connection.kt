@@ -167,6 +167,23 @@ internal class Connection(
         android.util.Log.i("NativeQUIC", "[$serverHost] $msg")
     }
 
+    /** Like [log] but ALSO mirrors to [externalStatLog] when installed,
+     *  so the line lands in the agent's *exportable* log — not just
+     *  logcat, which the field can't easily capture. Reserved for the
+     *  low-frequency 5-second stats line so the export stays compact. */
+    private fun logStat(msg: String) {
+        android.util.Log.i("NativeQUIC", "[$serverHost] $msg")
+        externalStatLog?.invoke("[$serverHost] $msg")
+    }
+
+    internal companion object {
+        /** Diagnostic sink installed by NativeProxyAgent so the in-house
+         *  QUIC stats line shows up in the exportable agent log without
+         *  `adb logcat`. Process-global (the proxy runs one uplink QUIC
+         *  connection); cleared on teardown to avoid leaking the agent. */
+        @Volatile var externalStatLog: ((String) -> Unit)? = null
+    }
+
     /** Establish the connection. Blocks until handshake completes
      *  or a fatal error occurs. */
     fun connect(timeoutMs: Long) {
@@ -626,7 +643,7 @@ internal class Connection(
                 // or if new server-initiated streams arrive.
                 val now = System.nanoTime()
                 if (now - lastStatsLogNanos > 5_000_000_000L) {
-                    log("stats: datagrams=${statsDatagrams.get()}" +
+                    logStat("stats: datagrams=${statsDatagrams.get()}" +
                         " stream_frames=${statsStreamFrames.get()}" +
                         " new_server_streams=${statsNewServerStreams.get()}" +
                         " accept_queue=${incomingServerStreams.size}" +

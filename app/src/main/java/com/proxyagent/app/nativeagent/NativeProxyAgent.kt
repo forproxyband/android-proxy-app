@@ -1107,15 +1107,26 @@ internal class Uplink(
         controlOutput = BufferedOutputStream(stream.output)
         agent.logInfo("uplink: QUIC control established",
             "endpoint" to "${creds.host}:${creds.port}")
-        // Surface kwik's CC swap result so agent.log shows which CC
-        // is in effect. `swapped` = FixedWindow pacing (high download
-        // throughput); `skipped:<reason>` = fell back to NewReno
-        // (lower download throughput, see KwikQuicTransport.ccSwapState).
-        agent.logInfo("uplink: QUIC congestion control",
-            "state" to KwikQuicTransport.ccSwapState)
+        // Surface which CC is in effect. The in-house QUIC stack runs
+        // Brutal natively (no swap concept); only the kwik adapter does
+        // the NewReno→FixedWindow reflection swap and records it in
+        // ccSwapState. Logging the kwik state while the in-house
+        // transport is active would be misleading, so branch on it.
+        val ccState = if (transport is com.proxyagent.app.nativeagent.quic.NativeQuicTransport)
+            "native_brutal"
+        else
+            KwikQuicTransport.ccSwapState
+        agent.logInfo("uplink: QUIC congestion control", "state" to ccState)
+        // Mirror the in-house QUIC stack's 5-second stats line into the
+        // exportable agent log (diagnostic; harmless no-op for kwik). Lets
+        // us read cwnd / in-flight / send_credit / stream counts without
+        // logcat. Cleared in cleanupTransport so we don't leak `agent`.
+        com.proxyagent.app.nativeagent.quic.connection.Connection.externalStatLog =
+            { line -> agent.logInfo(line) }
     }
 
     private fun cleanupTransport() {
+        com.proxyagent.app.nativeagent.quic.connection.Connection.externalStatLog = null
         try { controlOutput?.close() } catch (_: Throwable) {}
         try { controlInput?.close() } catch (_: Throwable) {}
         try { controlSocket?.close() } catch (_: Throwable) {}
@@ -1480,19 +1491,29 @@ internal class Uplink(
         // request-response traffic this is invisible; for protocols
         // that depend on a clean FIN-on-both-sides this isn't the
         // right primitive.
+        // Per-direction byte counters surfaced in the exportable
+        // "tunnel closed" line so per-tunnel throughput is visible
+        // WITHOUT logcat (the QUIC stack's own stats only go to
+        // logcat). down = bytes target→client (the customer's
+        // download — what we send on QUIC); up = bytes client→target.
+        // A burst test that's "one stream only" shows one tunnel with
+        // a big `down` and the rest ~0; a uniformly slow path shows
+        // all tunnels small.
+        val downBytes = java.util.concurrent.atomic.AtomicLong(0)
+        val upBytes = java.util.concurrent.atomic.AtomicLong(0)
         val done = java.util.concurrent.CountDownLatch(1)
         bridgeExecutor.execute {
-            try { copyStream(input, sock.getOutputStream()) } catch (_: Throwable) {}
+            try { copyStream(input, sock.getOutputStream(), upBytes) } catch (_: Throwable) {}
             finally { done.countDown() }
         }
         bridgeExecutor.execute {
-            try { copyStream(sock.getInputStream(), output) } catch (_: Throwable) {}
+            try { copyStream(sock.getInputStream(), output, downBytes) } catch (_: Throwable) {}
             finally { done.countDown() }
         }
         try { done.await() } catch (_: InterruptedException) {}
         try { sock.close() } catch (_: Throwable) {}
         try { output.close() } catch (_: Throwable) {}
-        agent.logInfo("tunnel closed")
+        agent.logInfo("tunnel closed", "up" to upBytes.get(), "down" to downBytes.get())
     }
 
     /** Drains [input] into [output]. Uses a 256 KiB buffer to match
@@ -1502,12 +1523,17 @@ internal class Uplink(
      *  userspace by default. A flushed write would force kwik to
      *  re-evaluate frame scheduling on every chunk and stutter the
      *  pipeline on receiver-bound paths. */
-    private fun copyStream(input: InputStream, output: OutputStream) {
+    private fun copyStream(
+        input: InputStream,
+        output: OutputStream,
+        counter: java.util.concurrent.atomic.AtomicLong? = null,
+    ) {
         val buf = ByteArray(NativeProxyAgent.BRIDGE_BUFFER_BYTES)
         while (true) {
             val n = input.read(buf)
             if (n < 0) break
             output.write(buf, 0, n)
+            counter?.addAndGet(n.toLong())
         }
     }
 
