@@ -178,6 +178,22 @@ class MainActivity : AppCompatActivity() {
         Thread { try { AnalyticsStore.pruneToRetention(this) } catch (_: Throwable) {} }
             .apply { isDaemon = true; name = "AnalyticsPrune"; start() }
 
+        // Recovery from a cellular rotation interrupted by a process kill
+        // (PACKAGE_REPLACED app update, OOM, force-stop). IpCycle drops an
+        // in-progress marker file before toggling airplane mode and removes
+        // it in finally — so a leftover marker on launch means we may have
+        // died between airplaneOn() and airplaneOff(), leaving the device
+        // without any cellular path. Background-threaded because the root
+        // probe + secure-settings write can take a second or two and we
+        // don't want to delay first paint.
+        Thread {
+            try {
+                IpCycle.recoverInterruptedCycle(this) { msg ->
+                    Log.i("ProxyAgent", "rotation-recovery: $msg")
+                }
+            } catch (_: Throwable) {}
+        }.apply { isDaemon = true; name = "RotationRecovery"; start() }
+
         // Mirror current cycle config from SharedPreferences into the
         // cross-process file. Back-fill for users who upgraded but haven't
         // opened Settings again, and a no-op refresh for everyone else.
@@ -1309,8 +1325,9 @@ class MainActivity : AppCompatActivity() {
         kv("Exported-At", now)
 
         section("CONNECTION STATE")
-        val proxyState = readFile("proxy_state")
-        val info = readFile("conn_info").split("|")
+        // Same staleness gate as refresh() — if :proxy is dead, the export
+        // shows DISCONNECTED instead of a forever-running fake session.
+        val (proxyState, info) = readLiveProxyFiles()
         val connStatus = info.getOrNull(0).orEmpty()
         val rxRate = info.getOrNull(1)?.toLongOrNull() ?: -1L
         val txRate = info.getOrNull(2)?.toLongOrNull() ?: -1L
@@ -1526,8 +1543,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refresh() {
-        val proxyState = readFile("proxy_state")
-        val connInfo = readFile("conn_info").split("|")
+        // readLiveProxyFiles wipes proxy_state + conn_info when the writer
+        // process is dead (heartbeat in field 9 stale), so the rest of this
+        // function naturally falls into the DISCONNECTED branch instead of
+        // trusting stale CONNECTED + uptime + traffic-rate fields from a
+        // killed :proxy (e.g., after a PACKAGE_REPLACED app update).
+        val (proxyState, connInfo) = readLiveProxyFiles()
         val connStatus = connInfo.getOrNull(0) ?: ""
         val rxRate = connInfo.getOrNull(1)?.toLongOrNull() ?: -1L
         val txRate = connInfo.getOrNull(2)?.toLongOrNull() ?: -1L
@@ -1942,5 +1963,39 @@ class MainActivity : AppCompatActivity() {
 
     private fun readFile(name: String): String {
         return try { File(filesDir, name).readText().trim() } catch (_: Throwable) { "" }
+    }
+
+    // Returns (proxy_state, conn_info parts) only when the :proxy process is
+    // actually alive — verified via the wall-clock heartbeat in conn_info
+    // field 9. If the heartbeat is missing or older than STALE_CONN_INFO_MS,
+    // the writer is dead (typically because PACKAGE_REPLACED killed it
+    // mid-session without running doStop) and the file content is no longer
+    // trustworthy: connectedSinceMs would still parse fine and produce a
+    // monotonically-growing fake "uptime", and the CONNECTED badge would
+    // stick forever. Wiping both files here is what flips the UI back to
+    // DISCONNECTED and lets toggle()/cycleMobileIp() take their "not
+    // running" branches on the next user action.
+    private fun readLiveProxyFiles(): Pair<String, List<String>> {
+        val proxyState = readFile("proxy_state")
+        val raw = readFile("conn_info")
+        if (raw.isEmpty()) return proxyState to emptyList()
+        val parts = raw.split("|")
+        val heartbeatMs = parts.getOrNull(9)?.toLongOrNull() ?: 0L
+        val stale = heartbeatMs == 0L ||
+            (System.currentTimeMillis() - heartbeatMs) > STALE_CONN_INFO_MS
+        if (!stale) return proxyState to parts
+        try { File(filesDir, "conn_info").delete() } catch (_: Throwable) {}
+        try { File(filesDir, "proxy_state").delete() } catch (_: Throwable) {}
+        return "" to emptyList()
+    }
+
+    companion object {
+        // conn_info field 9 carries a ~1Hz wall-clock heartbeat written by
+        // ProxyService's status updater thread. If the latest write is older
+        // than this threshold, :proxy is dead and the file is treated as
+        // void. Headroom over the 1s tick covers slow devices and UI stalls
+        // during long GC pauses; setting it too low would risk wiping a
+        // live state on a temporarily-blocked writer.
+        private const val STALE_CONN_INFO_MS = 5_000L
     }
 }

@@ -83,6 +83,15 @@ object IpCycle {
 
     private const val CFG_FILE_NAME = "cycle_cfg.json"
 
+    // Marker file present for the duration of a cycleAndVerify call. The
+    // wrapper writes it on entry and deletes it in finally. If a process
+    // dies mid-cycle (PACKAGE_REPLACED kill, force-stop, OOM) the marker
+    // sticks around and recoverInterruptedCycle() — invoked on the next
+    // :main launch — uses it to detect "we were toggling airplane_mode
+    // when we were killed" and flip it back off so the user isn't left
+    // without any cellular path.
+    private const val IN_PROGRESS_MARKER = "ip_cycle_in_progress"
+
     fun loadConfigFromFile(context: Context): CycleConfig {
         return try {
             val f = File(context.filesDir, CFG_FILE_NAME)
@@ -136,11 +145,32 @@ object IpCycle {
     // the "real alternate" search (so we don't double-swap our own dup).
     private const val DUP_APN_NAME = "ProxyAgent-rotation-tmp"
 
+    // Public entry point. Drops an IN_PROGRESS_MARKER file before delegating
+    // and removes it in finally, so an aborted run (process kill, app update,
+    // OOM) leaves the marker behind. The next :main launch picks it up via
+    // recoverInterruptedCycle() and turns airplane_mode back off — otherwise
+    // a crash between airplaneOn() and the inner finally would strand the
+    // device with no cellular path.
     fun cycleAndVerify(
         context: Context,
         knownIp: String,
         log: (String) -> Unit = {},
         config: CycleConfig = CycleConfig(),
+    ): CycleResult {
+        val marker = File(context.filesDir, IN_PROGRESS_MARKER)
+        try { marker.writeText(System.currentTimeMillis().toString()) } catch (_: Throwable) {}
+        try {
+            return cycleAndVerifyInner(context, knownIp, log, config)
+        } finally {
+            try { marker.delete() } catch (_: Throwable) {}
+        }
+    }
+
+    private fun cycleAndVerifyInner(
+        context: Context,
+        knownIp: String,
+        log: (String) -> Unit,
+        config: CycleConfig,
     ): CycleResult {
         val start = System.currentTimeMillis()
         val deadline = start + TOTAL_BUDGET_MS
@@ -324,6 +354,47 @@ object IpCycle {
             oldIp, lastNewIp, false, attempts,
             System.currentTimeMillis() - start, reason,
         )
+    }
+
+    // Best-effort recovery from a rotation interrupted by process kill (app
+    // update via PACKAGE_REPLACED, low-memory kill, force-stop, native crash).
+    // The wrapper writes IN_PROGRESS_MARKER on entry to cycleAndVerify and
+    // deletes it in finally, so a leftover marker means we died between
+    // airplaneOn() and the matching airplaneOff() — likely with airplane mode
+    // still enabled, which would otherwise strand the device.
+    //
+    // Called from MainActivity.onCreate on a background thread. Idempotent:
+    // no marker → returns false without touching anything; marker present but
+    // airplane already off → just deletes the marker.
+    //
+    // Returns true iff a recovery was attempted (marker existed). The caller
+    // doesn't need the result, but it's useful for logs and tests.
+    fun recoverInterruptedCycle(
+        context: Context,
+        log: (String) -> Unit = {},
+    ): Boolean {
+        val marker = File(context.filesDir, IN_PROGRESS_MARKER)
+        if (!marker.exists()) return false
+        val airplaneOn = try {
+            Settings.Global.getInt(
+                context.contentResolver,
+                Settings.Global.AIRPLANE_MODE_ON,
+                0,
+            ) == 1
+        } catch (_: Throwable) { false }
+        log("recovery: ip_cycle marker found, airplane_mode=$airplaneOn")
+        if (airplaneOn) {
+            // root path tried first since the cycle that died was likely
+            // using it (cleaner exit, broadcasts the AIRPLANE_MODE_CHANGED
+            // intent that some carrier services need); falls back to
+            // WRITE_SECURE_SETTINGS if root isn't available anymore.
+            val rootAvailable = runRoot("true")
+            val ok = airplaneOff(context, rootAvailable)
+            log("recovery: airplane_off ${if (ok) "ok" else "failed"} " +
+                "(root=$rootAvailable)")
+        }
+        try { marker.delete() } catch (_: Throwable) {}
+        return true
     }
 
     private fun airplaneOn(context: Context, preferRoot: Boolean): Boolean {

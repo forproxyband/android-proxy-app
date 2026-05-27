@@ -200,13 +200,19 @@ class ProxyService : Service() {
             // Field 6 (currentUplinkTransport) was added in v2.0.14-quic;
             // field 7 (cycleStage) was added with the IP-rotation UI surface;
             // field 8 (wifiReturnStatus) was added with the Wi-Fi return
-            // relay feature. Readers must use getOrNull(N) for forward
-            // compatibility so the tail fields stay optional if a downgrade
-            // ever writes shorter rows. `|` is escaped in cycleStage so a
-            // stray pipe in a log line can't shift the field count.
+            // relay feature; field 9 is a wall-clock heartbeat refreshed on
+            // every writeConnInfo (≈1Hz from the status updater + on every
+            // state transition) so MainActivity can detect when this process
+            // died without a graceful doStop — typically PACKAGE_REPLACED
+            // kill mid-session — and stop trusting the stale file (otherwise
+            // the UI keeps showing CONNECTED + accumulating uptime forever).
+            // Readers must use getOrNull(N) for forward compatibility so the
+            // tail fields stay optional if a downgrade ever writes shorter
+            // rows. `|` is escaped in cycleStage so a stray pipe in a log
+            // line can't shift the field count.
             val safeStage = cycleStage.replace('|', '/')
             File(filesDir, "conn_info").writeText(
-                "${connStatus.name}|$rxRate|$txRate|$currentRegistrator|$activeTunnels|$connectedSinceMs|$currentUplinkTransport|$safeStage|$wifiReturnStatus"
+                "${connStatus.name}|$rxRate|$txRate|$currentRegistrator|$activeTunnels|$connectedSinceMs|$currentUplinkTransport|$safeStage|$wifiReturnStatus|${System.currentTimeMillis()}"
             )
         } catch (_: Exception) {}
     }
