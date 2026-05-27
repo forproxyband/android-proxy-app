@@ -1,8 +1,16 @@
 package com.proxyagent.app.nativeagent.quic.tls
 
 import com.proxyagent.app.nativeagent.quic.crypto.Hkdf
+import java.math.BigInteger
+import java.security.KeyFactory
+import java.security.KeyPairGenerator
 import java.security.MessageDigest
+import java.security.PrivateKey
 import java.security.SecureRandom
+import java.security.interfaces.XECPublicKey
+import java.security.spec.NamedParameterSpec
+import java.security.spec.XECPublicKeySpec
+import javax.crypto.KeyAgreement
 
 /**
  * TLS 1.3 crypto primitives for our hand-rolled handshake.
@@ -15,10 +23,21 @@ import java.security.SecureRandom
  * trust). This keeps the code small and removes huge swaths
  * of TLS complexity.
  *
- * **Why BouncyCastle for X25519 and JDK for everything else.**
- * Android API 30+ has `KeyPairGenerator.getInstance("X25519")`,
- * but our minSdk is 21 — BC is the portable choice. Everything
- * else (SHA-256, HMAC, AES-GCM) is on every Android since 21.
+ * **Why Android's built-in XDH for X25519, NOT BouncyCastle.**
+ * We originally pulled BouncyCastle for X25519. That broke kwik
+ * (and would break any other JCA crypto user in the app):
+ * Android bundles its own `org.bouncycastle.*` in the platform,
+ * and a second full BC under the same package names corrupts the
+ * JCA provider chain — empirically confirmed by an isolation test
+ * (kwik QUIC went from working to ERR_TIMED_OUT the moment BC was
+ * on the classpath, and recovered the moment it was removed).
+ *
+ * So we use the platform's `XDH` KeyAgreement (Conscrypt) instead.
+ * X25519 via `XDH` is available on API 33+ (and on the API 36
+ * devices we target). On older devices `KeyPairGenerator`/
+ * `KeyAgreement` throw `NoSuchAlgorithmException`, which surfaces
+ * as a handshake failure and the agent falls back to TCP or kwik.
+ * No third-party dependency, no package conflict.
  */
 internal object TlsCrypto {
 
@@ -27,34 +46,68 @@ internal object TlsCrypto {
     /** 32 random bytes for the ClientHello.random field. */
     fun randomBytes(n: Int): ByteArray = ByteArray(n).also { rng.nextBytes(it) }
 
-    // ── X25519 (RFC 7748 §6.1) ────────────────────────────────
+    // ── X25519 (RFC 7748 §6.1) via the platform XDH provider ───
 
-    data class X25519KeyPair(val publicKey: ByteArray, val privateKey: ByteArray) {
-        init {
-            require(publicKey.size == 32) { "X25519 public key must be 32 bytes" }
-            require(privateKey.size == 32) { "X25519 private key must be 32 bytes" }
-        }
+    /** Holds the raw 32-byte public key (for the ClientHello key
+     *  share) and the live [PrivateKey] object (for ECDH — we keep
+     *  the object rather than raw scalar bytes because some
+     *  providers don't expose the scalar). */
+    class X25519KeyPair(val publicKey: ByteArray, val privateKey: PrivateKey) {
+        init { require(publicKey.size == 32) { "X25519 public key must be 32 bytes" } }
     }
 
-    /** Generate a fresh X25519 key pair.
-     *  STUBBED for the BC-isolation test — see build.gradle.kts. The
-     *  in-house QUIC ("native" toggle) is non-functional while BC is
-     *  removed; selecting it throws here. kwik (the default toggle)
-     *  is unaffected and is what this test exercises. */
+    private val x25519Params = NamedParameterSpec("X25519")
+
+    /** Generate a fresh X25519 key pair via the platform provider. */
     fun generateX25519KeyPair(): X25519KeyPair {
-        throw UnsupportedOperationException(
-            "X25519 stubbed: BouncyCastle removed for kwik-isolation test. " +
-                "Select 'kwik library' in QUIC implementation settings."
-        )
+        val kpg = KeyPairGenerator.getInstance("XDH")
+        kpg.initialize(x25519Params)
+        val kp = kpg.generateKeyPair()
+        val pubRaw = encodeU((kp.public as XECPublicKey).u)
+        return X25519KeyPair(pubRaw, kp.private)
     }
 
     /**
-     * X25519 ECDH. STUBBED for the BC-isolation test (see above).
+     * X25519 ECDH between our [privateKey] and the peer's raw
+     * 32-byte public key. RFC 7748 §6.1 — reject the all-zero
+     * shared secret (small-order point attack).
      */
-    fun x25519(privateKey: ByteArray, peerPublicKey: ByteArray): ByteArray {
-        throw UnsupportedOperationException(
-            "X25519 stubbed: BouncyCastle removed for kwik-isolation test."
-        )
+    fun x25519(privateKey: PrivateKey, peerPublicKey: ByteArray): ByteArray {
+        require(peerPublicKey.size == 32) { "peer X25519 key must be 32 bytes" }
+        val kf = KeyFactory.getInstance("XDH")
+        val peerPub = kf.generatePublic(XECPublicKeySpec(x25519Params, decodeU(peerPublicKey)))
+        val ka = KeyAgreement.getInstance("XDH")
+        ka.init(privateKey)
+        ka.doPhase(peerPub, true)
+        val out = ka.generateSecret()
+        if (out.size != 32 || out.all { it == 0.toByte() }) {
+            throw TlsException("x25519 produced invalid shared secret (len=${out.size})")
+        }
+        return out
+    }
+
+    /** Encode an X25519 u-coordinate [BigInteger] as 32 bytes,
+     *  little-endian (RFC 7748 wire format). */
+    private fun encodeU(u: BigInteger): ByteArray {
+        val be = u.toByteArray()  // big-endian, possibly with a leading sign byte
+        val out = ByteArray(32)   // little-endian, zero-padded
+        var src = be.size - 1     // least-significant byte of the value
+        var dst = 0
+        while (src >= 0 && dst < 32) {
+            out[dst] = be[src]
+            src--; dst++
+        }
+        return out
+    }
+
+    /** Decode a 32-byte little-endian X25519 public key into the
+     *  u-coordinate [BigInteger] the JCA spec expects. */
+    private fun decodeU(raw: ByteArray): BigInteger {
+        // Reverse to big-endian, prepend a zero byte to force a
+        // positive BigInteger regardless of the high bit.
+        val be = ByteArray(raw.size + 1)
+        for (i in raw.indices) be[be.size - 1 - i] = raw[i]
+        return BigInteger(be)
     }
 
     // ── SHA-256 ───────────────────────────────────────────────

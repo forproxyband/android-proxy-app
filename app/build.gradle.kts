@@ -146,19 +146,15 @@ dependencies {
     // in `nativeagent/quic/` — once `NativeQuicTransport` is field-validated
     // (see com.proxyagent.app.nativeagent.quic.DESIGN.md), this dep goes away.
     implementation("tech.kwik:kwik:0.10.10")
-    // BouncyCastle provides the TLS 1.3 building blocks the in-house QUIC
-    // client needs — specifically `TlsClientProtocol` exposes raw handshake
-    // records and the QUIC-specific key exporter that JSSE/Conscrypt do not.
-    // Total APK overhead is ~5 MB (bcprov + bctls); acceptable for parity
-    // with the Go SDK's QUIC throughput.
-    //
-    // TEMPORARILY DISABLED — isolation test: does BC on the classpath break
-    // kwik? Android bundles its own `org.bouncycastle.*`; the duplicate may
-    // corrupt the JCA crypto kwik relies on. With these out (and TlsCrypto's
-    // X25519 stubbed), the in-house QUIC won't function, but if kwik starts
-    // working again we've found the culprit. Restore both lines after.
-    // implementation("org.bouncycastle:bcprov-jdk18on:1.79")
-    // implementation("org.bouncycastle:bctls-jdk18on:1.79")
+    // DO NOT add BouncyCastle here. We tried (`bcprov`/`bctls` 1.79) to get
+    // X25519 for the in-house QUIC client, and it broke kwik QUIC entirely:
+    // Android bundles its own `org.bouncycastle.*` in the platform, and a
+    // second full BC under the same package names corrupts the JCA provider
+    // chain that kwik (and any other JCA crypto user) relies on. Confirmed
+    // by isolation test — kwik recovered the instant BC left the classpath.
+    // The in-house QUIC now uses the platform `XDH` KeyAgreement (Conscrypt)
+    // for X25519 instead — see nativeagent/quic/tls/TlsCrypto.kt. If you ever
+    // genuinely need BC, shade it into a private namespace first.
     // Desugaring for java.time.* on API < 26 (needed by kwik).
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
 }

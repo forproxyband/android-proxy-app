@@ -145,22 +145,35 @@ The cost: three threads instead of one per connection. Worth it.
 
 ## TLS strategy
 
-Bouncing through BouncyCastle's low-level TLS API:
+**Hand-rolled TLS 1.3 client, NOT BouncyCastle.** The original plan
+was to bridge BouncyCastle's `TlsClientProtocol`. We abandoned it
+for two reasons:
 
-- `BcTlsCrypto` as the crypto backend (avoid platform JCA quirks).
-- Custom `TlsClient` subclass that:
-  - Advertises ALPN `proxy-tunnel/1` (matches the Go SDK's
-    `QUIC_ALPN`).
-  - Surfaces the QUIC transport parameter TLS extension (RFC 9000
-    §18) — we encode/decode it ourselves; BC doesn't know about it.
-  - Disables server certificate verification (matches the SDK's
-    `InsecureSkipVerify: true`; identity is verified by the AUTH
-    key on the control channel, not the cert).
-- Custom `DatagramTransport` that turns TLS records into payloads
-  we ship via CRYPTO frames, and vice versa for received CRYPTO
-  frames.
-- Exporter for the QUIC initial / handshake / 1-RTT traffic
-  secrets, derived from the TLS handshake (RFC 9001 §7).
+1. BC's API is TLS-record-oriented; QUIC carries raw handshake
+   messages in CRYPTO frames. Stripping records out of BC was
+   hackier than writing the state machine ourselves.
+2. **BC must not be on the classpath at all.** Android bundles its
+   own `org.bouncycastle.*` in the platform; a second full BC under
+   the same package names corrupts the JCA provider chain and broke
+   kwik QUIC entirely (confirmed by isolation test — kwik went from
+   working to `ERR_TIMED_OUT` the moment `bcprov`/`bctls` were added,
+   and recovered the moment they were removed). Any JCA crypto user
+   in the process is collateral damage.
+
+So `TlsClient.kt` is a minimal hand-rolled TLS 1.3 client (see its
+header for the supported subset) and `TlsCrypto.kt` provides the
+primitives:
+
+- **X25519** via the platform `XDH` KeyAgreement (Conscrypt) — NOT
+  BC. Available on API 33+ / our API 36 targets; older devices throw
+  `NoSuchAlgorithmException` and fall back to kwik / TCP.
+- **HKDF-Expand-Label, AES-128-GCM, SHA-256, HMAC** via the standard
+  JDK `Cipher` / `Mac` / `MessageDigest` — on every Android since 21.
+- ALPN `proxy-tunnel/1`, QUIC transport-parameter extension (we
+  encode/decode it ourselves), server-cert verification disabled
+  (identity is proven by the AUTH key on the control channel).
+- Traffic secrets for Initial / Handshake / 1-RTT derived through
+  the TLS 1.3 key schedule in `TlsCrypto.KeySchedule` (RFC 9001 §7).
 
 ## CC strategy — Brutal
 
