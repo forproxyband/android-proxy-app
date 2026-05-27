@@ -418,6 +418,7 @@ internal class Connection(
                     handleTlsStep(step)
                 }
                 is StreamFrame -> {
+                    val isNew = !streams.containsKey(frame.streamId)
                     val s = streams.getOrPut(frame.streamId) {
                         // Server-initiated stream.
                         val ns = Stream(
@@ -428,23 +429,33 @@ internal class Connection(
                         incomingServerStreams.offer(ns)
                         ns
                     }
+                    if (isNew) log("recv STREAM: NEW server stream id=${frame.streamId} peer_max=${s.peerMaxStreamData}")
                     s.acceptStreamFrame(frame)
                     flow.onBytesReceived(frame.data.size)
+                    log("recv STREAM: id=${frame.streamId} offset=${frame.offset} len=${frame.data.size} fin=${frame.fin} readOffset=${s.recvBuffer.readOffset}")
                 }
-                is MaxData -> flow.applyPeerMaxData(frame.maxData)
-                is MaxStreamData -> streams[frame.streamId]?.applyMaxStreamData(frame.maxStreamData)
-                is MaxStreams -> { /* TODO: track peer's stream limit */ }
+                is MaxData -> {
+                    flow.applyPeerMaxData(frame.maxData)
+                    log("recv MAX_DATA: $frame.maxData")
+                }
+                is MaxStreamData -> {
+                    streams[frame.streamId]?.applyMaxStreamData(frame.maxStreamData)
+                    log("recv MAX_STREAM_DATA: id=${frame.streamId} max=${frame.maxStreamData}")
+                }
+                is MaxStreams -> { log("recv MAX_STREAMS: bidi=${frame.bidi} max=${frame.maxStreams}") }
                 is HandshakeDone -> {
                     handshakeDone = true
                     // Discard Initial + Handshake keys per RFC 9001 §4.9.
                     initialSpace.send = null; initialSpace.receive = null
                     handshakeSpace.send = null; handshakeSpace.receive = null
+                    log("recv HANDSHAKE_DONE")
                 }
                 is ConnectionClose -> {
+                    log("recv CONNECTION_CLOSE: app=${frame.isApplicationError} errCode=${frame.errorCode} frameType=${frame.frameType} reason='${frame.reasonPhrase}'")
                     closed.set(true)
                 }
-                is NewToken -> { /* discard */ }
-                else -> { /* ignore informational frames */ }
+                is NewToken -> { log("recv NEW_TOKEN: ${frame.token.size}B") }
+                else -> { log("recv frame (unhandled): ${frame.javaClass.simpleName}") }
             }
         }
     }
@@ -552,9 +563,21 @@ internal class Connection(
                 }
                 if (!cc.canSendNow(budget)) break
             }
-            val frame = stream.pollSendFrame(budget) ?: continue
-            if (!flow.canSend(frame.data.size)) break
+            val queuedBefore = stream.sendBuffer.queuedBytes
+            val frame = stream.pollSendFrame(budget)
+            if (frame == null) {
+                // Log only if there's buffered data we couldn't send (flow-control stall).
+                if (queuedBefore > 0) {
+                    log("drainStreams: stream id=${stream.streamId} STALLED queued=${queuedBefore} sendOffset=${stream.sendOffset} peerMax=${stream.peerMaxStreamData}")
+                }
+                continue
+            }
+            if (!flow.canSend(frame.data.size)) {
+                log("drainStreams: connection-level FLOW STALL: sendCredit=${flow.sendCredit()} needed=${frame.data.size}")
+                break
+            }
             flow.onBytesSent(frame.data.size)
+            log("send STREAM: id=${frame.streamId} offset=${frame.offset} len=${frame.data.size} fin=${frame.fin}")
             emitOneRttPacket(listOf(frame))
         }
     }
