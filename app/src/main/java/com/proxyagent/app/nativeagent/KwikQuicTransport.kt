@@ -53,6 +53,18 @@ class KwikQuicTransport private constructor(
     }
 
     private class KwikStream(private val s: tech.kwik.core.QuicStream) : QuicTransport.Stream {
+        init {
+            // Patch kwik's tiny 50 KB per-stream send buffer cap to
+            // STREAM_SEND_BUFFER_BYTES. See enlargeStreamSendBuffer
+            // doc for why — short version: the small default causes
+            // the application thread (our copyStream) to block on
+            // write() far more often than the wire can drain, capping
+            // single-stream send throughput around 40-50 Mbps regardless
+            // of cwnd. Best-effort; on reflection failure the stream
+            // still works at the original cap.
+            enlargeStreamSendBuffer(s)
+        }
+
         override val input: InputStream get() = s.inputStream
         override val output: OutputStream get() = s.outputStream
         override fun close() {
@@ -160,6 +172,22 @@ class KwikQuicTransport private constructor(
          *  constructor signature is `(int, Logger)`. */
         private const val FIXED_CC_WINDOW_BYTES = 16 * 1024 * 1024
 
+        /** Per-stream SendBuffer.maxBufferSize override. kwik's
+         *  default is 50 KB — see `SendBuffer.java` constructor.
+         *  That's tiny: on a 100 Mbps × 86 ms path the BDP is
+         *  ≈ 1.1 MB, so the application's `write()` blocks
+         *  far more often than it should. With CC swapped to
+         *  FixedWindow we'd expect 90+ Mbps, but the 50 KB cap
+         *  pulls steady-state throughput back to ~44 Mbps as the
+         *  application thread oscillates between "buffer full,
+         *  block" and "buffer drained, write 50 KB". 4 MiB matches
+         *  the BDP for a 400 Mbps × 80 ms path with healthy margin,
+         *  costs ~4 MiB per concurrent tunnel (manageable — Active-
+         *  Tunnels stays under ~100 in practice), and the underlying
+         *  `ConcurrentLinkedDeque` grows dynamically so this is a
+         *  logical limit, not a fixed allocation. */
+        private const val STREAM_SEND_BUFFER_BYTES = 4 * 1024 * 1024
+
         /** Outcome of the most recent `connect()`'s CC swap attempt.
          *  `NativeProxyAgent.startQuic` reads and logs this so
          *  `agent.log` shows whether kwik is running with the
@@ -185,6 +213,44 @@ class KwikQuicTransport private constructor(
                 swapToFixedWindowCC(conn)
             } catch (t: Throwable) {
                 "skipped:wrap_${t.javaClass.simpleName}"
+            }
+        }
+
+        /**
+         * Bumps the per-stream send buffer cap so the application
+         * (`copyStream` in `NativeProxyAgent`) doesn't block on every
+         * 50 KB written. kwik's `StreamOutputStreamImpl` holds two
+         * copies of the cap:
+         *
+         *  - `sendBuffer.maxBufferSize` (the `SendBuffer` instance's
+         *    own field) — gates `write()` blocking.
+         *  - `StreamOutputStreamImpl.maxBufferSize` (cached from
+         *    `sendBuffer.getMaxSize()`) — used by the write-chunking
+         *    logic that splits oversized writes into `maxBufferSize/2`
+         *    pieces.
+         *
+         * Both must be patched for the bump to take effect end-to-end;
+         * patching only `SendBuffer` lets writes get larger but the
+         * chunker still splits them into 25 KB pieces, defeating the
+         * point. Reflection on private final `int` fields works on
+         * Android ART without the modifiers-field hack.
+         *
+         * Best-effort: any reflection failure leaves the stream on
+         * the 50 KB default — it still functions, just with the
+         * documented throughput cap. Called from [KwikStream.init]
+         * so every stream (control + tunnels, client-opened and
+         * peer-initiated) gets the bump consistently.
+         */
+        internal fun enlargeStreamSendBuffer(stream: tech.kwik.core.QuicStream) {
+            try {
+                val out = stream.outputStream
+                val sendBuffer = getField(out, "sendBuffer") ?: return
+                setField(sendBuffer, "maxBufferSize", STREAM_SEND_BUFFER_BYTES)
+                setField(out, "maxBufferSize", STREAM_SEND_BUFFER_BYTES)
+            } catch (_: Throwable) {
+                // Stay on the 50 KB default — stream still works,
+                // just at the lower throughput documented in the
+                // STREAM_SEND_BUFFER_BYTES KDoc above.
             }
         }
 

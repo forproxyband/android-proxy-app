@@ -200,24 +200,51 @@ builder exposes the equivalent:
   the OS gives.
 - `keepAlive(20)` matches the Go config's `KeepAlivePeriod`.
 
-**Congestion control — FixedWindow swap.** Brutal CC isn't portable
-to kwik (no CC plugin point on the builder), and kwik's default
-NewReno caps QUIC send-side throughput around 40 Mbps on healthy
-~86 ms RTT paths (slow-start + multiplicative decrease on spurious
-loss). To match the BINARY engine's Brutal-paced ~92 Mbps, the
-factory reflectively replaces `SenderImpl.congestionController` with
-`tech.kwik.core.cc.FixedWindowCongestionController` carrying a 16 MiB
-fixed window (≈ 1.5 Gbps ceiling at 86 ms RTT — well above the link).
-`FixedWindowCC` inherits all the bytes-in-flight accounting from
-`AbstractCongestionController` but never modifies the window — same
-"trust the link" behavior as Brutal without re-implementing the CC.
-Outcome is logged as `uplink: QUIC congestion control state=swapped`
-(or `skipped:<reason>` on fallback). The swap is best-effort: any
-reflection failure leaves NewReno in place — connection still works
-at the original throughput. Pin kwik or re-verify
-`KwikQuicTransport.Companion.swapToFixedWindowCC` on dependency
-bumps (field names `sender`, `congestionController`, `bytesInFlight`,
-`log` must still exist).
+**Two reflection-based knobs on kwik internals — both required for
+QUIC parity with the BINARY engine.** kwik 0.10.x's public Builder
+exposes neither a CC plugin point nor a send-buffer setter, so both
+of these are patched after `connection.connect()` returns. Best-
+effort: any reflection failure leaves the stream on kwik's defaults
+(connection still works, throughput just lower).
+
+1. **Congestion controller swap — `SenderImpl.congestionController`.**
+   kwik's default `NewRenoCongestionController` caps QUIC send-side
+   throughput around 40 Mbps on healthy ~86 ms RTT paths (slow-start
+   + multiplicative decrease on spurious loss). The factory replaces
+   it with `tech.kwik.core.cc.FixedWindowCongestionController` at a
+   16 MiB fixed window (≈ 1.5 Gbps ceiling at 86 ms RTT). `FixedWindowCC`
+   inherits all bytes-in-flight accounting from
+   `AbstractCongestionController` but never modifies the window —
+   same "trust the link" behavior as Brutal CC without re-
+   implementing the algorithm. Path traversed:
+   `QuicClientConnectionImpl.sender → SenderImpl.congestionController`.
+   `bytesInFlight` is migrated from old to new CC so handshake
+   ACKs don't underflow the new counter. Outcome surfaces in
+   `agent.log` as `uplink: QUIC congestion control state=swapped`
+   (or `skipped:<reason>`).
+
+2. **Per-stream send buffer cap — `SendBuffer.maxBufferSize` +
+   `StreamOutputStreamImpl.maxBufferSize`.** kwik defaults the
+   per-stream send buffer to 50 KB (`SendBuffer.java` constructor:
+   `maxBufferSize = 50 * 1024`). The CC swap alone does NOT lift
+   throughput: with a 50 KB cap and 86 ms RTT path, the application
+   thread (our `copyStream`) oscillates between "buffer full →
+   blocked" and "buffer drained → write 50 KB" at a rate equal to
+   the wire's drain rate — empirically ~44 Mbps. The cap is raised
+   to 4 MiB on every stream (`KwikStream.init` calls
+   `enlargeStreamSendBuffer`). Both fields must be patched: the
+   `SendBuffer`'s field gates `write()` blocking, the
+   `StreamOutputStreamImpl`'s cached copy gates the write-chunker
+   that otherwise splits oversized writes into 25 KB pieces. The
+   underlying `ConcurrentLinkedDeque` grows dynamically — this is
+   a logical bump, not a fixed allocation.
+
+**Risk surface for both.** Breakage if kwik renames any of `sender`,
+`congestionController`, `bytesInFlight`, `log`, `sendBuffer`,
+`maxBufferSize` in a future version. Each patch failure silently
+falls back to defaults. Pin kwik or re-verify
+`KwikQuicTransport.Companion.swapToFixedWindowCC` and
+`enlargeStreamSendBuffer` field names on dependency bumps.
 
 ALPN is `proxy-tunnel/1`, certificate validation is disabled
 (`noServerCertificateCheck()` — same posture as the Go SDK's
