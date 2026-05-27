@@ -125,7 +125,14 @@ internal class SpliceShim {
                 val viaPfd = fdViaPfd(ch)
                 if (viaPfd >= 0) viaPfd else fdOf(ch)
             } catch (t: Throwable) {
-                logFallbackOnce("warmup_exception:${t.javaClass.simpleName}")
+                // Always emit, not once-per-process — see the success
+                // path below for the restart-friendliness reasoning.
+                logger?.invoke(
+                    "INFO",
+                    "splice: NIO fallback engaged",
+                    mapOf("reason" to "warmup_exception:${t.javaClass.simpleName}"),
+                )
+                loggedFallback.set(true)
                 try { ch?.close() } catch (_: Throwable) {}
                 return
             }
@@ -134,28 +141,39 @@ internal class SpliceShim {
             if (packed >= 0) {
                 val strategy = ((packed shr 32) and 0xFFL).toInt()
                 cacheStrategyOnce(strategy)
-                // Emit the canonical "active" line so the UI badge
-                // refines from "TCP" → "TCP (splice)" before the
-                // first real tunnel opens. Per-copy invocations will
-                // see loggedFirstSuccess already set and skip the
-                // duplicate log.
-                if (loggedFirstSuccess.compareAndSet(false, true)) {
-                    logger?.invoke(
-                        "INFO",
-                        "splice: kernel zero-copy active",
-                        mapOf(
-                            "strategy" to (winningStrategy ?: strategyName(strategy)),
-                            "via" to "warmup",
-                        ),
-                    )
-                }
+                // Always emit on warmup — not once-per-process.
+                // Reason: when the user stops + restarts the agent in
+                // the same :proxy process, SpliceShim state survives
+                // (loadedFirstSuccess stays true from the first run).
+                // Without re-emitting here, the second start's
+                // ProxyService.parseAgentLine wouldn't see the
+                // "kernel zero-copy active" line and would leave the
+                // widget badge stuck on the bare "TCP" set by
+                // "uplink connected". Per-copy invocations are still
+                // silenced via the loggedFirstSuccess flag below so
+                // we don't spam the log on every tunnel.
+                logger?.invoke(
+                    "INFO",
+                    "splice: kernel zero-copy active",
+                    mapOf(
+                        "strategy" to (winningStrategy ?: strategyName(strategy)),
+                        "via" to "warmup",
+                    ),
+                )
+                loggedFirstSuccess.set(true)
             } else {
                 // Pre-emptive fallback decision — extraction failed
                 // on a virgin SocketChannel, so it's not going to work
-                // for real tunnels either. Log the reason once now;
-                // copy() will silently take the NIO path without
-                // re-logging.
-                logFallbackOnce("warmup:${decodeFdError(packed)}")
+                // for real tunnels either. Always emit on warmup
+                // (same restart-friendliness reason as the success
+                // path) and set the once-flag so copy() doesn't
+                // duplicate.
+                logger?.invoke(
+                    "INFO",
+                    "splice: NIO fallback engaged",
+                    mapOf("reason" to "warmup:${decodeFdError(packed)}"),
+                )
+                loggedFallback.set(true)
             }
         }
 

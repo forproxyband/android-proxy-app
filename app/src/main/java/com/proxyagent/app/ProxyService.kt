@@ -302,7 +302,23 @@ class ProxyService : Service() {
                 currentUplinkTransport = if (line.contains("uplink connected")) {
                     when (transportRe.find(line)?.groupValues?.get(1)?.lowercase(Locale.US)) {
                         "quic" -> "QUIC"
-                        "tcp" -> if (engine == Engine.NATIVE) "TCP" else "TCP (splice)"
+                        "tcp" -> when {
+                            // NATIVE: don't clobber a splice/NIO state
+                            // that the SpliceShim warmup may have
+                            // already published. Warmup runs inside
+                            // start() — before the supervisor dials —
+                            // so its "kernel zero-copy active" /
+                            // "NIO fallback engaged" log line arrives
+                            // BEFORE this "uplink connected" line.
+                            // Without this guard we'd overwrite the
+                            // accurate badge with a bare "TCP".
+                            engine == Engine.NATIVE &&
+                                (currentUplinkTransport == "TCP (splice)" ||
+                                 currentUplinkTransport == "TCP (NIO)") ->
+                                    currentUplinkTransport
+                            engine == Engine.NATIVE -> "TCP"
+                            else -> "TCP (splice)"
+                        }
                         null -> "TCP+yamux"
                         else -> transportRe.find(line)?.groupValues?.get(1)?.uppercase(Locale.US).orEmpty()
                     }
