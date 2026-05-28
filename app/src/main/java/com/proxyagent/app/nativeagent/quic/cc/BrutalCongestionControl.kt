@@ -74,16 +74,22 @@ internal class BrutalCongestionControl(
         nextSendTimeNanos = maxOf(now, nextSendTimeNanos) + delayNanos
     }
 
-    /** Record an ACK for a packet of [packetSize] bytes that was
-     *  sent [rttNanos] ago. Frees the in-flight budget and
-     *  updates the smoothed RTT estimate (EWMA, α = 1/8). */
+    /** Record an ACK for a packet of [packetSize] bytes. Always frees
+     *  the in-flight budget. Updates [smoothedRttNanos] (EWMA, α = 1/8)
+     *  ONLY when [rttNanos] is positive — RFC 9002 §5 mandates that the
+     *  RTT sample come from the **largest** acknowledged packet only,
+     *  so callers pass 0 for every other acked packet. Sampling each
+     *  acked packet would feed seconds-old `sentTime` values into the
+     *  EWMA when a big batch is acked at once (e.g. the 100-pkt cwnd
+     *  worth a server delivers in one ACK frame), inflating srtt to
+     *  multiple seconds and ballooning [congestionWindow] to 100+ MiB —
+     *  exactly what build-93's stats showed after a heavy burst. */
     fun onPacketAcked(packetSize: Int, rttNanos: Long) {
         _bytesInFlight.updateAndGet { (it - packetSize).coerceAtLeast(0L) }
-        // Smoothed RTT: srtt = 7/8 * srtt + 1/8 * sample, with
-        // clamp to a sane floor (mobile networks can briefly
-        // report sub-ms RTT during local-cache hits).
-        val clamped = rttNanos.coerceAtLeast(1_000_000L)  // 1 ms floor
-        smoothedRttNanos = (smoothedRttNanos * 7 + clamped) / 8
+        if (rttNanos > 0L) {
+            val clamped = rttNanos.coerceAtLeast(1_000_000L)  // 1 ms floor
+            smoothedRttNanos = (smoothedRttNanos * 7 + clamped) / 8
+        }
     }
 
     /** Record that a sent packet was declared lost. Brutal

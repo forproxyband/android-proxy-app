@@ -84,11 +84,18 @@ class NativeQuicTransport private constructor(
                 throw java.io.IOException("DNS lookup failed for $host: ${t.message}", t)
             }
             val ourTp = TransportParameters(
-                // Mirror the values our kwik adapter advertised; the
-                // server-side TPs in proxy-agent-sdk-go expect these
-                // limits.
+                // Mirror what kwik effectively advertises: 16 MiB per-stream
+                // and 160 MiB (= 10× per-stream) at the connection level.
+                // Build-93's 9-minute upload trace showed the proxy stops
+                // forwarding client→agent data when our advertised connection
+                // MAX_DATA is tight (12 MiB): once we use it during download
+                // it never gets reopened, and the proxy throttles subsequent
+                // uploads. Advertising 160 MiB up front gives the proxy
+                // permanent headroom and tracks kwik's behavior 1:1 — which
+                // does push upload (7.94 Mbps in the user's run) where 12 MiB
+                // gave 0.
                 maxIdleTimeoutMs = 60_000,
-                initialMaxData = 12L * 1024 * 1024,
+                initialMaxData = 160L * 1024 * 1024,
                 initialMaxStreamDataBidiLocal = 16L * 1024 * 1024,
                 initialMaxStreamDataBidiRemote = 16L * 1024 * 1024,
                 initialMaxStreamDataUni = 16L * 1024 * 1024,

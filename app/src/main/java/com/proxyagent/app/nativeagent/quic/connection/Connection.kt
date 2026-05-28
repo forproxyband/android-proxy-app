@@ -461,8 +461,15 @@ internal class Connection(
                     if (frame.largestAcked > cs.largestAckedSentPn) cs.largestAckedSentPn = frame.largestAcked
                     val acked = cs.recovery.processAckFrame(frame, peerTransportParameters?.ackDelayExponent ?: 3)
                     val now = System.nanoTime()
+                    // RFC 9002 §5: take the RTT sample ONLY from the largest
+                    // newly-acked packet. Sampling every packet in the batch
+                    // feeds the EWMA with old sentTimes when a big group is
+                    // acked at once (build-93: cc.cwnd ballooned to 161 MiB
+                    // because srtt drifted to ~6 s from such stale samples).
+                    val largestAckedPacket = acked.maxByOrNull { it.packetNumber }
                     for (p in acked) {
-                        cc.onPacketAcked(p.sizeBytes, now - p.sentTimeNanos)
+                        val rtt = if (p === largestAckedPacket) now - p.sentTimeNanos else 0L
+                        cc.onPacketAcked(p.sizeBytes, rtt)
                     }
                     // ACK progress resets the PTO timer + backoff so the probe
                     // only fires when the peer truly goes quiet on us.
