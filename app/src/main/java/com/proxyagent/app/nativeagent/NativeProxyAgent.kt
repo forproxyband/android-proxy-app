@@ -26,6 +26,7 @@ import kotlin.math.min
 import kotlin.math.pow
 import kotlin.random.Random
 import com.proxyagent.app.nativeagent.quic.NetworkProfile
+import com.proxyagent.app.nativeagent.quic.tuning
 
 /**
  * Self-contained native Kotlin port of the Go proxy-agent SDK.
