@@ -300,6 +300,19 @@ that are easy to regress:
   peer is bounded by the MIN of the connection and per-stream windows,
   so BOTH must be extended or a download stalls once one fills.
 
+- **Key updates (RFC 9001 §6) must be followed.** quic-go rotates
+  1-RTT keys mid-connection by flipping the short-header Key Phase
+  bit. `processShortPacket` compares that bit to `CryptoSpace.keyPhase`;
+  on a flip it trial-decrypts with `nextReceiveProtection()` (next
+  generation via `HKDF-Expand-Label(secret, "quic ku")`, HP keys
+  unchanged) and on success `commitKeyUpdate()` advances BOTH
+  directions and flips the phase. Without this, every packet after the
+  peer's update silently fails AEAD and is dropped — the connection
+  goes half-dead (build 92: `recv_pn` frozen, `decrypt_fails` climbing,
+  `datagrams` flooding with un-decryptable retransmits). The handshake
+  and pre-update data path are untouched because the new code is inert
+  until the phase bit actually differs.
+
 - **Per-packet wire logs are gated behind `Connection.verboseWire`
   (default off).** At line rate the per-send / per-ACK / per-STREAM
   logs fire ~10k×/s, flooding logcat and throttling the sender thread.

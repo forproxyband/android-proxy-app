@@ -73,8 +73,11 @@ import java.util.concurrent.atomic.AtomicLong
  *    retry response; first-shot Initial only.
  *  - Version negotiation: refuses (closes connection) rather
  *    than retrying.
- *  - Key updates: not implemented; long-lived connections that
- *    exceed the AEAD usage limit will fail.
+ *  - Key updates (RFC 9001 §6): supported on the receive path —
+ *    a peer-initiated Key Phase flip is followed by deriving the
+ *    next-generation keys ("quic ku") and adopting them for both
+ *    directions. We never *initiate* an update ourselves (fine for
+ *    our connection lifetimes, well under the AEAD usage limit).
  *  - PMTU discovery: assumes 1200-byte MTU.
  *  - Datagram extension: disabled.
  */
@@ -310,6 +313,10 @@ internal class Connection(
     private val statsDatagrams = java.util.concurrent.atomic.AtomicLong(0L)
     private val statsStreamFrames = java.util.concurrent.atomic.AtomicLong(0L)
     private val statsNewServerStreams = java.util.concurrent.atomic.AtomicLong(0L)
+    /** 1-RTT AEAD decrypt failures — a non-zero value that keeps
+     *  climbing means we're dropping the peer's packets (e.g. an
+     *  unhandled key update, which is exactly what froze build 92). */
+    private val statsDecryptFailures = java.util.concurrent.atomic.AtomicLong(0L)
 
     private fun processLongPacket(bytes: ByteArray, datagramStart: Int, datagramEnd: Int, buf: ByteBuffer): Int {
         return try {
@@ -407,9 +414,28 @@ internal class Connection(
             val aad = bytes.copyOfRange(info.headerStartOffset, payloadStart)
             aad[0] = unprotectedFirst
             System.arraycopy(unprotectedPn, 0, aad, info.packetNumberOffset - info.headerStartOffset, pnLength)
+            // Key update (RFC 9001 §6): if the Key Phase bit differs from
+            // our current phase, the peer rotated keys — decrypt with the
+            // next generation and, on success, adopt it for both
+            // directions. quic-go initiates this mid-connection; not
+            // following it dropped every subsequent packet (build 92:
+            // recv_pn frozen while datagrams flooded).
+            val pktKeyPhase = (unprotectedFirst.toInt() ushr 2) and 1
+            val keyUpdate = pktKeyPhase != cs.keyPhase
+            val protection = if (keyUpdate) (cs.nextReceiveProtection() ?: cs.receive!!) else cs.receive!!
             val plaintext = try {
-                cs.receive!!.decrypt(pn, ciphertext, aad)
-            } catch (_: Throwable) { return -1 }
+                protection.decrypt(pn, ciphertext, aad)
+            } catch (_: Throwable) {
+                val n = statsDecryptFailures.incrementAndGet()
+                if (n <= 12L || n % 200L == 0L) {
+                    log("recv short: AEAD FAIL #$n pn=$pn keyphase=$pktKeyPhase(cur=${cs.keyPhase}) ct=${ciphertext.size}B recv_pn=${cs.largestReceivedPn}")
+                }
+                return -1
+            }
+            if (keyUpdate) {
+                cs.commitKeyUpdate()
+                log("recv: KEY UPDATE adopted at pn=$pn, new phase=${cs.keyPhase}")
+            }
             if (pn > cs.largestReceivedPn) cs.largestReceivedPn = pn
             val frames = Frame.parseAll(ByteBuffer.wrap(plaintext))
             val ackElic = frames.any { it.ackEliciting }
@@ -686,6 +712,7 @@ internal class Connection(
                     logStat("stats: datagrams=${statsDatagrams.get()}" +
                         " stream_frames=${statsStreamFrames.get()}" +
                         " new_server_streams=${statsNewServerStreams.get()}" +
+                        " decrypt_fails=${statsDecryptFailures.get()}" +
                         " accept_queue=${incomingServerStreams.size}" +
                         " streams_map=${streams.size}" +
                         " cc.in_flight=${cc.bytesInFlight}" +
@@ -922,7 +949,7 @@ internal class Connection(
         val headerBytes: ByteArray
         val pnOffset: Int
         if (space == PacketNumberSpace.ONE_RTT) {
-            val shdr = encodeShortHeader(destinationCid, pnLen)
+            val shdr = encodeShortHeader(destinationCid, pnLen, keyPhase = cs.keyPhase == 1)
             headerBytes = shdr
             pnOffset = shdr.size
         } else {
