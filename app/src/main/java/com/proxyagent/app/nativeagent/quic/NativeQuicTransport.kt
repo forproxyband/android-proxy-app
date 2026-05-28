@@ -79,6 +79,11 @@ class NativeQuicTransport private constructor(
          *  self-heal, so each fresh QUIC socket lands on the right
          *  network even after a Wi-Fi handover. */
         private val uplinkSocketBinder: ((java.net.DatagramSocket) -> Unit)? = null,
+        /** User-selected network profile. Renders to a [QuicTuning]
+         *  that gates Brutal CC target rate, the UDP socket buffer
+         *  size, and the flow-control window-refresh cadence. Default
+         *  matches the safer low-latency end of the scale. */
+        private val networkProfile: NetworkProfile = NetworkProfile.LOW_100,
     ) : QuicTransport.Factory {
         override fun connect(
             host: String,
@@ -112,14 +117,17 @@ class NativeQuicTransport private constructor(
                 initialMaxStreamsUni = 1024,
                 initialSourceConnectionId = null,  // filled in by Connection
             )
+            val quicTuning = networkProfile.tuning().quic
             val conn = Connection(
                 serverHost = host,
                 serverPort = port,
                 resolvedAddress = resolved,
                 alpn = alpn,
                 ourTransportParameters = ourTp,
-                ccTargetMbps = 100,
+                ccTargetMbps = quicTuning.brutalTargetMbps,
                 uplinkSocketBinder = uplinkSocketBinder,
+                udpSocketBufBytes = quicTuning.udpSocketBufBytes,
+                windowUpdateHeadroomRatio = quicTuning.windowUpdateHeadroomRatio,
             )
             conn.connect(timeoutMs = dialTimeoutMs.toLong())
             return NativeQuicTransport(conn)

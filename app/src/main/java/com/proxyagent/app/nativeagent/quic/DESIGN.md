@@ -180,7 +180,13 @@ primitives:
 `proxy-agent-sdk-go/internal/netagent/brutal/` implements the
 Brutal algorithm in Go. We mirror it in Kotlin:
 
-- Send at a configured target rate (default 100 Mbps).
+- Send at a configured target rate, picked from the user's
+  `network_profile` setting (`LOW_100` = 100 Mbps default,
+  `MID_500` = 500 Mbps, `HIGH_1000` = 1 Gbps). See
+  `NetworkProfile.kt` and the host-side `ARCHITECTURE.md`
+  §NetworkProfile-driven tuning for the full table — Brutal
+  target moves in lockstep with the UDP socket buffer and the
+  flow-control refresh cadence so they don't fight each other.
 - Pace packet emission via a leaky bucket on timestamps — emit
   next packet at `last_emit + packet_size / target_rate`.
 - Ignore loss feedback beyond updating RTT estimates. Loss recovery

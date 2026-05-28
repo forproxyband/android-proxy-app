@@ -342,50 +342,71 @@ class MainActivity : AppCompatActivity() {
         val etImeiCustomCmd = view.findViewById<EditText>(R.id.etImeiCustomCmd)
         val cbWifiReturn = view.findViewById<CheckBox>(R.id.cbWifiReturn)
         val tvWifiReturnHint = view.findViewById<TextView>(R.id.tvWifiReturnHint)
+        val spNetworkProfile = view.findViewById<Spinner>(R.id.spNetworkProfile)
+        val tvNetworkProfileHint = view.findViewById<TextView>(R.id.tvNetworkProfileHint)
         val prefs = getSharedPreferences("cfg", 0)
 
-        // Wi-Fi return is Modem-only on this iteration: the Balancer path
-        // dials the registrator picked from the JSON balancer reply *after*
-        // env was set, so a loopback relay that only sees the balancer GET
-        // wouldn't catch the real uplink. Disable the checkbox + grey out
-        // the hint when Balancer is selected; checkbox state is preserved
-        // in SharedPreferences either way so toggling back to Modem brings
-        // it back.
-        fun applyWifiReturnEnabled(modemMode: Boolean) {
-            cbWifiReturn.isEnabled = modemMode
-            tvWifiReturnHint.alpha = if (modemMode) 1f else 0.5f
-            cbWifiReturn.text = if (modemMode) {
-                "Return traffic to client over Wi-Fi"
-            } else {
-                "Return traffic to client over Wi-Fi  (Modem mode only)"
+        // Wi-Fi return is gated on TWO conditions, both required:
+        //
+        //   1. Modem mode. The Balancer path dials the registrator
+        //      returned in the JSON balancer reply *after* env was
+        //      set, so a loopback relay that only sees the balancer
+        //      GET wouldn't catch the real uplink. Balancer support
+        //      is on the wishlist but not yet implemented.
+        //
+        //   2. NATIVE engine. bindProcessToNetwork(cellular) sets a
+        //      per-process default route — BINARY runs the agent in
+        //      a forked ProcessBuilder subprocess that DOES NOT
+        //      inherit Android-level network binding, so its target
+        //      dials would always egress through the default route
+        //      (Wi-Fi on dual-transport devices), leaking the Wi-Fi
+        //      IP to targets. NATIVE is in-process; the bind sticks.
+        //
+        // When either is wrong, the checkbox is disabled with a hint
+        // saying why. State in SharedPreferences is preserved either
+        // way — fixing the offending toggle brings the box back to
+        // life with the same checked value.
+        fun applyWifiReturnEnabled(modemMode: Boolean, nativeEngine: Boolean) {
+            val allowed = modemMode && nativeEngine
+            cbWifiReturn.isEnabled = allowed
+            tvWifiReturnHint.alpha = if (allowed) 1f else 0.5f
+            cbWifiReturn.text = when {
+                allowed -> "Return traffic to client over Wi-Fi"
+                !modemMode && !nativeEngine ->
+                    "Return traffic to client over Wi-Fi  (Modem + NATIVE engine only)"
+                !modemMode ->
+                    "Return traffic to client over Wi-Fi  (Modem mode only)"
+                else ->
+                    "Return traffic to client over Wi-Fi  (NATIVE engine only)"
             }
         }
 
-        // Wi-Fi return requires the in-process NATIVE engine —
-        // bindProcessToNetwork(cellular) sets a per-process default
-        // route that doesn't survive ProcessBuilder fork+exec, so a
-        // BINARY subprocess wouldn't inherit it and target dials would
-        // leak through Wi-Fi (default route on dual-transport devices).
-        // We gate the engine radio accordingly: when the Wi-Fi return
-        // checkbox is on, BINARY is disabled and NATIVE is auto-selected.
-        fun applyEngineGateForWifiReturn() {
-            val wifiOn = cbWifiReturn.isChecked && cbWifiReturn.isEnabled
-            rbEngineBinary.isEnabled = !wifiOn
-            if (wifiOn && !rbEngineNative.isChecked) {
-                rbEngineNative.isChecked = true
-            }
-            rbEngineBinary.text = if (wifiOn) {
-                "Binary subprocess  (disabled — needs NATIVE engine for Wi-Fi return)"
-            } else {
-                "Binary subprocess"
-            }
+        // Convenience overload — refresh using the current radio state.
+        // Called from anywhere the gate inputs might have changed
+        // (rgMode listener, rgEngine listener, loadFromPrefs).
+        fun refreshWifiReturnGate() {
+            applyWifiReturnEnabled(
+                modemMode = rgMode.checkedRadioButtonId == R.id.rbModeModem,
+                nativeEngine = rgEngine.checkedRadioButtonId == R.id.rbEngineNative,
+            )
+        }
+
+        // Network profile is wired only into the NATIVE engine — the
+        // Go binary has no env hooks for bandwidth/buffer tuning (see
+        // BINARIES.md §2). Grey out the spinner + hint when the user
+        // picks BINARY so it's visually obvious the choice is moot,
+        // but keep the value in prefs so flipping back to NATIVE
+        // restores the prior selection.
+        fun applyNetworkProfileEnabled(nativeEngine: Boolean) {
+            spNetworkProfile.isEnabled = nativeEngine
+            tvNetworkProfileHint.alpha = if (nativeEngine) 1f else 0.5f
         }
 
         fun applyModeVisibility(modemMode: Boolean) {
             etId.visibility = if (modemMode) View.VISIBLE else View.GONE
             btnScanQr.visibility = if (modemMode) View.VISIBLE else View.GONE
             tvScanQrHint.visibility = if (modemMode) View.VISIBLE else View.GONE
-            applyWifiReturnEnabled(modemMode)
+            refreshWifiReturnGate()
         }
 
         val retentionLabels = arrayOf("Day (1)", "Week (7)", "Month (30)")
@@ -394,6 +415,23 @@ class MainActivity : AppCompatActivity() {
             val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, retentionLabels)
             adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
             spRetention.adapter = adapter
+        }
+
+        // Network optimization profile. Labels are user-facing; keys
+        // are the SharedPreferences string and intent-extra value
+        // (matched by NetworkProfile.fromPrefValue on the :proxy
+        // side). Index order MUST stay parallel — selectedItemPosition
+        // is the look-up key for both labels and keys arrays.
+        val networkProfileLabels = arrayOf(
+            "100 Mbps — low latency (cellular / Wi-Fi)",
+            "500 Mbps — balanced",
+            "1 Gbps — max throughput",
+        )
+        val networkProfileKeys = arrayOf("LOW_100", "MID_500", "HIGH_1000")
+        run {
+            val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, networkProfileLabels)
+            adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            spNetworkProfile.adapter = adapter
         }
 
         val imeiMethodLabels = arrayOf(
@@ -430,6 +468,12 @@ class MainActivity : AppCompatActivity() {
                 "binary" -> rbEngineBinary.isChecked = true
                 else -> rbEngineNative.isChecked = true     // "native" or unset
             }
+            val savedProfile = prefs.getString("network_profile", "LOW_100") ?: "LOW_100"
+            val pIdx = networkProfileKeys.indexOf(savedProfile).let { if (it < 0) 0 else it }
+            spNetworkProfile.setSelection(pIdx)
+            applyNetworkProfileEnabled(
+                nativeEngine = rgEngine.checkedRadioButtonId == R.id.rbEngineNative,
+            )
             // QUIC implementation picker removed from the dialog: the
             // in-house QUIC stack is now the default and only UI-visible
             // path for the NATIVE engine. The `quic_impl` SharedPreferences
@@ -451,12 +495,22 @@ class MainActivity : AppCompatActivity() {
             etImeiCustomCmd.setText(prefs.getString("imei_cmd", ""))
             applyImeiVisibility()
             cbWifiReturn.isChecked = prefs.getBoolean("wifi_return", false)
-            applyEngineGateForWifiReturn()
+            refreshWifiReturnGate()
         }
         loadFromPrefs()
 
         rgMode.setOnCheckedChangeListener { _, checkedId ->
             applyModeVisibility(checkedId == R.id.rbModeModem)
+        }
+        // Re-evaluate the Wi-Fi return gate on engine flip. Picking
+        // BINARY mid-dialog must grey out the checkbox immediately
+        // (and switching back to NATIVE re-enables it with whatever
+        // checked state was there before).
+        rgEngine.setOnCheckedChangeListener { _, _ ->
+            refreshWifiReturnGate()
+            applyNetworkProfileEnabled(
+                nativeEngine = rgEngine.checkedRadioButtonId == R.id.rbEngineNative,
+            )
         }
         // Wi-Fi return hard gate: the user can't leave the box ticked on a
         // device that won't actually split traffic. Three rejection paths:
@@ -475,10 +529,6 @@ class MainActivity : AppCompatActivity() {
         // routing doesn't work", and the user may legitimately want to
         // pre-configure the toggle.
         cbWifiReturn.setOnCheckedChangeListener { _, isChecked ->
-            // Whether the checkbox came on or off, the engine gate must
-            // refresh — turning the box off should re-enable BINARY, and
-            // turning it on must force NATIVE even before preflight returns.
-            applyEngineGateForWifiReturn()
             if (!isChecked || !cbWifiReturn.isEnabled) return@setOnCheckedChangeListener
             // Fast path: known-bad device from a previous self-test.
             // Reading wifi_info.json on the UI thread is cheap (small
@@ -527,28 +577,27 @@ class MainActivity : AppCompatActivity() {
                 val newMode = if (rgMode.checkedRadioButtonId == R.id.rbModeBalancer) "balancer" else "modem"
                 val imeiMethodKey = imeiMethodKeys[
                     spImeiMethod.selectedItemPosition.coerceIn(0, imeiMethodKeys.size - 1)]
-                // wifi_return is gated to Modem mode — if the user flipped
-                // to Balancer while the box was ticked (the box gets
-                // disabled but its in-memory state is still "checked"), we
-                // store false anyway so ProxyService doesn't try to spin up
-                // a relay that can't intercept the balancer-discovered
-                // registrator.
-                val effectiveWifiReturn = cbWifiReturn.isChecked && newMode == "modem"
-                // Wi-Fi return REQUIRES the NATIVE in-process engine —
-                // see runBinaryEngine guard + bindProcessToNetwork comment
-                // in ProxyService. If we somehow end up saving with
-                // wifi_return=true and engine=binary (e.g. stale dialog
-                // state or pref tampering), the ProxyService guard would
-                // silently disable the relay, leaving the user confused.
-                // Clamp it here to NATIVE.
-                val effectiveEngine = if (effectiveWifiReturn && newEngine == "binary") "native" else newEngine
-                val engineClampedForWifiReturn = effectiveWifiReturn && newEngine == "binary"
-                // engineChanged tracks what actually goes into prefs — i.e.
-                // effectiveEngine, not the radio's nominal newEngine. That
-                // way the "stop & restart to apply" hint fires even when
-                // engine was clamped by the Wi-Fi return gate.
+                // Wi-Fi return is gated to (Modem mode AND NATIVE engine)
+                // — see applyWifiReturnEnabled for the reasoning. The UI
+                // already disables the checkbox when either is wrong; we
+                // re-check here as defence in depth against stale dialog
+                // state, racey radio events, or direct pref tampering.
+                // Whatever the in-memory checkbox says, we only persist
+                // wifi_return=true when both gates pass. Engine itself
+                // is NOT touched — that's the user's choice; ours is to
+                // refuse to enable Wi-Fi return on top of an incompatible
+                // engine.
+                val effectiveWifiReturn = cbWifiReturn.isChecked &&
+                    newMode == "modem" &&
+                    newEngine == "native"
+                val effectiveEngine = newEngine
+                // engineChanged & modeChanged drive the "stop & restart
+                // to apply" hint so the user knows when the change needs
+                // a service kick to take effect.
                 val engineChanged = prefs.getString("engine", "native") != effectiveEngine
                 val modeChanged = prefs.getString("mode", "modem") != newMode
+                val newNetworkProfile = networkProfileKeys[
+                    spNetworkProfile.selectedItemPosition.coerceIn(0, networkProfileKeys.size - 1)]
                 prefs.edit()
                     .putString("h", h).putString("p", p).putString("k", k)
                     .putString("id", id).putString("dns", d)
@@ -561,14 +610,8 @@ class MainActivity : AppCompatActivity() {
                     .putString("imei_method", imeiMethodKey)
                     .putString("imei_cmd", etImeiCustomCmd.text.toString().trim())
                     .putBoolean("wifi_return", effectiveWifiReturn)
+                    .putString("network_profile", newNetworkProfile)
                     .apply()
-                if (engineClampedForWifiReturn) {
-                    Toast.makeText(
-                        this,
-                        "Wi-Fi return requires the NATIVE engine — switched automatically",
-                        Toast.LENGTH_LONG,
-                    ).show()
-                }
                 // Mirror cycle config into the cross-process file so
                 // ProxyService (:proxy) can see the toggle changes — its
                 // SharedPreferences in-memory cache otherwise stays stale.
@@ -1075,6 +1118,7 @@ class MainActivity : AppCompatActivity() {
 
         val engine = prefs.getString("engine", "native") ?: "native"
         val mode = prefs.getString("mode", "modem") ?: "modem"
+        val networkProfile = prefs.getString("network_profile", "LOW_100") ?: "LOW_100"
         // QUIC implementation chooser was removed from the UI — the
         // in-house stack is the default. We deliberately do NOT pass a
         // `quic_impl` extra so ProxyService applies its own default
@@ -1088,6 +1132,7 @@ class MainActivity : AppCompatActivity() {
                 putExtra("id", id); putExtra("dns", d)
                 putExtra("engine", engine)
                 putExtra("mode", mode)
+                putExtra("network_profile", networkProfile)
             }
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc) else startService(svc)
             tvStatus.text = "STARTING..."

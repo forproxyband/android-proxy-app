@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.min
 import kotlin.math.pow
 import kotlin.random.Random
+import com.proxyagent.app.nativeagent.quic.NetworkProfile
 
 /**
  * Self-contained native Kotlin port of the Go proxy-agent SDK.
@@ -82,6 +83,13 @@ class NativeProxyAgent {
         val quicDialTimeoutMs: Int = 3000,
         // Per-stream warm pool size for TCP mode (matches Go SDK default).
         val tcpWarmPoolSize: Int = 8,
+        // User-selected network optimization profile. Renders to two
+        // independent tuning sets (TCP and QUIC) that gate socket
+        // buffers, bridge buffer size, Brutal CC target, UDP buffer,
+        // and flow-control refresh cadence. Default = LOW_100 (low
+        // latency / cellular-class link). The QUIC factory chosen
+        // above also receives this — keep them in sync from the host.
+        val networkProfile: NetworkProfile = NetworkProfile.LOW_100,
     ) {
         fun hasDirectRegistrator(): Boolean =
             !registratorHost.isNullOrBlank() && registratorPort > 0
@@ -281,6 +289,22 @@ class NativeProxyAgent {
 
     private fun supervisorMain(cfg: Config) {
         logInfo("supervisor start")
+        // Surface the active network profile and what its numeric
+        // parameters resolved to. One structured line so diagnostic
+        // exports show both the user's choice and the applied
+        // tunings together — fires once per supervisor lifetime,
+        // covers both TCP and QUIC paths since both consume the
+        // same profile.
+        cfg.networkProfile.tuning().let { tuning ->
+            logInfo("network profile",
+                "user_choice" to cfg.networkProfile.name,
+                "tcp_socket_buf" to tuning.tcp.socketBufferBytes,
+                "tcp_bridge_buf" to tuning.tcp.bridgeBufferBytes,
+                "quic_brutal_target_mbps" to tuning.quic.brutalTargetMbps,
+                "quic_udp_socket_buf" to tuning.quic.udpSocketBufBytes,
+                "quic_window_headroom_ratio" to tuning.quic.windowUpdateHeadroomRatio,
+            )
+        }
         try {
             val backoff = ExponentialJitterBackoff(
                 baseMs = 250L,
@@ -543,33 +567,12 @@ class NativeProxyAgent {
         internal const val POOL_DIAL_TIMEOUT_MS = 10_000L
         internal const val POOL_REFILL_IDLE_MS = 5_000L
 
-        // Bridge buffer size for the bidirectional copy between the
-        // tunnel transport and the dialed TCP target. Matches the Go
-        // SDK's pipeQUIC buffer; 256 KiB is large enough that the
-        // userspace copy isn't a bottleneck at typical mobile/desktop
-        // line rates and small enough that the per-tunnel memory
-        // footprint stays sane on Android.
-        internal const val BRIDGE_BUFFER_BYTES = 256 * 1024
-
-        // Per-socket SO_RCVBUF / SO_SNDBUF hint we apply BEFORE
-        // connect() so the TCP window for the new connection is sized
-        // for high-BDP paths. On Android the kernel may clamp to
-        // net.core.rmem_max / net.core.wmem_max (typically 4–8 MiB);
-        // we ask for 4 MiB and take whatever the OS gives.
-        //
-        // Why this matters: bandwidth × RTT defines max in-flight
-        // bytes. At RTT = 200 ms (cellular or trans-continental Wi-Fi
-        // path to a datacenter registrator), the Android default
-        // receive buffer of ~208 KiB caps a single TCP flow at
-        // 208 KB / 0.2 s ≈ 8 Mbps — exactly the upload throughput
-        // we observed before this knob existed. With a 4 MiB buffer
-        // the cap moves to ~160 Mbps per flow, well past anything we
-        // expect on mobile or home Wi-Fi.
-        //
-        // Note: this MUST be set BEFORE connect() to take effect for
-        // the new connection's window scaling. Setting it later is a
-        // no-op on most TCP stacks.
-        internal const val SOCKET_BUFFER_HINT_BYTES = 4 * 1024 * 1024
+        // Per-socket SO_RCVBUF / SO_SNDBUF hint AND userspace bridge
+        // buffer size are now profile-scaled — see
+        // com.proxyagent.app.nativeagent.quic.NetworkProfile and the
+        // TcpTuning fields. The hint MUST still be set BEFORE
+        // connect() to influence TCP window scaling; that contract is
+        // preserved at every call site.
     }
 }
 
@@ -1060,8 +1063,8 @@ internal class Uplink(
             agent.logInfo("opening tunnel", "target" to target, "transport" to "quic")
             val sock = Socket()
             sock.tcpNoDelay = true
-            try { sock.receiveBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
-            try { sock.sendBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
+            try { sock.receiveBufferSize = cfg.networkProfile.tuning().tcp.socketBufferBytes } catch (_: Throwable) {}
+            try { sock.sendBufferSize = cfg.networkProfile.tuning().tcp.socketBufferBytes } catch (_: Throwable) {}
             sock.connect(InetSocketAddress(dns.resolve(host), port),
                 NativeProxyAgent.TARGET_DIAL_TIMEOUT_MS.toInt())
             targetSock = sock
@@ -1097,8 +1100,8 @@ internal class Uplink(
         sock.keepAlive = true
         try { sock.setSoLinger(false, 0) } catch (_: Throwable) {}
         // Pre-connect buffer hints (see SOCKET_BUFFER_HINT_BYTES doc).
-        try { sock.receiveBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
-        try { sock.sendBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
+        try { sock.receiveBufferSize = cfg.networkProfile.tuning().tcp.socketBufferBytes } catch (_: Throwable) {}
+        try { sock.sendBufferSize = cfg.networkProfile.tuning().tcp.socketBufferBytes } catch (_: Throwable) {}
         sock.connect(
             InetSocketAddress(dns.resolve(creds.host), creds.port),
             cfg.dialTimeoutMs,
@@ -1300,8 +1303,8 @@ internal class Uplink(
             val futureTarget = bridgeExecutor.submit<SocketChannel> {
                 val ch = SocketChannel.open()
                 ch.socket().tcpNoDelay = true
-                try { ch.socket().receiveBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
-                try { ch.socket().sendBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
+                try { ch.socket().receiveBufferSize = cfg.networkProfile.tuning().tcp.socketBufferBytes } catch (_: Throwable) {}
+                try { ch.socket().sendBufferSize = cfg.networkProfile.tuning().tcp.socketBufferBytes } catch (_: Throwable) {}
                 ch.socket().connect(
                     InetSocketAddress(dns.resolve(host), port),
                     NativeProxyAgent.TARGET_DIAL_TIMEOUT_MS.toInt(),
@@ -1356,8 +1359,8 @@ internal class Uplink(
         val stream = q.openStream()
         val targetSock = Socket().apply {
             tcpNoDelay = true
-            try { receiveBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
-            try { sendBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
+            try { receiveBufferSize = cfg.networkProfile.tuning().tcp.socketBufferBytes } catch (_: Throwable) {}
+            try { sendBufferSize = cfg.networkProfile.tuning().tcp.socketBufferBytes } catch (_: Throwable) {}
             connect(InetSocketAddress(dns.resolve(host), port),
                 NativeProxyAgent.TARGET_DIAL_TIMEOUT_MS.toInt())
         }
@@ -1488,7 +1491,7 @@ internal class Uplink(
         // splice path and the NIO fallback feed the same counter without
         // the host needing to know which one fired.
         if (SpliceShim.copy(src, dst, onBytes)) return
-        val buf = ByteBuffer.allocateDirect(NativeProxyAgent.BRIDGE_BUFFER_BYTES)
+        val buf = ByteBuffer.allocateDirect(cfg.networkProfile.tuning().tcp.bridgeBufferBytes)
         while (true) {
             buf.clear()
             val n = src.read(buf)
@@ -1576,7 +1579,7 @@ internal class Uplink(
         output: OutputStream,
         counter: java.util.concurrent.atomic.AtomicLong? = null,
     ) {
-        val buf = ByteArray(NativeProxyAgent.BRIDGE_BUFFER_BYTES)
+        val buf = ByteArray(cfg.networkProfile.tuning().tcp.bridgeBufferBytes)
         while (true) {
             val n = input.read(buf)
             if (n < 0) break
@@ -1684,8 +1687,8 @@ internal class Uplink(
                 ch.socket().keepAlive = true
                 // Buffer hints before connect — see SOCKET_BUFFER_HINT_BYTES
                 // for why this is necessary for high-BDP receive paths.
-                try { ch.socket().receiveBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
-                try { ch.socket().sendBufferSize = NativeProxyAgent.SOCKET_BUFFER_HINT_BYTES } catch (_: Throwable) {}
+                try { ch.socket().receiveBufferSize = cfg.networkProfile.tuning().tcp.socketBufferBytes } catch (_: Throwable) {}
+                try { ch.socket().sendBufferSize = cfg.networkProfile.tuning().tcp.socketBufferBytes } catch (_: Throwable) {}
                 ch.socket().connect(
                     InetSocketAddress(dns.resolve(creds.host), creds.port),
                     NativeProxyAgent.POOL_DIAL_TIMEOUT_MS.toInt(),

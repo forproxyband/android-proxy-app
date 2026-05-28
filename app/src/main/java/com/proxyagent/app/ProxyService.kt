@@ -52,6 +52,15 @@ class ProxyService : Service() {
     // (the picker was removed). Set via the optional `quic_impl=kwik`
     // start intent extra for the rare regression-debug scenario.
     @Volatile private var quicImpl: String = "native"
+    // User-selected network profile. Passed in via the start intent
+    // (same rationale as quicImpl — cross-process SharedPreferences
+    // is unreliable from :proxy). Defaults to LOW_100 = low-latency
+    // / cellular-class link, matching the new agent default. Only the
+    // NATIVE engine honors this; binary engine ignores it (no env
+    // hooks in libproxyagent.so — logged as a warning at runBinary
+    // start so operators see why their setting did nothing).
+    @Volatile private var networkProfile: com.proxyagent.app.nativeagent.quic.NetworkProfile =
+        com.proxyagent.app.nativeagent.quic.NetworkProfile.LOW_100
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var analytics: AnalyticsRecorder? = null
     @Volatile private var lastNatRefreshMs = 0L
@@ -691,6 +700,8 @@ class ProxyService : Service() {
         }
         mode = if (intent.getStringExtra("mode") == "balancer") Mode.BALANCER else Mode.MODEM
         quicImpl = intent.getStringExtra("quic_impl") ?: "native"
+        networkProfile = com.proxyagent.app.nativeagent.quic.NetworkProfile
+            .fromPrefValue(intent.getStringExtra("network_profile"))
         if (host.isEmpty()) { stopSelf(); return START_NOT_STICKY }
 
         // Defensive bind reset. The :proxy process survives stops in
@@ -1510,10 +1521,12 @@ class ProxyService : Service() {
                             }
                             com.proxyagent.app.nativeagent.quic.NativeQuicTransport.Factory(
                                 uplinkSocketBinder = binder,
+                                networkProfile = networkProfile,
                             )
                         }
                         else -> com.proxyagent.app.nativeagent.KwikQuicTransport.Factory()
                     },
+                    networkProfile = networkProfile,
                 )
 
                 connStatus = ConnStatus.CONNECTING
@@ -1568,6 +1581,16 @@ class ProxyService : Service() {
         }
         try { binary.setExecutable(true, false) } catch (_: Throwable) {}
         log("Binary: ${binary.absolutePath} size=${binary.length()}")
+        // The Go binary reads only env vars (see BINARIES.md §2) — its
+        // QUIC stack hardcodes Brutal CC at 100 Mbps and a 32 MiB UDP
+        // buffer with no env hooks. Surface that the operator's
+        // network_profile choice was ignored so log-trawling explains
+        // why their "MID_500" setting didn't change behaviour.
+        if (networkProfile != com.proxyagent.app.nativeagent.quic.NetworkProfile.LOW_100) {
+            log("WARN: network_profile=${networkProfile.name} ignored — " +
+                "binary engine uses fixed 100 Mbps Brutal CC / 32 MiB UDP buf. " +
+                "Switch to NATIVE engine to honor this setting.")
+        }
         // Spin up the Wi-Fi return relay (if enabled) BEFORE the runner loop
         // so the very first dial of the subprocess uses the loopback address.
         // The relay lives across subprocess respawns (the agent reconnect /

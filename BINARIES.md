@@ -120,9 +120,14 @@ onto direct here.
 - **QUIC transport** — single connection, ALPN `proxy-tunnel/1`, TLS
   with `InsecureSkipVerify=true`, custom `quic.Transport` over a
   32 MiB-buffered UDP socket, Brutal CC at 100 Mbps
-  (`netagent/brutal/`). Control = first opened stream; each
-  server-opened stream carries a JSON `tunnelHeader{host, port}` then a
-  byte pipe (no splice on the QUIC path).
+  (`netagent/brutal/`). Both values are baked into the Go binary
+  and have no env override — the Android app's `network_profile`
+  preset (see [ARCHITECTURE.md] §NetworkProfile-driven tuning)
+  applies only to the NATIVE engine; `runBinaryEngine` logs a WARN
+  on startup if a non-default profile was selected. Control = first
+  opened stream; each server-opened stream carries a JSON
+  `tunnelHeader{host, port}` then a byte pipe (no splice on the QUIC
+  path).
 - **Try order**: `TCP, QUIC` by default; the sticky cache flips it if
   QUIC won last time (`uplink.go:127-133`).
 

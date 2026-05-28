@@ -20,6 +20,12 @@ key can route proxy traffic out through this phone's cellular IP.
 - **Wi-Fi return** (optional): the agent↔registrator control link
   can ride Wi-Fi while target dials still go through cellular —
   saves mobile data without leaking the Wi-Fi IP to targets.
+- **Network optimization preset** (`100 / 500 / 1000 Mbps`):
+  one dropdown that scales TCP socket / bridge buffers and QUIC
+  Brutal CC target / UDP buffer / flow-control refresh together
+  to the link's expected ceiling — avoids the bufferbloat that
+  comes from fat buffers + slow pacer at lower link rates.
+  NATIVE engine only.
 - Auto-stops on low battery / no-internet, auto-restarts after app
   updates (when OEM doesn't block the broadcast).
 

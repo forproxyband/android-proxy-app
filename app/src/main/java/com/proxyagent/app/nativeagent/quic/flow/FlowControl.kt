@@ -29,6 +29,12 @@ internal class ConnectionFlowControl(
     initialPeerMaxData: Long,
     /** Bytes we initially authorize the peer to send to us. */
     private val initialOurMaxData: Long,
+    /** Fraction of [initialOurMaxData] below which remaining headroom
+     *  triggers a MAX_DATA refresh. 0.5 = legacy "refresh at half
+     *  consumed"; higher = refresh sooner (more control-frame traffic,
+     *  less HoL waiting on the receive direction). Wired from the
+     *  active [com.proxyagent.app.nativeagent.quic.NetworkProfile]. */
+    private val windowUpdateHeadroomRatio: Double = 0.5,
 ) {
     private val peerMaxData = AtomicLong(initialPeerMaxData)
     private val bytesSent = AtomicLong(0)
@@ -112,7 +118,8 @@ internal class ConnectionFlowControl(
     fun shouldAdvertiseMaxData(): Long? {
         val cur = ourAdvertisedMaxData.get()
         val received = bytesReceived.get()
-        return if (received > cur - initialOurMaxData / 2) {
+        val headroomFloor = (initialOurMaxData * windowUpdateHeadroomRatio).toLong()
+        return if (received > cur - headroomFloor) {
             val next = received + initialOurMaxData
             ourAdvertisedMaxData.set(next)
             next

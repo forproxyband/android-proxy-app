@@ -76,11 +76,13 @@ class PackageReplacedReceiver : BroadcastReceiver() {
         val dns = prefs.getString("dns", "")?.trim().orEmpty()
         val engine = prefs.getString("engine", "native") ?: "native"
         val mode = prefs.getString("mode", "modem") ?: "modem"
+        val networkProfile = prefs.getString("network_profile", "LOW_100") ?: "LOW_100"
 
         val svc = Intent(context, ProxyService::class.java).apply {
             putExtra("host", host); putExtra("port", port); putExtra("key", key)
             putExtra("id", id); putExtra("dns", dns)
             putExtra("engine", engine); putExtra("mode", mode)
+            putExtra("network_profile", networkProfile)
         }
         try {
             if (Build.VERSION.SDK_INT >= 26) {

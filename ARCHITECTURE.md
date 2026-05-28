@@ -126,6 +126,7 @@ Backed by the dialog at `MainActivity.kt:278-408` (XML
 | `imei_cmd` | string | — | Root shell command when `imei_method="custom"`. |
 | `wifi_return` | bool | false | Route the agent↔registrator uplink over Wi-Fi via a loopback relay; target dials still ride cellular. Modem mode only — auto-clamped to false on save when `mode="balancer"`. See "Wi-Fi return relay" below. |
 | `wifi_return_method` | string | `"local_relay"` | Slot for future methods (SO_MARK, VpnService split tunnel). No UI yet — only `local_relay` is implemented; anything else falls back to direct dial with a log line. |
+| `network_profile` | string | `"LOW_100"` | Network optimization preset — `"LOW_100"` / `"MID_500"` / `"HIGH_1000"`. Scales TCP socket / bridge buffers AND QUIC Brutal CC target / UDP socket buffer / flow-control refresh cadence to match the expected link ceiling. NATIVE engine only; BINARY ignores it (`libproxyagent.so` has no env hooks for these values — logged as a WARN at runBinaryEngine start). Applies on the next stop/start; changing it mid-session shows a Toast and waits for a manual restart. See [NetworkProfile-driven tuning](#networkprofile-driven-tuning). |
 
 ## Agent engines
 
@@ -192,9 +193,10 @@ builder exposes the equivalent:
 - `maxOpenPeerInitiatedBidirectionalStreams(1024)` — peer-initiated
   stream cap.
 - `socketFactory` builds a `DatagramSocket` with `receiveBufferSize` /
-  `sendBufferSize = 32 MB`. Android usually clamps to
-  `net.core.rmem_max` (4–8 MiB); we request 32 MB and take whatever
-  the OS gives.
+  `sendBufferSize = 32 MB` (fixed — kwik adapter does not honor the
+  `network_profile` preset; only the in-house `NativeQuicTransport`
+  does). Android usually clamps to `net.core.rmem_max` (4–8 MiB); we
+  request 32 MB and take whatever the OS gives.
 - `keepAlive(20)` matches the Go config's `KeepAlivePeriod`.
 
 **Congestion controller swap — `SenderImpl.congestionController`.**
@@ -412,6 +414,83 @@ easy to regress:
   self-heal redials and mid-session Wi-Fi handovers pick up the
   current `Network` reference without manual wiring.
 
+### NetworkProfile-driven tuning
+
+The agent's TCP and QUIC stacks each have their own knobs — socket
+buffers, bridge buffer, pacer rate, flow-control cadence — that
+interact: fat buffers + slow pacer = bufferbloat; slim buffers +
+fast pacer = under-utilization. Field operators can't be expected
+to tune five constants per stack to fit their link, so all of
+them are scaled together by a single preset
+(`nativeagent/quic/NetworkProfile.kt`):
+
+| Profile | Brutal CC | QUIC UDP buf | FC headroom | TCP SO_*BUF | TCP bridge buf |
+| --- | --- | --- | --- | --- | --- |
+| `LOW_100` (default) | 100 Mbps | 4 MiB | 0.75 | 1.5 MiB | 64 KiB |
+| `MID_500` | 500 Mbps | 16 MiB | 0.60 | 6 MiB | 128 KiB |
+| `HIGH_1000` | 1 Gbps | 32 MiB | 0.50 | 12 MiB | 256 KiB |
+
+- **Brutal CC target** rates the QUIC pacer's bytes/second; the
+  cwnd ceiling is `2 × BDP` at this rate.
+- **QUIC UDP socket buffer** caps kernel-queue depth so the pacer
+  is what bounds latency, not the queue. At LOW_100 the prior
+  32 MiB buffer over 100 Mbps was up to 2.5 s of bufferbloat —
+  the dominant cause of "buffers slow / not smooth" reports.
+- **FC headroom ratio** is the fraction of `initialMaxData` left
+  as buffer before a `MAX_DATA` refresh fires (see
+  `ConnectionFlowControl.shouldAdvertiseMaxData`). Higher =
+  refresh sooner = less HoL wait on the receive direction at the
+  cost of more control-frame overhead.
+- **TCP SO_RCVBUF / SO_SNDBUF** sized to BDP at the profile rate
+  ×100 ms RTT × ~1.2 headroom. Applied BEFORE `connect()` at every
+  call site (see [TCP socket tuning](#tcp-socket-tuning)).
+- **TCP bridge buffer** is the userspace bridge ByteBuffer in
+  `Uplink.bridge()` / `Uplink.copyStream()`. Smaller = more
+  frequent flushes = lower latency; larger = fewer syscalls per
+  byte.
+
+**Intentionally NOT scaled: QUIC `initialMaxData` (160 MiB) and
+`initialMaxStreamData` (16 MiB).** Build-93 traced a 9-minute
+upload stall to a 12-MiB connection-level MAX_DATA — quic-go on
+the server side stopped refreshing once the window filled. The
+160 MiB / 16 MiB values are production-validated and stay
+constant across profiles. The pacer is the real rate limit, so
+generous windows cost nothing.
+
+**The preset wiring chain:**
+
+1. UI Spinner writes `network_profile` to SharedPreferences `cfg`.
+2. `MainActivity.buildAndSendStartIntent` reads it and puts it as
+   an Intent extra (cross-process SharedPreferences caching makes
+   in-memory reads in `:proxy` unreliable).
+3. `ProxyService.onStartCommand` parses it via
+   `NetworkProfile.fromPrefValue` into `@Volatile networkProfile`.
+4. `runNativeEngine` passes it as `Config.networkProfile` AND as
+   `NativeQuicTransport.Factory(networkProfile = …)`. The Config
+   value drives TCP buffers via `cfg.networkProfile.tuning().tcp.*`
+   at every socket open in `NativeProxyAgent`; the Factory value
+   drives QUIC via `Connection(..., udpSocketBufBytes = ...,
+   windowUpdateHeadroomRatio = ..., ccTargetMbps = ...)`.
+5. `NativeProxyAgent.supervisorMain` logs the resolved profile and
+   numeric values once per supervisor lifetime via
+   `agent.logInfo("network profile", ...)` — the line lands in
+   `agent.log` so the export shows both the user's choice and what
+   actually got applied.
+
+**Live-apply NOT supported.** QUIC transport parameters ride the
+TLS handshake — they can't be renegotiated mid-connection — and
+TCP socket buffer hints take effect only before `connect()`. So
+the UI's "Save" persists the choice but takes effect on the next
+manual stop/start. The Toast in `MainActivity` reflects this
+(`"Saved — restart agent to apply"`).
+
+**Binary engine ignores the preset.** `libproxyagent.so` reads
+only env vars and the SDK has no env hook for the QUIC Brutal
+target or buffers (BINARIES.md §2 lists all 16 keys, none
+bandwidth-related). `runBinaryEngine` logs a `WARN: network_profile=
+… ignored` line on every start when the preset differs from
+default so the disparity surfaces in operators' log exports.
+
 ### NATIVE engine TCP fast path
 
 The TCP bridge between a registrator-side data socket and the dialed
@@ -508,27 +587,36 @@ to `start()` is a fair trade for a clean first burst.
 #### TCP socket tuning
 
 Every TCP socket the NATIVE engine opens — control, data pool,
-target dials — gets a 4 MiB hint applied to `SO_RCVBUF` and
-`SO_SNDBUF` BEFORE `connect()`:
+target dials — gets `SO_RCVBUF` and `SO_SNDBUF` set to
+`cfg.networkProfile.tuning().tcp.socketBufferBytes` BEFORE
+`connect()`. The bridge ByteBuffer in `Uplink.bridge()` /
+`Uplink.copyStream()` uses
+`cfg.networkProfile.tuning().tcp.bridgeBufferBytes` from the same
+profile (`NetworkProfile.kt` table — see
+[NetworkProfile-driven tuning](#networkprofile-driven-tuning) for
+the per-profile values).
 
 - **Why before connect**: on Linux the TCP window scaling is decided
   during the SYN handshake based on the receive buffer size at that
   moment. Setting it after connect is a no-op for the connection's
   effective window.
-- **Why 4 MiB**: bandwidth × RTT defines max in-flight bytes. At
-  RTT = 200 ms (cellular or trans-continental Wi-Fi path to a
-  datacenter registrator), the Android default receive buffer of
-  ~208 KiB caps a single TCP flow at ~8 Mbps. 4 MiB raises the cap
-  to ~160 Mbps per flow.
+- **Why scale with profile**: bandwidth × RTT defines max in-flight
+  bytes. At RTT = 200 ms, Android's default receive buffer of
+  ~208 KiB caps a single TCP flow at ~8 Mbps. The `LOW_100` profile
+  asks for 1.5 MiB (≈100 Mbps × 100 ms × 1.2 headroom); `MID_500`
+  for 6 MiB; `HIGH_1000` for 12 MiB. Picking the profile that fits
+  the link normalises behaviour without per-device tuning.
 - **Why ask for more than Android typically grants**: the kernel may
   clamp to `net.core.rmem_max` / `wmem_max` (often 4–8 MiB on modern
-  ROMs). Asking for 4 MiB and accepting whatever the OS gives is
-  cheaper than per-device tuning.
+  ROMs). Asking for the BDP and accepting whatever the OS gives is
+  cheaper than fighting the clamp.
 
-This was the root cause of an early NATIVE-engine bug where upload
-throughput hit ~7 Mbps on high-RTT paths — Go's BINARY engine
-happened to use socket sizes that triggered different kernel
-auto-tuning behaviour. The explicit hint normalises behaviour.
+This was originally the root cause of an early NATIVE-engine bug
+where upload throughput hit ~7 Mbps on high-RTT paths — Go's BINARY
+engine happened to use socket sizes that triggered different
+kernel auto-tuning behaviour. The explicit hint normalises
+behaviour; the profile abstraction lets operators rescale without
+recompiling.
 
 #### Native build
 

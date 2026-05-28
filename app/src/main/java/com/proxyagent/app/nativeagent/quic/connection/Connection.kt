@@ -98,6 +98,15 @@ internal class Connection(
      *  attempt picks up the current Wi-Fi network. Null = no binding,
      *  socket uses the process default route. */
     private val uplinkSocketBinder: ((java.net.DatagramSocket) -> Unit)? = null,
+    /** UDP socket buffer hint (receive + send). Sized by the active
+     *  [com.proxyagent.app.nativeagent.quic.NetworkProfile]; smaller
+     *  values cap kernel-queue depth so the pacer rate is what bounds
+     *  latency, not the socket queue. OS may clamp at
+     *  net.core.{r,s}mem_max. */
+    private val udpSocketBufBytes: Int = 32 * 1024 * 1024,
+    /** Forwarded to [ConnectionFlowControl] — fraction of initial
+     *  window kept as headroom before a MAX_DATA refresh fires. */
+    private val windowUpdateHeadroomRatio: Double = 0.5,
 ) {
 
     // ── Connection IDs (RFC 9000 §5) ──────────────────────────
@@ -143,6 +152,7 @@ internal class Connection(
     private val flow = ConnectionFlowControl(
         initialPeerMaxData = 0L,  // will be set from peer's TP
         initialOurMaxData = ourTransportParameters.initialMaxData,
+        windowUpdateHeadroomRatio = windowUpdateHeadroomRatio,
     )
 
     private val streams = ConcurrentHashMap<Long, Stream>()
@@ -160,7 +170,15 @@ internal class Connection(
 
     // ── I/O ────────────────────────────────────────────────────
 
-    private val socket = DatagramSocket()
+    private val socket = DatagramSocket().also {
+        // Pre-bind buffer hint so the kernel sizes its UDP queue for the
+        // expected BDP of this profile. Failures are swallowed: Android
+        // commonly clamps below the request (net.core.rmem_max), and the
+        // socket still works with the OS default — just at degraded
+        // throughput on high-BDP paths.
+        try { it.receiveBufferSize = udpSocketBufBytes } catch (_: Throwable) {}
+        try { it.sendBufferSize = udpSocketBufBytes } catch (_: Throwable) {}
+    }
     private val closed = AtomicBoolean(false)
     private val sendQueue = LinkedBlockingQueue<QueuedSendWork>()
     private lateinit var recvThread: Thread
