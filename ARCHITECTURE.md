@@ -426,7 +426,7 @@ them are scaled together by a single preset
 
 | Profile | Brutal CC | QUIC UDP buf | FC headroom | TCP SO_*BUF | TCP bridge buf |
 | --- | --- | --- | --- | --- | --- |
-| `LOW_100` | 100 Mbps | 4 MiB | 0.75 | 1 MiB | 64 KiB |
+| `LOW_100` | 100 Mbps | 4 MiB | 0.75 | 2 MiB | 64 KiB |
 | `MID_500` | 500 Mbps | 16 MiB | 0.60 | 2 MiB | 128 KiB |
 | `HIGH_1000` (default) | 1 Gbps | 32 MiB | 0.50 | 4 MiB | 256 KiB |
 
@@ -441,25 +441,26 @@ them are scaled together by a single preset
   `ConnectionFlowControl.shouldAdvertiseMaxData`). Higher =
   refresh sooner = less HoL wait on the receive direction at the
   cost of more control-frame overhead.
-- **TCP SO_RCVBUF / SO_SNDBUF** anchored at 4 MiB for HIGH_1000
-  (the prod-validated value from before the preset existed) and
-  scaled down for the lower profiles (2 MiB / 1 MiB) so the
-  kernel-queue depth caps proportionally to the target rate —
-  approx max bufferbloat at 100 ms RTT under saturation:
-  ~80 ms at LOW_100, ~32 ms at MID_500, ~32 ms at HIGH_1000
-  (anchor-constrained). A field test on Samsung S Fold 7
-  (samsung q7q, kernel 6.6.98) raising HIGH_1000 to 12 MiB
-  regressed TCP upload duplex (298/24 over wired in the same
-  city as the registrator — clean duplex was lost). Hypothesis:
-  setting SO_SNDBUF manually disables `tcp_wmem` auto-tuning,
-  and requesting more than `net.core.wmem_max` (~4–8 MiB on
-  Android) leaves the effective send window below where
-  auto-tune would have grown it. 4 MiB is at-or-below wmem_max
-  on every device we've measured, so the kernel grants it fully —
-  hence the ceiling. Per-flow throughput cap at 1 MiB / 100 ms
-  RTT is ~80 Mbps; fine because the proxy normally has 30+
-  parallel target dials, so aggregate throughput stays well
-  past the profile's target.
+- **TCP SO_RCVBUF / SO_SNDBUF** lives in a 2–4 MiB safe zone,
+  bounded by two symmetric field-test regressions:
+    - *Above the ceiling*: 12 MiB at HIGH_1000 on Samsung S Fold 7
+      (q7q, kernel 6.6.98) collapsed upload to ~5 Mbps. Setting
+      `SO_SNDBUF` manually disables `tcp_wmem` auto-tuning, and a
+      value above `net.core.wmem_max` (~4–8 MiB on Android)
+      leaves the effective send window below where auto-tune
+      would have grown it.
+    - *Below the floor*: 1 MiB at LOW_100 on Pixel 9 Pro XL
+      (komodo, kernel 6.1.145) reproduced exactly the same
+      ~5 Mbps upload symptom from the other direction. Below
+      `tcp_rmem` / `tcp_wmem` defaults the explicit value also
+      seems to disable auto-tuning, and `tcp_adv_win_scale`
+      overhead eats too much of the small buffer for window
+      scaling to keep up under multi-flow load.
+
+  So 4 MiB stays the ceiling (HIGH_1000, matches the pre-profile
+  hardcoded value), 2 MiB the floor (LOW_100 and MID_500). The
+  latency-vs-throughput tradeoff for TCP at the lower profiles
+  lives in the bridge buffer alone, not in SO_*BUF.
 - **TCP bridge buffer** is the userspace bridge ByteBuffer in
   `Uplink.bridge()` / `Uplink.copyStream()`. Smaller = more
   frequent flushes = lower latency; larger = fewer syscalls per
@@ -617,24 +618,14 @@ the per-profile values).
   during the SYN handshake based on the receive buffer size at that
   moment. Setting it after connect is a no-op for the connection's
   effective window.
-- **Why anchored at 4 MiB on HIGH_1000 and scaled down**: bandwidth
-  × RTT defines max in-flight bytes. At RTT = 200 ms, Android's
-  default receive buffer of ~208 KiB caps a single TCP flow at
-  ~8 Mbps; 4 MiB raises that cap to ~160 Mbps per flow. Going
-  higher (we tried 12 MiB at HIGH_1000) regressed upload duplex on
-  real devices — see the
+- **Why 2–4 MiB, not wider**: both extremes broke the upload
+  direction in field tests (12 MiB on Samsung, 1 MiB on Pixel).
+  Inside the safe zone, all three profiles work duplex; only the
+  bridge buffer varies for the TCP latency tradeoff. The 4 MiB
+  upper anchor matches the pre-profile hardcoded value and works
+  on every device we've measured. See the
   [NetworkProfile-driven tuning](#networkprofile-driven-tuning)
-  section for the field-test details. Below the 4 MiB ceiling,
-  smaller profiles use proportionally smaller buffers (2 MiB at
-  MID_500, 1 MiB at LOW_100) so the per-socket kernel queue can't
-  accrue more than ~32–80 ms of bufferbloat at the profile's
-  target rate.
-- **Single-flow throughput tradeoff**: 1 MiB / 100 ms RTT caps a
-  single flow at ~80 Mbps. The proxy normally has 30+ parallel
-  target dials, so aggregate throughput stays well past 100 Mbps
-  even at LOW_100 — speedtests with multi-flow mode (the default
-  on Speedtest.net and Cloudflare) won't notice. Single-flow
-  scrapers / single big-file downloads will see the per-flow cap.
+  section for the field-test details.
 
 This was originally the root cause of an early NATIVE-engine bug
 where upload throughput hit ~7 Mbps on high-RTT paths — Go's BINARY
