@@ -50,6 +50,32 @@ internal class ConnectionFlowControl(
         peerMaxData.updateAndGet { if (newMax > it) newMax else it }
     }
 
+    /** Peer-advertised MAX_DATA value at which we last emitted a
+     *  DATA_BLOCKED frame, so we don't spam one per drain pass. */
+    private val lastDataBlockedAt = AtomicLong(-1L)
+
+    /**
+     * Returns the current peer-advertised limit if we are connection-
+     * flow-blocked at it AND haven't already signalled at this limit
+     * — the caller emits a DATA_BLOCKED frame (RFC 9000 §19.12) to
+     * prompt the peer to send MAX_DATA. Without this signal,
+     * proxy-server-go can leave us with `peerMaxData==bytesSent` for
+     * minutes (build 94: after the speedtest's download phase, the
+     * proxy holds buffers it hasn't yet drained to the test client,
+     * so it never proactively extends our send window — upload then
+     * sits at 0 Mbps forever). Each unique blocking event emits
+     * exactly once; when the peer extends the limit, the new larger
+     * value becomes eligible to signal again if we re-block at it.
+     */
+    fun shouldEmitDataBlocked(): Long? {
+        val cur = peerMaxData.get()
+        val sent = bytesSent.get()
+        if (sent < cur) return null
+        val prev = lastDataBlockedAt.get()
+        if (prev >= cur) return null
+        return if (lastDataBlockedAt.compareAndSet(prev, cur)) cur else null
+    }
+
     // ── Receive side ─────────────────────────────────────────
 
     fun onBytesReceived(bytes: Int) { bytesReceived.addAndGet(bytes.toLong()) }

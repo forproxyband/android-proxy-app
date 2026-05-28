@@ -11,6 +11,7 @@ import com.proxyagent.app.nativeagent.quic.tls.encodeTransportParameters
 import com.proxyagent.app.nativeagent.quic.wire.Ack
 import com.proxyagent.app.nativeagent.quic.wire.ConnectionClose
 import com.proxyagent.app.nativeagent.quic.wire.Crypto
+import com.proxyagent.app.nativeagent.quic.wire.DataBlocked
 import com.proxyagent.app.nativeagent.quic.wire.Frame
 import com.proxyagent.app.nativeagent.quic.wire.HandshakeDone
 import com.proxyagent.app.nativeagent.quic.wire.LongPacketType
@@ -897,7 +898,22 @@ internal class Connection(
             }
             if (!sentThisPass) break  // no stream could make progress this pass
         }
-        return anyStreamHasData()
+        val workRemains = anyStreamHasData()
+        // If we still have data but the peer's connection-level window is
+        // exhausted, tell the peer (RFC 9000 §19.12). proxy-server-go can
+        // sit on stale MAX_DATA for minutes after a heavy download burst —
+        // build 94 captured this: after the speedtest's download phase,
+        // flow.send_credit stayed at 0 for 70+ seconds (forever, really)
+        // and upload sat at 0 Mbps. DATA_BLOCKED nudges the proxy to drain
+        // its forward buffer and send us a fresh MAX_DATA. Emitted at most
+        // once per unique blocking event so we don't spam.
+        if (workRemains && flow.sendCredit() <= 0L) {
+            flow.shouldEmitDataBlocked()?.let { limit ->
+                log("send DATA_BLOCKED: $limit (sendCredit exhausted)")
+                emitOneRttPacket(listOf(DataBlocked(limit)))
+            }
+        }
+        return workRemains
     }
 
     // ── Packet emission ────────────────────────────────────────
