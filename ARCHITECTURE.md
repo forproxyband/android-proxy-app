@@ -313,6 +313,18 @@ that are easy to regress:
   and pre-update data path are untouched because the new code is inert
   until the phase bit actually differs.
 
+- **No `BigInteger.TWO` — use the `BI_TWO` polyfill in `TlsCrypto`.**
+  `BigInteger.TWO` is Java 9 / Android API 31+ only. The hand-rolled
+  X25519 Montgomery ladder uses it once in `scalarMult` for the Fermat
+  modular inverse `z^(p-2) mod p`; on every Android < 11 device (e.g.
+  Xiaomi Redmi Note 5 on API 28) accessing it throws
+  `NoSuchFieldError: No field TWO of type Ljava/math/BigInteger;` and
+  the QUIC handshake fails every single time — supervisor loops dial
+  failures forever (build 100). A private `BI_TWO = BigInteger.valueOf(2L)`
+  constant fixes it. Do not "tidy" this back to the JDK constant. Same
+  rule applies if anyone later adds another `BigInteger.TWO` site —
+  reuse `BI_TWO` (or audit `minSdk` before adding the JDK reference).
+
 - **Per-packet wire logs are gated behind `Connection.verboseWire`
   (default off).** At line rate the per-send / per-ACK / per-STREAM
   logs fire ~10k×/s, flooding logcat and throttling the sender thread.
