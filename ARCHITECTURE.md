@@ -126,7 +126,7 @@ Backed by the dialog at `MainActivity.kt:278-408` (XML
 | `imei_cmd` | string | — | Root shell command when `imei_method="custom"`. |
 | `wifi_return` | bool | false | Route the agent↔registrator uplink over Wi-Fi via a loopback relay; target dials still ride cellular. Modem mode only — auto-clamped to false on save when `mode="balancer"`. See "Wi-Fi return relay" below. |
 | `wifi_return_method` | string | `"local_relay"` | Slot for future methods (SO_MARK, VpnService split tunnel). No UI yet — only `local_relay` is implemented; anything else falls back to direct dial with a log line. |
-| `network_profile` | string | `"LOW_100"` | Network optimization preset — `"LOW_100"` / `"MID_500"` / `"HIGH_1000"`. Scales TCP socket / bridge buffers AND QUIC Brutal CC target / UDP socket buffer / flow-control refresh cadence to match the expected link ceiling. NATIVE engine only; BINARY ignores it (`libproxyagent.so` has no env hooks for these values — logged as a WARN at runBinaryEngine start). Applies on the next stop/start; changing it mid-session shows a Toast and waits for a manual restart. See [NetworkProfile-driven tuning](#networkprofile-driven-tuning). |
+| `network_profile` | string | `"HIGH_1000"` | Network optimization preset — `"LOW_100"` / `"MID_500"` / `"HIGH_1000"`. Scales TCP socket / bridge buffers AND QUIC Brutal CC target / UDP socket buffer / flow-control refresh cadence to match the expected link ceiling. Default `HIGH_1000` reproduces the pre-profile hardcoded parameters exactly, so an unconfigured install behaves identically to the legacy codebase. NATIVE engine only; BINARY ignores it (`libproxyagent.so` has no env hooks for these values — logged as a WARN at runBinaryEngine start). Applies on the next stop/start; changing it mid-session shows a Toast and waits for a manual restart. See [NetworkProfile-driven tuning](#networkprofile-driven-tuning). |
 
 ## Agent engines
 
@@ -426,9 +426,9 @@ them are scaled together by a single preset
 
 | Profile | Brutal CC | QUIC UDP buf | FC headroom | TCP SO_*BUF | TCP bridge buf |
 | --- | --- | --- | --- | --- | --- |
-| `LOW_100` (default) | 100 Mbps | 4 MiB | 0.75 | 1.5 MiB | 64 KiB |
-| `MID_500` | 500 Mbps | 16 MiB | 0.60 | 6 MiB | 128 KiB |
-| `HIGH_1000` | 1 Gbps | 32 MiB | 0.50 | 12 MiB | 256 KiB |
+| `LOW_100` | 100 Mbps | 4 MiB | 0.75 | 1 MiB | 64 KiB |
+| `MID_500` | 500 Mbps | 16 MiB | 0.60 | 2 MiB | 128 KiB |
+| `HIGH_1000` (default) | 1 Gbps | 32 MiB | 0.50 | 4 MiB | 256 KiB |
 
 - **Brutal CC target** rates the QUIC pacer's bytes/second; the
   cwnd ceiling is `2 × BDP` at this rate.
@@ -441,13 +441,30 @@ them are scaled together by a single preset
   `ConnectionFlowControl.shouldAdvertiseMaxData`). Higher =
   refresh sooner = less HoL wait on the receive direction at the
   cost of more control-frame overhead.
-- **TCP SO_RCVBUF / SO_SNDBUF** sized to BDP at the profile rate
-  ×100 ms RTT × ~1.2 headroom. Applied BEFORE `connect()` at every
-  call site (see [TCP socket tuning](#tcp-socket-tuning)).
+- **TCP SO_RCVBUF / SO_SNDBUF** anchored at 4 MiB for HIGH_1000
+  (the prod-validated value from before the preset existed) and
+  scaled down for the lower profiles (2 MiB / 1 MiB) so the
+  kernel-queue depth caps proportionally to the target rate —
+  approx max bufferbloat at 100 ms RTT under saturation:
+  ~80 ms at LOW_100, ~32 ms at MID_500, ~32 ms at HIGH_1000
+  (anchor-constrained). A field test on Samsung S Fold 7
+  (samsung q7q, kernel 6.6.98) raising HIGH_1000 to 12 MiB
+  regressed TCP upload duplex (298/24 over wired in the same
+  city as the registrator — clean duplex was lost). Hypothesis:
+  setting SO_SNDBUF manually disables `tcp_wmem` auto-tuning,
+  and requesting more than `net.core.wmem_max` (~4–8 MiB on
+  Android) leaves the effective send window below where
+  auto-tune would have grown it. 4 MiB is at-or-below wmem_max
+  on every device we've measured, so the kernel grants it fully —
+  hence the ceiling. Per-flow throughput cap at 1 MiB / 100 ms
+  RTT is ~80 Mbps; fine because the proxy normally has 30+
+  parallel target dials, so aggregate throughput stays well
+  past the profile's target.
 - **TCP bridge buffer** is the userspace bridge ByteBuffer in
   `Uplink.bridge()` / `Uplink.copyStream()`. Smaller = more
   frequent flushes = lower latency; larger = fewer syscalls per
-  byte.
+  byte. This is the only TCP-side dimension that actually varies
+  across profiles.
 
 **Intentionally NOT scaled: QUIC `initialMaxData` (160 MiB) and
 `initialMaxStreamData` (16 MiB).** Build-93 traced a 9-minute
@@ -600,23 +617,30 @@ the per-profile values).
   during the SYN handshake based on the receive buffer size at that
   moment. Setting it after connect is a no-op for the connection's
   effective window.
-- **Why scale with profile**: bandwidth × RTT defines max in-flight
-  bytes. At RTT = 200 ms, Android's default receive buffer of
-  ~208 KiB caps a single TCP flow at ~8 Mbps. The `LOW_100` profile
-  asks for 1.5 MiB (≈100 Mbps × 100 ms × 1.2 headroom); `MID_500`
-  for 6 MiB; `HIGH_1000` for 12 MiB. Picking the profile that fits
-  the link normalises behaviour without per-device tuning.
-- **Why ask for more than Android typically grants**: the kernel may
-  clamp to `net.core.rmem_max` / `wmem_max` (often 4–8 MiB on modern
-  ROMs). Asking for the BDP and accepting whatever the OS gives is
-  cheaper than fighting the clamp.
+- **Why anchored at 4 MiB on HIGH_1000 and scaled down**: bandwidth
+  × RTT defines max in-flight bytes. At RTT = 200 ms, Android's
+  default receive buffer of ~208 KiB caps a single TCP flow at
+  ~8 Mbps; 4 MiB raises that cap to ~160 Mbps per flow. Going
+  higher (we tried 12 MiB at HIGH_1000) regressed upload duplex on
+  real devices — see the
+  [NetworkProfile-driven tuning](#networkprofile-driven-tuning)
+  section for the field-test details. Below the 4 MiB ceiling,
+  smaller profiles use proportionally smaller buffers (2 MiB at
+  MID_500, 1 MiB at LOW_100) so the per-socket kernel queue can't
+  accrue more than ~32–80 ms of bufferbloat at the profile's
+  target rate.
+- **Single-flow throughput tradeoff**: 1 MiB / 100 ms RTT caps a
+  single flow at ~80 Mbps. The proxy normally has 30+ parallel
+  target dials, so aggregate throughput stays well past 100 Mbps
+  even at LOW_100 — speedtests with multi-flow mode (the default
+  on Speedtest.net and Cloudflare) won't notice. Single-flow
+  scrapers / single big-file downloads will see the per-flow cap.
 
 This was originally the root cause of an early NATIVE-engine bug
 where upload throughput hit ~7 Mbps on high-RTT paths — Go's BINARY
 engine happened to use socket sizes that triggered different
 kernel auto-tuning behaviour. The explicit hint normalises
-behaviour; the profile abstraction lets operators rescale without
-recompiling.
+behaviour.
 
 #### Native build
 

@@ -21,22 +21,25 @@ package com.proxyagent.app.nativeagent.quic
  * generous costs nothing.
  */
 enum class NetworkProfile {
-    /** Mobile / Wi-Fi up to ~100 Mbps. Latency-optimized. Default. */
+    /** Mobile / Wi-Fi up to ~100 Mbps. Latency-optimized. */
     LOW_100,
     /** ~500 Mbps-class links. Balanced. */
     MID_500,
-    /** Gigabit-class uplink. Throughput-optimized. */
+    /** Gigabit-class uplink. Throughput-optimized. Default. */
     HIGH_1000;
 
     companion object {
         /** Parse a SharedPreferences / intent-extra string. Unknown
-         *  values (including null) collapse to [LOW_100] — the safe
-         *  default for unconfigured devices. */
+         *  values (including null) collapse to [HIGH_1000] — the
+         *  default for unconfigured devices. HIGH_1000 reproduces
+         *  the pre-profile hardcoded TCP/QUIC parameters exactly,
+         *  so a new install or a missing pref gives identical
+         *  behaviour to the codebase before this preset existed. */
         @JvmStatic
         fun fromPrefValue(raw: String?): NetworkProfile = when (raw) {
+            "LOW_100" -> LOW_100
             "MID_500" -> MID_500
-            "HIGH_1000" -> HIGH_1000
-            else -> LOW_100
+            else -> HIGH_1000
         }
     }
 }
@@ -46,9 +49,12 @@ enum class NetworkProfile {
  * (uplink, target dials, warm-pool members) before connect().
  */
 data class TcpTuning(
-    /** Per-socket SO_RCVBUF / SO_SNDBUF hint. OS may clamp at
-     *  net.core.{r,s}mem_max — we ask, the kernel decides. Sized
-     *  for BDP at the profile's target rate × ~100 ms RTT. */
+    /** Per-socket SO_RCVBUF / SO_SNDBUF hint. Scaled from a 4 MiB
+     *  anchor at HIGH_1000 (the prod-validated ceiling; see the
+     *  kdoc on [tuning] for the Samsung upload-regression that
+     *  rules out going higher) down through MID_500 and LOW_100
+     *  so lower-bandwidth profiles bound kernel-queue depth and
+     *  avoid bufferbloat at their target rate. */
     val socketBufferBytes: Int,
     /** Userspace bridge buffer used by the bidirectional copy
      *  between the tunnel transport and the dialed target. Smaller
@@ -93,16 +99,36 @@ data class ProfileTuning(
  * call repeatedly; we still memoize at one call site (the supervisor)
  * to keep the log line's reported values stable across reads.
  *
- * BDP math: 100 ms RTT × target bandwidth, doubled for headroom.
- * 100 Mbps → 1.25 MB, 500 Mbps → 6.25 MB, 1000 Mbps → 12.5 MB.
- * TCP socket buffer floors the doubled value; UDP socket buffer
- * over-sizes it (QUIC bursts can spike higher than TCP's paced
- * fill).
+ * **TCP SO_*BUF anchored at 4 MiB for HIGH_1000** — the prod-
+ * validated value from the pre-profile codebase, proven to support
+ * TCP-duplex on real devices. Going higher (12 MiB attempted at
+ * HIGH_1000) regressed TCP upload on Samsung S Fold 7 (samsung q7q,
+ * kernel 6.6.98): manually setting SO_SNDBUF disables `tcp_wmem`
+ * auto-tuning, and a value above `net.core.wmem_max` (typically
+ * 4–8 MiB on Android) leaves the effective send window below where
+ * auto-tune would have grown it. So 4 MiB stays the ceiling.
+ *
+ * **Below the ceiling, SO_*BUF scales down with target rate** so
+ * lower-bandwidth profiles cap kernel-queue depth and don't accrue
+ * bufferbloat. Approx max bufferbloat per profile at 100 ms RTT
+ * when the link is saturated:
+ *   LOW_100  (1 MiB / 100 Mbps)  ≈ 80 ms
+ *   MID_500  (2 MiB / 500 Mbps)  ≈ 32 ms
+ *   HIGH_1000(4 MiB / 1000 Mbps) ≈ 32 ms (constrained by the anchor)
+ *
+ * Per-flow throughput cap at 1 MiB / 100 ms RTT is ~80 Mbps —
+ * tight for a single-flow speedtest at LOW_100, but the proxy
+ * normally has many parallel target dials (>30 in field logs), so
+ * aggregate throughput stays well past the profile's target rate.
+ *
+ * QUIC scales all three of its dimensions independently — its
+ * userspace pacer + UDP socket queue interact differently from
+ * TCP's in-kernel cwnd, so the same scaling logic doesn't apply.
  */
 fun NetworkProfile.tuning(): ProfileTuning = when (this) {
     NetworkProfile.LOW_100 -> ProfileTuning(
         tcp = TcpTuning(
-            socketBufferBytes = 1_500_000,        // ~1.5 MiB ≈ 100 Mbps × 100 ms × 1.2
+            socketBufferBytes = 1 * 1024 * 1024,
             bridgeBufferBytes = 64 * 1024,        // small flushes → low per-hop latency
         ),
         quic = QuicTuning(
@@ -113,7 +139,7 @@ fun NetworkProfile.tuning(): ProfileTuning = when (this) {
     )
     NetworkProfile.MID_500 -> ProfileTuning(
         tcp = TcpTuning(
-            socketBufferBytes = 6 * 1024 * 1024,
+            socketBufferBytes = 2 * 1024 * 1024,
             bridgeBufferBytes = 128 * 1024,
         ),
         quic = QuicTuning(
@@ -124,8 +150,8 @@ fun NetworkProfile.tuning(): ProfileTuning = when (this) {
     )
     NetworkProfile.HIGH_1000 -> ProfileTuning(
         tcp = TcpTuning(
-            socketBufferBytes = 12 * 1024 * 1024,
-            bridgeBufferBytes = 256 * 1024,
+            socketBufferBytes = 4 * 1024 * 1024,  // anchor: matches the pre-profile hardcoded value
+            bridgeBufferBytes = 256 * 1024,       // matches the pre-profile hardcoded value
         ),
         quic = QuicTuning(
             brutalTargetMbps = 1000,
