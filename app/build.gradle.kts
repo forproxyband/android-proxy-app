@@ -146,21 +146,24 @@ android {
     }
 }
 
-// Disable AGP tasks that only produce metadata Google Play Console
-// reads. This app is sideloaded as a plain APK (via `adb install` or
-// direct user install), never uploaded to Play, so these are pure
-// build-time waste:
+// Disable the native-debug-symbol pipeline. This app is sideloaded as
+// a plain APK (via `adb install` or direct user install), never
+// uploaded to Play, so the Play-Console symbol bundle is dead weight.
+// `buildTypes.release.ndk.debugSymbolLevel = "none"` already keeps
+// `extract*NativeSymbolTables` from registering, and `merge*NativeDebugMetadata`
+// runs as SKIPPED — verified safe (`packageDebug`/`packageRelease` do
+// not consume its output).
 //
-//   * extract*VersionControlInfo — embeds git commit / branch in the
-//     APK for Play Console's "Bundle Explorer" tab.
-//   * sdk*DependencyData + collect*Dependencies — dump the dependency
-//     graph for Google Play SDK Index / Play Integrity scanning.
-//
-// Also disable the native-debug-symbol pipeline (Play Console uses
-// these for symbolicating native crashes; we don't upload symbols
-// anywhere). `buildTypes.release.ndk.debugSymbolLevel = "none"` already
-// makes them no-ops, but they still appear in the build log unless
-// explicitly disabled here.
+// IMPORTANT: do NOT try to also disable the AGP "Play Store metadata"
+// pipeline (`extract*VersionControlInfo`, `collect*Dependencies`,
+// `sdk*DependencyData`, `write*AppMetadata`). Even though their content
+// is only read by Play Console, AGP 8.7.x wires their output files as
+// *required inputs* to `package{Debug,Release}`. Disabling any of them
+// makes packaging fail config-validation with:
+//   - "appMetadata ... app-metadata.properties does not exist"
+//   - "dependencyDataFile ... sdkDependencyData.pb does not exist"
+// Both regressions verified in CI; the build-time saving is single-
+// digit seconds anyway. Not worth the brittleness.
 //
 // What's NOT disabled and why:
 //   - DEX tasks (dexBuilder*, merge*Dex*, mergeExtDex*, l8DexDesugarLib*)
@@ -173,17 +176,9 @@ android {
 //     the user's first launch noticeably faster. Cheap to build,
 //     valuable to keep.
 //   - lintVital* stays — catches real bugs in release builds.
-//   - write*AppMetadata stays — looks Play-Store-only but AGP wires
-//     its output file (app-metadata.properties) as a *required input*
-//     to package{Debug,Release}. Disabling it makes packaging fail
-//     with "An input file was expected to be present but it doesn't
-//     exist" — verified the hard way. Leave alone.
 tasks.configureEach {
     if (name.startsWith("extract") && name.endsWith("NativeSymbolTables")) enabled = false
     if (name.startsWith("merge") && name.endsWith("NativeDebugMetadata")) enabled = false
-    if (name.startsWith("extract") && name.endsWith("VersionControlInfo")) enabled = false
-    if (name.startsWith("sdk") && name.endsWith("DependencyData")) enabled = false
-    if (name.startsWith("collect") && name.endsWith("Dependencies")) enabled = false
 }
 
 dependencies {
