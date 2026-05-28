@@ -329,6 +329,24 @@ internal class Connection(
      *  [statsDataBlockedSent] to tell if DATA_BLOCKED is doing its job. */
     private val statsMaxDataRecv = java.util.concurrent.atomic.AtomicLong(0L)
 
+    // ── Send-side stall detection / auto-reconnect ───────────────
+    //
+    // Build-97 proved that quic-go on the proxy-server side does NOT
+    // react to DATA_BLOCKED (224 frames sent over 3m40s, MAX_DATA never
+    // extended). quic-go extends MAX_DATA solely off its own consume
+    // position; when the test client stops reading the download payload
+    // (download phase ends), the proxy's consume stops, MAX_DATA stops,
+    // our send_credit stays at 0 forever — and any subsequent upload
+    // can't even get TLS ServerHello back through (which needs the
+    // agent's QUIC send). The user's own observation: fresh connections
+    // always work. So we self-heal: if work is queued AND send_credit
+    // has been pinned at 0 for [stallTimeoutNanos], close the connection
+    // — the supervisor reopens a fresh one and resumes.
+    @Volatile private var stallStartNanos: Long = 0L
+    private val stallTimeoutNanos: Long = 15_000_000_000L  // 15 s
+    /** How many times we've force-closed for stall self-heal. */
+    private val statsStallReconnects = java.util.concurrent.atomic.AtomicLong(0L)
+
     private fun processLongPacket(bytes: ByteArray, datagramStart: Int, datagramEnd: Int, buf: ByteBuffer): Int {
         return try {
             val info = parseLongHeader(buf, datagramEnd)
@@ -734,6 +752,7 @@ internal class Connection(
                         " decrypt_fails=${statsDecryptFailures.get()}" +
                         " db_sent=${statsDataBlockedSent.get()}" +
                         " md_recv=${statsMaxDataRecv.get()}" +
+                        " stall_reconnects=${statsStallReconnects.get()}" +
                         " accept_queue=${incomingServerStreams.size}" +
                         " streams_map=${streams.size}" +
                         " cc.in_flight=${cc.bytesInFlight}" +
@@ -841,6 +860,29 @@ internal class Connection(
 
                 // Priority 4: STREAM frames, paced via the token bucket.
                 val workRemains = if (oneRttSpace.ready()) drainStreams() else false
+
+                // Send-side stall self-heal: if we've had data to send
+                // but no send credit for [stallTimeoutNanos], close the
+                // connection so the supervisor reopens a fresh one. See
+                // the field-block comment above for why DATA_BLOCKED
+                // alone doesn't get us out (proxy-server-go ignores it).
+                val nowStallNs = System.nanoTime()
+                val stalled = workRemains && flow.sendCredit() <= 0L
+                if (stalled) {
+                    if (stallStartNanos == 0L) {
+                        stallStartNanos = nowStallNs
+                        logStat("send-side stall started (sendCredit=0 with work pending)")
+                    } else if (nowStallNs - stallStartNanos > stallTimeoutNanos) {
+                        statsStallReconnects.incrementAndGet()
+                        logStat("STALL TIMEOUT >${stallTimeoutNanos / 1_000_000_000}s — closing for reconnect (count=${statsStallReconnects.get()})")
+                        close()
+                    }
+                } else {
+                    if (stallStartNanos != 0L) {
+                        logStat("send-side stall cleared (sendCredit recovered)")
+                        stallStartNanos = 0L
+                    }
+                }
 
                 // Priority 5: PING keepalive. ACK frames are not
                 // ack-eliciting; if we send only ACKs for too long, the
