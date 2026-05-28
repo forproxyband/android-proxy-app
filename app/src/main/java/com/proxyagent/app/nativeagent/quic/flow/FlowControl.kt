@@ -51,29 +51,43 @@ internal class ConnectionFlowControl(
     }
 
     /** Peer-advertised MAX_DATA value at which we last emitted a
-     *  DATA_BLOCKED frame, so we don't spam one per drain pass. */
+     *  DATA_BLOCKED frame, paired with the wall time of that emission
+     *  so we can periodically RE-emit while still blocked at the same
+     *  limit — quic-go ignores a one-shot DATA_BLOCKED (build-96 logs
+     *  confirmed: db_sent went 0→1 at credit=0, md_recv then sat
+     *  unchanged at 56 for 115 seconds). RFC 9000 §19.12 permits
+     *  repeated DATA_BLOCKED while blocked. */
     private val lastDataBlockedAt = AtomicLong(-1L)
+    @Volatile private var lastDataBlockedNanos: Long = 0L
+    /** Re-emit interval. 1 s is aggressive but bounded — at most
+     *  1 DATA_BLOCKED/sec while stuck, which is well under any flood
+     *  threshold but frequent enough to keep nudging the peer. */
+    private val dataBlockedReemitNanos: Long = 1_000_000_000L
 
     /**
      * Returns the current peer-advertised limit if we are connection-
-     * flow-blocked at it AND haven't already signalled at this limit
-     * — the caller emits a DATA_BLOCKED frame (RFC 9000 §19.12) to
-     * prompt the peer to send MAX_DATA. Without this signal,
+     * flow-blocked at it AND it's time to (re-)signal the peer via a
+     * DATA_BLOCKED frame (RFC 9000 §19.12). Without this signal,
      * proxy-server-go can leave us with `peerMaxData==bytesSent` for
-     * minutes (build 94: after the speedtest's download phase, the
-     * proxy holds buffers it hasn't yet drained to the test client,
-     * so it never proactively extends our send window — upload then
-     * sits at 0 Mbps forever). Each unique blocking event emits
-     * exactly once; when the peer extends the limit, the new larger
-     * value becomes eligible to signal again if we re-block at it.
+     * minutes after a heavy download (the proxy stops proactively
+     * extending MAX_DATA once its consume rate falls to zero). One-
+     * shot wasn't enough (build 96), so we re-emit every
+     * [dataBlockedReemitNanos] while still blocked at the same limit;
+     * when the peer extends the limit we reset and the new value
+     * becomes eligible immediately if we hit it again.
      */
     fun shouldEmitDataBlocked(): Long? {
         val cur = peerMaxData.get()
         val sent = bytesSent.get()
         if (sent < cur) return null
         val prev = lastDataBlockedAt.get()
-        if (prev >= cur) return null
-        return if (lastDataBlockedAt.compareAndSet(prev, cur)) cur else null
+        val now = System.nanoTime()
+        val limitChanged = prev != cur
+        val intervalElapsed = now - lastDataBlockedNanos >= dataBlockedReemitNanos
+        if (!limitChanged && !intervalElapsed) return null
+        lastDataBlockedAt.set(cur)
+        lastDataBlockedNanos = now
+        return cur
     }
 
     // ── Receive side ─────────────────────────────────────────
