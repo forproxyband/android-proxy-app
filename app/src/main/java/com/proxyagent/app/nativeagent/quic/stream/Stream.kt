@@ -48,6 +48,13 @@ internal class Stream(
     /** Initial flow-control window the peer granted us for
      *  sending on this stream (their MAX_STREAM_DATA from us). */
     var peerMaxStreamData: Long,
+    /** Per-stream cap on the userspace SendBuffer (see
+     *  [SendBuffer] kdoc). Bounds how far ahead the bridge thread
+     *  may write before it blocks on [SendBuffer.write], which is
+     *  what gives us kwik-style backpressure to the upstream TCP
+     *  socket when peer's flow control pins. Sourced from the
+     *  active NetworkProfile. */
+    sendBufferMaxBytes: Int = SendBuffer.DEFAULT_MAX_BUFFER_BYTES,
 ) {
     /** Send-side state per RFC 9000 §3.1. */
     enum class SendState { READY, SEND, DATA_SENT, DATA_RECVD, RESET_SENT, RESET_RECVD }
@@ -59,7 +66,7 @@ internal class Stream(
     @Volatile var recvState: RecvState = RecvState.RECV
         private set
 
-    val sendBuffer = SendBuffer()
+    val sendBuffer = SendBuffer(sendBufferMaxBytes)
     val recvBuffer = ReceiveBuffer(ourInitialMaxStreamData)
 
     /** Highest stream offset we've sent. */
@@ -188,24 +195,41 @@ internal class Stream(
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Send buffer — unbounded, blocking-on-write only when peer's
-// flow-control window is exhausted (managed by Stream.pollSendFrame).
+// Send buffer — bounded, blocks on write() when full so the bridge
+// thread feeding it can't accumulate gigabytes locally when the QUIC
+// peer stops accepting bytes.
 // ────────────────────────────────────────────────────────────────────
 
 /**
- * Append-only FIFO of bytes waiting to be sent. Backed by a
- * deque of `ByteArray` chunks so writes never block on
- * allocation (unlike a fixed-size circular buffer).
+ * Append-only FIFO of bytes waiting to be sent, capped at
+ * [maxBufferBytes]. Writes that would push past the cap block on
+ * [notFull] until the sender drains room (kwik's SendBuffer design,
+ * see `tech.kwik.core.stream.SendBuffer` for the reference).
  *
- * The deliberate design here is: **the application thread never
- * blocks on this buffer alone**. Backpressure comes from the
- * peer's MAX_STREAM_DATA window via [Stream.pollSendFrame]
- * returning a no-data frame, which makes the sender skip this
- * stream until the peer extends credit. This is the inverse of
- * kwik's "50 KB cap then block" design — see the ARCHITECTURE
- * regression note explaining why.
+ * **Why bounded:** earlier (build ≤99) this buffer was unbounded.
+ * The bridge thread that copies TCP-target bytes into the stream
+ * could pump unlimited bytes locally even when peer's MAX_DATA was
+ * pinned (e.g. proxy-server-go after a download speedtest). The
+ * stuck bytes blocked the build-97 stall self-heal from clearing
+ * and prevented the upload phase from using the same QUIC
+ * connection. With a hard cap, the bridge stalls on write() →
+ * TCP target socket's window fills → target backs off → no local
+ * accumulation, no need to close the QUIC connection to recover.
+ *
+ * **Cap size:** comes from the active
+ * [com.proxyagent.app.nativeagent.quic.NetworkProfile]'s
+ * `sendBufferMaxBytes`. Big enough to hold ≈BDP × small fanout
+ * (so the sender always has data to pull when credit allows),
+ * small enough that an idle stream after a finished tunnel
+ * doesn't pin MiB of dead bytes.
+ *
+ * **Sender fairness:** in our QUIC stack the sender prioritizes
+ * ACK / MAX_*_DATA control frames over STREAM data, so a fat
+ * SendBuffer here does NOT starve receive-direction window
+ * updates (the regression kwik saw at 4 MiB doesn't apply —
+ * kwik's sender was strictly FIFO).
  */
-internal class SendBuffer {
+internal class SendBuffer(private val maxBufferBytes: Int = DEFAULT_MAX_BUFFER_BYTES) {
     private val chunks = ArrayDeque<ByteArray>()
     private var headOffset = 0  // bytes consumed from chunks[0]
     @Volatile var queuedBytes: Long = 0L
@@ -213,17 +237,41 @@ internal class SendBuffer {
     @Volatile var closed: Boolean = false
         private set
     private val lock = ReentrantLock()
+    /** Signalled by [drain] whenever bytes leave the buffer AND by
+     *  [close] / [unblockAll] when the buffer is being torn down.
+     *  Writers parked in [write] await on this. */
+    private val notFull = lock.newCondition()
 
-    fun write(data: ByteArray, off: Int = 0, len: Int = data.size - off) = lock.withLock {
-        check(!closed) { "write to closed SendBuffer" }
-        if (len <= 0) return@withLock
-        val copy = ByteArray(len)
-        System.arraycopy(data, off, copy, 0, len)
-        chunks.addLast(copy)
-        queuedBytes += len
+    fun write(data: ByteArray, off: Int = 0, len: Int = data.size - off) {
+        if (len <= 0) return
+        lock.withLock {
+            // Park until cap allows the full chunk (or the buffer
+            // closes / is force-unblocked). Partial-fit writes would
+            // require splitting the source which complicates the
+            // public contract; we keep the contract "append once
+            // succeeded, contiguous" and split on the caller side if
+            // needed. In practice the bridge thread writes ≤bridge-
+            // buffer-bytes at a time, well under maxBufferBytes.
+            while (!closed && queuedBytes + len > maxBufferBytes) {
+                notFull.await()
+            }
+            if (closed) {
+                // Closed while we were parked (e.g. peer dropped the
+                // stream or connection terminated). Surface as
+                // IOException so the bridge thread's copy loop exits
+                // via its catch instead of silently retrying.
+                throw java.io.IOException("send buffer closed")
+            }
+            val copy = ByteArray(len)
+            System.arraycopy(data, off, copy, 0, len)
+            chunks.addLast(copy)
+            queuedBytes += len
+        }
     }
 
-    /** Drain up to [maxBytes] from the head into a fresh array. */
+    /** Drain up to [maxBytes] from the head into a fresh array.
+     *  Signals [notFull] so any [write] parked at the cap wakes
+     *  and refills the headroom we just opened. */
     fun drain(maxBytes: Int): ByteArray = lock.withLock {
         if (maxBytes <= 0 || chunks.isEmpty()) return@withLock ByteArray(0)
         val out = ByteArray(minOf(maxBytes.toLong(), queuedBytes).toInt())
@@ -241,10 +289,27 @@ internal class SendBuffer {
             }
         }
         queuedBytes -= written
+        if (written > 0) notFull.signalAll()
         if (written == out.size) out else out.copyOf(written)
     }
 
-    fun close() = lock.withLock { closed = true }
+    fun close() = lock.withLock {
+        closed = true
+        notFull.signalAll()  // unblock any parked writers
+    }
+
+    /** Force-unblock parked writers without marking the buffer
+     *  closed — used on connection termination to free bridge
+     *  threads so they can exit and let stream teardown proceed. */
+    fun unblockAll() = lock.withLock { notFull.signalAll() }
+
+    companion object {
+        /** Fallback when no profile-sourced cap is supplied. 1 MiB
+         *  matches the LOW_100 BDP at ~80 ms RTT and is the
+         *  smallest size that doesn't throttle a single stream
+         *  below the profile's nominal rate. */
+        const val DEFAULT_MAX_BUFFER_BYTES: Int = 1 * 1024 * 1024
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────

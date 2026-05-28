@@ -87,6 +87,16 @@ data class QuicTuning(
      *  in the receive direction at the cost of more control-frame
      *  overhead. */
     val windowUpdateHeadroomRatio: Double,
+    /** Per-stream userspace SendBuffer cap. The bridge thread that
+     *  feeds a QUIC stream blocks on `write()` when this fills —
+     *  kwik-style backpressure that prevents local accumulation
+     *  when peer's MAX_DATA pins (build-99 download→upload
+     *  regression: without a cap, the bridge dumped GiB into the
+     *  buffer locally and the connection couldn't recover without
+     *  a force-close). Sized to ≈BDP × small fanout: large enough
+     *  the sender always has data when credit allows, small enough
+     *  that finished tunnels release memory promptly. */
+    val sendBufferMaxBytes: Int,
 )
 
 /** Concrete tunings for one profile. Picked once at agent startup
@@ -141,6 +151,7 @@ fun NetworkProfile.tuning(): ProfileTuning = when (this) {
             brutalTargetMbps = 100,
             udpSocketBufBytes = 4 * 1024 * 1024,  // ~4 MiB; 32 MiB at 100 Mbps = 2.5s bufferbloat
             windowUpdateHeadroomRatio = 0.75,     // refresh aggressively (at 25% consumed)
+            sendBufferMaxBytes = 1 * 1024 * 1024,  // 1 MiB ≈ BDP at 100 Mbps × 80 ms RTT
         ),
     )
     NetworkProfile.MID_500 -> ProfileTuning(
@@ -152,6 +163,7 @@ fun NetworkProfile.tuning(): ProfileTuning = when (this) {
             brutalTargetMbps = 500,
             udpSocketBufBytes = 16 * 1024 * 1024,
             windowUpdateHeadroomRatio = 0.60,
+            sendBufferMaxBytes = 2 * 1024 * 1024,  // 2 MiB ≈ BDP at 500 Mbps × 32 ms
         ),
     )
     NetworkProfile.HIGH_1000 -> ProfileTuning(
@@ -163,6 +175,7 @@ fun NetworkProfile.tuning(): ProfileTuning = when (this) {
             brutalTargetMbps = 1000,
             udpSocketBufBytes = 32 * 1024 * 1024,
             windowUpdateHeadroomRatio = 0.50,     // legacy threshold
+            sendBufferMaxBytes = 4 * 1024 * 1024,  // 4 MiB ≈ BDP at 1 Gbps × 32 ms, matches HIGH TCP buf
         ),
     )
 }

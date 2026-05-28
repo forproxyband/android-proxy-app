@@ -131,6 +131,7 @@ class NativeQuicTransport private constructor(
                 uplinkSocketBinder = uplinkSocketBinder,
                 udpSocketBufBytes = quicTuning.udpSocketBufBytes,
                 windowUpdateHeadroomRatio = quicTuning.windowUpdateHeadroomRatio,
+                streamSendBufferMaxBytes = quicTuning.sendBufferMaxBytes,
             )
             conn.connect(timeoutMs = dialTimeoutMs.toLong())
             return NativeQuicTransport(conn)

@@ -107,6 +107,15 @@ internal class Connection(
     /** Forwarded to [ConnectionFlowControl] — fraction of initial
      *  window kept as headroom before a MAX_DATA refresh fires. */
     private val windowUpdateHeadroomRatio: Double = 0.5,
+    /** Per-stream SendBuffer cap. The bridge thread feeding a stream
+     *  blocks on [com.proxyagent.app.nativeagent.quic.stream.SendBuffer.write]
+     *  when this fills — backpressure to the upstream TCP socket.
+     *  Replaces the old build-97 close-and-reconnect self-heal:
+     *  with bounded buffers there's no local accumulation when peer
+     *  pins MAX_DATA, so the connection never needs to be torn down
+     *  to recover. */
+    private val streamSendBufferMaxBytes: Int =
+        com.proxyagent.app.nativeagent.quic.stream.SendBuffer.DEFAULT_MAX_BUFFER_BYTES,
 ) {
 
     // ── Connection IDs (RFC 9000 §5) ──────────────────────────
@@ -276,6 +285,7 @@ internal class Connection(
             streamId = id,
             ourInitialMaxStreamData = ourTransportParameters.initialMaxStreamDataBidiLocal,
             peerMaxStreamData = peerTransportParameters?.initialMaxStreamDataBidiRemote ?: 0L,
+            sendBufferMaxBytes = streamSendBufferMaxBytes,
         )
         s.sendWakeup = { sendQueue.offer(QueuedSendWork.Tick) }
         streams[id] = s
@@ -338,7 +348,6 @@ internal class Connection(
             try {
                 socket.receive(pkt)
                 packetCount++
-                lastRxProgressNanos = System.nanoTime()
                 if (verboseWire) log("recv: pkt#$packetCount size=${pkt.length} firstByte=0x${(buf[0].toInt() and 0xFF).toString(16)}")
                 processDatagram(buf, pkt.length)
             } catch (_: java.net.SocketTimeoutException) {
@@ -389,36 +398,17 @@ internal class Connection(
      *  [statsDataBlockedSent] to tell if DATA_BLOCKED is doing its job. */
     private val statsMaxDataRecv = java.util.concurrent.atomic.AtomicLong(0L)
 
-    // ── Send-side stall detection / auto-reconnect ───────────────
-    //
-    // Build-97 proved that quic-go on the proxy-server side does NOT
-    // react to DATA_BLOCKED (224 frames sent over 3m40s, MAX_DATA never
-    // extended). quic-go extends MAX_DATA solely off its own consume
-    // position; when the test client stops reading the download payload
-    // (download phase ends), the proxy's consume stops, MAX_DATA stops,
-    // our send_credit stays at 0 forever — and any subsequent upload
-    // can't even get TLS ServerHello back through (which needs the
-    // agent's QUIC send). The user's own observation: fresh connections
-    // always work. So we self-heal: if work is queued AND send_credit
-    // has been pinned at 0 for [stallTimeoutNanos], close the connection
-    // — the supervisor reopens a fresh one and resumes.
-    @Volatile private var stallStartNanos: Long = 0L
-    private val stallTimeoutNanos: Long = 5_000_000_000L  // 5 s — fast self-heal
-    /** Wall-clock of the last UDP datagram we received. Gates the
-     *  stall self-heal: a connection that's actively pulling bytes
-     *  off the wire is NOT actually dead even if our TX side is
-     *  flow-blocked. The build-97 self-heal trigger
-     *  (workRemains && sendCredit==0) fires on the perfectly common
-     *  speedtest pattern of "download leaves a stuck stream with
-     *  queued bytes and proxy-server-go's MAX_DATA never re-grows" —
-     *  which is exactly when the upload stream then starts flowing
-     *  inbound. Closing then is wrong: peer doesn't care about the
-     *  un-delivered tail of the dead download stream, and the live
-     *  upload stream gets killed for no reason. Updated on every
-     *  successful socket.receive(). */
-    @Volatile private var lastRxProgressNanos: Long = System.nanoTime()
-    /** How many times we've force-closed for stall self-heal. */
-    private val statsStallReconnects = java.util.concurrent.atomic.AtomicLong(0L)
+    // Send-side stall self-heal (build-97) was a force-close when
+    // (workRemains && sendCredit==0) for 5 s. It triggered on every
+    // download→upload speedtest transition because proxy-server-go
+    // pins MAX_DATA after the test client stops reading the download
+    // payload. The close-and-reconnect was the visible "обрыв" the
+    // user observed. Build-100 replaces that mechanism with kwik-style
+    // bounded SendBuffers: the bridge thread blocks at the cap, the
+    // upstream TCP socket backs off, no GB-scale local accumulation,
+    // workRemains naturally drains as streams complete. Genuinely-dead
+    // connections close via QUIC idle_timeout (60 s) — RFC-standard
+    // and applies symmetrically to both sides.
 
     private fun processLongPacket(bytes: ByteArray, datagramStart: Int, datagramEnd: Int, buf: ByteBuffer): Int {
         return try {
@@ -621,6 +611,7 @@ internal class Connection(
                             streamId = frame.streamId,
                             ourInitialMaxStreamData = ourTransportParameters.initialMaxStreamDataBidiRemote,
                             peerMaxStreamData = peerTransportParameters?.initialMaxStreamDataBidiLocal ?: 0L,
+                            sendBufferMaxBytes = streamSendBufferMaxBytes,
                         )
                         ns.sendWakeup = { sendQueue.offer(QueuedSendWork.Tick) }
                         incomingServerStreams.offer(ns)
@@ -831,15 +822,17 @@ internal class Connection(
                 // or if new server-initiated streams arrive.
                 val now = System.nanoTime()
                 if (now - lastStatsLogNanos > 5_000_000_000L) {
+                    var totalQueued = 0L
+                    for (s in streams.values) totalQueued += s.sendBuffer.queuedBytes
                     logStat("stats: datagrams=${statsDatagrams.get()}" +
                         " stream_frames=${statsStreamFrames.get()}" +
                         " new_server_streams=${statsNewServerStreams.get()}" +
                         " decrypt_fails=${statsDecryptFailures.get()}" +
                         " db_sent=${statsDataBlockedSent.get()}" +
                         " md_recv=${statsMaxDataRecv.get()}" +
-                        " stall_reconnects=${statsStallReconnects.get()}" +
                         " accept_queue=${incomingServerStreams.size}" +
                         " streams_map=${streams.size}" +
+                        " send_buf_queued=$totalQueued" +
                         " cc.in_flight=${cc.bytesInFlight}" +
                         " cc.cwnd=${cc.congestionWindow}" +
                         " flow.send_credit=${flow.sendCredit()}" +
@@ -958,43 +951,6 @@ internal class Connection(
 
                 // Priority 4: STREAM frames, paced via the token bucket.
                 val workRemains = if (oneRttSpace.ready()) drainStreams() else false
-
-                // Send-side stall self-heal: if we've had data to send
-                // but no send credit for [stallTimeoutNanos], close the
-                // connection so the supervisor reopens a fresh one. See
-                // the field-block comment above for why DATA_BLOCKED
-                // alone doesn't get us out (proxy-server-go ignores it).
-                //
-                // Build-99 refinement: also require RX to be quiet. The
-                // bare (workRemains && sendCredit==0) trigger fires on
-                // every speedtest download→upload transition — the dead
-                // download stream leaves queued bytes behind (workRemains
-                // stays true), proxy-server-go's MAX_DATA pins (sendCredit
-                // stays 0), and then the fresh upload stream starts
-                // pumping inbound bytes. Closing then KILLS the upload.
-                // Gating on `lastRxProgressNanos` makes the close
-                // conditional on the connection being truly dead — no
-                // packets at all — which is the case the self-heal was
-                // designed for (build-97: idle agent with stuck send
-                // credit after a long-finished download).
-                val nowStallNs = System.nanoTime()
-                val rxIdle = nowStallNs - lastRxProgressNanos > stallTimeoutNanos
-                val stalled = workRemains && flow.sendCredit() <= 0L && rxIdle
-                if (stalled) {
-                    if (stallStartNanos == 0L) {
-                        stallStartNanos = nowStallNs
-                        logStat("send-side stall started (sendCredit=0 with work pending AND rx idle ${(nowStallNs - lastRxProgressNanos) / 1_000_000}ms)")
-                    } else if (nowStallNs - stallStartNanos > stallTimeoutNanos) {
-                        statsStallReconnects.incrementAndGet()
-                        logStat("STALL TIMEOUT >${stallTimeoutNanos / 1_000_000_000}s — closing for reconnect (count=${statsStallReconnects.get()})")
-                        close()
-                    }
-                } else {
-                    if (stallStartNanos != 0L) {
-                        logStat("send-side stall cleared (sendCredit recovered or rx resumed)")
-                        stallStartNanos = 0L
-                    }
-                }
 
                 // Priority 5: PING keepalive. ACK frames are not
                 // ack-eliciting; if we send only ACKs for too long, the

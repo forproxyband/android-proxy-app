@@ -308,6 +308,7 @@ class NativeProxyAgent {
                 "quic_brutal_target_mbps" to tuning.quic.brutalTargetMbps,
                 "quic_udp_socket_buf" to tuning.quic.udpSocketBufBytes,
                 "quic_window_headroom_ratio" to tuning.quic.windowUpdateHeadroomRatio,
+                "quic_send_buf_max" to tuning.quic.sendBufferMaxBytes,
             )
         }
         try {
