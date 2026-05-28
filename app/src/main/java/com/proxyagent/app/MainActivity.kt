@@ -468,9 +468,9 @@ class MainActivity : AppCompatActivity() {
                 "binary" -> rbEngineBinary.isChecked = true
                 else -> rbEngineNative.isChecked = true     // "native" or unset
             }
-            val savedProfile = prefs.getString("network_profile", "HIGH_1000") ?: "HIGH_1000"
+            val savedProfile = prefs.getString("network_profile", "LOW_100") ?: "LOW_100"
             val pIdx = networkProfileKeys.indexOf(savedProfile)
-                .let { if (it < 0) networkProfileKeys.indexOf("HIGH_1000") else it }
+                .let { if (it < 0) networkProfileKeys.indexOf("LOW_100") else it }
             spNetworkProfile.setSelection(pIdx)
             applyNetworkProfileEnabled(
                 nativeEngine = rgEngine.checkedRadioButtonId == R.id.rbEngineNative,
@@ -1119,7 +1119,7 @@ class MainActivity : AppCompatActivity() {
 
         val engine = prefs.getString("engine", "native") ?: "native"
         val mode = prefs.getString("mode", "modem") ?: "modem"
-        val networkProfile = prefs.getString("network_profile", "HIGH_1000") ?: "HIGH_1000"
+        val networkProfile = prefs.getString("network_profile", "LOW_100") ?: "LOW_100"
         // QUIC implementation chooser was removed from the UI — the
         // in-house stack is the default. We deliberately do NOT pass a
         // `quic_impl` extra so ProxyService applies its own default

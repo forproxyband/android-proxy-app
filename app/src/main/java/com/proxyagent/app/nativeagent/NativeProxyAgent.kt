@@ -87,12 +87,14 @@ class NativeProxyAgent {
         // User-selected network optimization profile. Renders to two
         // independent tuning sets (TCP and QUIC) that gate socket
         // buffers, bridge buffer size, Brutal CC target, UDP buffer,
-        // and flow-control refresh cadence. Default = HIGH_1000 —
-        // reproduces the pre-profile hardcoded parameters so an
-        // unconfigured Config behaves identically to the legacy
-        // codebase. The QUIC factory chosen above also receives this
-        // — keep them in sync from the host.
-        val networkProfile: NetworkProfile = NetworkProfile.HIGH_1000,
+        // and flow-control refresh cadence. Default = LOW_100 — most
+        // mobile/Wi-Fi uplinks fall below 100 Mbps in practice, and
+        // smaller buffers there bound bufferbloat without losing
+        // multi-flow throughput on fast links (see
+        // NETWORK_PROFILE_TUNING.md for the field-test data). The
+        // QUIC factory chosen above also receives this — keep them
+        // in sync from the host.
+        val networkProfile: NetworkProfile = NetworkProfile.LOW_100,
     ) {
         fun hasDirectRegistrator(): Boolean =
             !registratorHost.isNullOrBlank() && registratorPort > 0

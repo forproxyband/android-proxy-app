@@ -54,15 +54,15 @@ class ProxyService : Service() {
     @Volatile private var quicImpl: String = "native"
     // User-selected network profile. Passed in via the start intent
     // (same rationale as quicImpl — cross-process SharedPreferences
-    // is unreliable from :proxy). Defaults to HIGH_1000 so a fresh
-    // :proxy process that somehow boots without the extra (e.g. an
-    // OEM auto-restart that drops the intent payload) lands on the
-    // same tunings the codebase used before the preset existed.
-    // Only the NATIVE engine honors this; binary engine ignores it
-    // (no env hooks in libproxyagent.so — logged as a warning at
-    // runBinary start so operators see why their setting did nothing).
+    // is unreliable from :proxy). Defaults to LOW_100 — matches the
+    // app-side default; most mobile/Wi-Fi uplinks fall below
+    // 100 Mbps in practice and smaller buffers there cap worst-case
+    // bufferbloat. Only the NATIVE engine honors this; binary engine
+    // ignores it (no env hooks in libproxyagent.so — logged as a
+    // warning at runBinary start so operators see why their setting
+    // did nothing).
     @Volatile private var networkProfile: com.proxyagent.app.nativeagent.quic.NetworkProfile =
-        com.proxyagent.app.nativeagent.quic.NetworkProfile.HIGH_1000
+        com.proxyagent.app.nativeagent.quic.NetworkProfile.LOW_100
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var analytics: AnalyticsRecorder? = null
     @Volatile private var lastNatRefreshMs = 0L

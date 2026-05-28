@@ -21,25 +21,29 @@ package com.proxyagent.app.nativeagent.quic
  * generous costs nothing.
  */
 enum class NetworkProfile {
-    /** Mobile / Wi-Fi up to ~100 Mbps. Latency-optimized. */
+    /** Mobile / Wi-Fi up to ~100 Mbps. Latency-optimized. Default. */
     LOW_100,
     /** ~500 Mbps-class links. Balanced. */
     MID_500,
-    /** Gigabit-class uplink. Throughput-optimized. Default. */
+    /** Gigabit-class uplink. Throughput-optimized. */
     HIGH_1000;
 
     companion object {
         /** Parse a SharedPreferences / intent-extra string. Unknown
-         *  values (including null) collapse to [HIGH_1000] — the
-         *  default for unconfigured devices. HIGH_1000 reproduces
-         *  the pre-profile hardcoded TCP/QUIC parameters exactly,
-         *  so a new install or a missing pref gives identical
-         *  behaviour to the codebase before this preset existed. */
+         *  values (including null) collapse to [LOW_100] — the
+         *  default for unconfigured devices. Picked because most
+         *  mobile/Wi-Fi uplinks fall below 100 Mbps in practice, and
+         *  LOW_100's smaller kernel queue bounds worst-case
+         *  bufferbloat tighter than the higher profiles. Field tests
+         *  (see NETWORK_PROFILE_TUNING.md) confirm LOW_100 still
+         *  delivers full multi-flow throughput on gigabit links
+         *  through parallel target dials, so users on fast networks
+         *  aren't penalised by the safe default. */
         @JvmStatic
         fun fromPrefValue(raw: String?): NetworkProfile = when (raw) {
-            "LOW_100" -> LOW_100
             "MID_500" -> MID_500
-            else -> HIGH_1000
+            "HIGH_1000" -> HIGH_1000
+            else -> LOW_100
         }
     }
 }
@@ -49,12 +53,12 @@ enum class NetworkProfile {
  * (uplink, target dials, warm-pool members) before connect().
  */
 data class TcpTuning(
-    /** Per-socket SO_RCVBUF / SO_SNDBUF hint. Bounded to a 2–4 MiB
-     *  safe zone empirically — see the kdoc on [tuning] for the two
-     *  field-test regressions (one at 12 MiB, one at 1 MiB) that
-     *  pinned the corners. Within the safe zone, larger = more
-     *  per-flow BDP headroom, smaller = less potential bufferbloat
-     *  at the target rate. */
+    /** Per-socket SO_RCVBUF / SO_SNDBUF hint. Bounded to a 1.5–4 MiB
+     *  safe zone empirically — see the kdoc on [tuning] for the
+     *  three field-test data points (broken at 12 MiB, broken at
+     *  1 MiB, clean at 1.5 MiB) that pinned the corners. Within
+     *  the safe zone, larger = more per-flow BDP headroom, smaller
+     *  = less potential bufferbloat at the target rate. */
     val socketBufferBytes: Int,
     /** Userspace bridge buffer used by the bidirectional copy
      *  between the tunnel transport and the dialed target. Smaller
@@ -99,8 +103,8 @@ data class ProfileTuning(
  * call repeatedly; we still memoize at one call site (the supervisor)
  * to keep the log line's reported values stable across reads.
  *
- * **TCP SO_*BUF lives in a 2–4 MiB safe zone**, empirically bounded
- * by two symmetric field-test regressions on Android:
+ * **TCP SO_*BUF lives in a 1.5–4 MiB safe zone**, empirically
+ * bounded by two symmetric field-test regressions on Android:
  *  - **12 MiB at HIGH_1000** regressed upload to ~5 Mbps on Samsung
  *    S Fold 7 (q7q, kernel 6.6.98). Hypothesis: above
  *    `net.core.wmem_max` the kernel clamps the request AND disables
@@ -112,12 +116,16 @@ data class ProfileTuning(
  *    defaults the explicit value also disables auto-tuning, and
  *    `tcp_adv_win_scale` overhead eats too much of the small
  *    buffer for window scaling to keep up under multi-flow load.
+ *  - **1.5 MiB at LOW_100** was the bisection retest on the same
+ *    Pixel and ran clean (331/299 Mbps with idle ping 84 ms) — so
+ *    the lower edge of the safe zone sits between 1.0 and 1.5 MiB.
  *
  * So 4 MiB stays the ceiling (HIGH_1000, matches the pre-profile
- * hardcoded value), 2 MiB the floor (LOW_100 and MID_500). The
- * latency-vs-throughput tradeoff for TCP at the lower profiles
- * lives in the **bridge buffer** alone (smaller chunks = more
- * frequent flushes = lower per-hop latency), not in SO_*BUF.
+ * hardcoded value), 1.5 MiB the floor (LOW_100). The
+ * latency-vs-throughput tradeoff at LOW_100 still gets some help
+ * from the smaller buffer (~120 ms max bufferbloat at saturation
+ * vs ~160 ms at 2 MiB), but the dominant TCP-side knob remains
+ * the **bridge buffer**.
  *
  * QUIC scales all three of its dimensions independently — its
  * userspace pacer + UDP socket queue interact differently from
@@ -126,7 +134,7 @@ data class ProfileTuning(
 fun NetworkProfile.tuning(): ProfileTuning = when (this) {
     NetworkProfile.LOW_100 -> ProfileTuning(
         tcp = TcpTuning(
-            socketBufferBytes = 1_536 * 1024,     // 1.5 MiB — midpoint between broken 1 MiB and safe 2 MiB; field-testing the floor
+            socketBufferBytes = 1_536 * 1024,     // 1.5 MiB — confirmed floor on Android; 1 MiB broke upload, 1.5 ran clean
             bridgeBufferBytes = 64 * 1024,        // small flushes → low per-hop latency
         ),
         quic = QuicTuning(

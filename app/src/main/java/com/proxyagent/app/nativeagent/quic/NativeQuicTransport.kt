@@ -82,11 +82,11 @@ class NativeQuicTransport private constructor(
         /** User-selected network profile. Renders to a [QuicTuning]
          *  that gates Brutal CC target rate, the UDP socket buffer
          *  size, and the flow-control window-refresh cadence. Default
-         *  reproduces the pre-profile hardcoded parameters (Brutal
-         *  CC 100 Mbps as the old hardcoded value, but with the
-         *  larger UDP buffer / 50% FC refresh that match the kwik
-         *  defaults at the high end). */
-        private val networkProfile: NetworkProfile = NetworkProfile.HIGH_1000,
+         *  matches the safer low-latency end of the scale — bounds
+         *  bufferbloat on typical mobile uplinks; field tests show
+         *  it still delivers full multi-flow throughput on faster
+         *  links (see NETWORK_PROFILE_TUNING.md). */
+        private val networkProfile: NetworkProfile = NetworkProfile.LOW_100,
     ) : QuicTransport.Factory {
         override fun connect(
             host: String,

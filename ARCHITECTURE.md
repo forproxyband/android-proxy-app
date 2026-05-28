@@ -126,7 +126,7 @@ Backed by the dialog at `MainActivity.kt:278-408` (XML
 | `imei_cmd` | string | — | Root shell command when `imei_method="custom"`. |
 | `wifi_return` | bool | false | Route the agent↔registrator uplink over Wi-Fi via a loopback relay; target dials still ride cellular. Modem mode only — auto-clamped to false on save when `mode="balancer"`. See "Wi-Fi return relay" below. |
 | `wifi_return_method` | string | `"local_relay"` | Slot for future methods (SO_MARK, VpnService split tunnel). No UI yet — only `local_relay` is implemented; anything else falls back to direct dial with a log line. |
-| `network_profile` | string | `"HIGH_1000"` | Network optimization preset — `"LOW_100"` / `"MID_500"` / `"HIGH_1000"`. Scales TCP socket / bridge buffers AND QUIC Brutal CC target / UDP socket buffer / flow-control refresh cadence to match the expected link ceiling. Default `HIGH_1000` reproduces the pre-profile hardcoded parameters exactly, so an unconfigured install behaves identically to the legacy codebase. NATIVE engine only; BINARY ignores it (`libproxyagent.so` has no env hooks for these values — logged as a WARN at runBinaryEngine start). Applies on the next stop/start; changing it mid-session shows a Toast and waits for a manual restart. See [NetworkProfile-driven tuning](#networkprofile-driven-tuning). |
+| `network_profile` | string | `"LOW_100"` | Network optimization preset — `"LOW_100"` / `"MID_500"` / `"HIGH_1000"`. Scales TCP socket / bridge buffers AND QUIC Brutal CC target / UDP socket buffer / flow-control refresh cadence to match the expected link ceiling. Default `LOW_100` matches the common-case mobile/Wi-Fi link (≤100 Mbps) and bounds bufferbloat tighter; field tests show it still delivers full multi-flow throughput on gigabit links through parallel target dials. NATIVE engine only; BINARY ignores it (`libproxyagent.so` has no env hooks for these values — logged as a WARN at runBinaryEngine start). Applies on the next stop/start; changing it mid-session shows a Toast and waits for a manual restart. See [NetworkProfile-driven tuning](#networkprofile-driven-tuning). |
 
 ## Agent engines
 
@@ -422,13 +422,23 @@ interact: fat buffers + slow pacer = bufferbloat; slim buffers +
 fast pacer = under-utilization. Field operators can't be expected
 to tune five constants per stack to fit their link, so all of
 them are scaled together by a single preset
-(`nativeagent/quic/NetworkProfile.kt`):
+(`nativeagent/quic/NetworkProfile.kt`).
+
+The numeric values below are the result of an in-apartment field
+test on 2026-05-28 (server + agent + test client all in
+Kremenchuk, agent on Wi-Fi, gigabit test client) that uncovered
+the 1.5–4 MiB SO_*BUF safe zone on Android. **Before changing
+any value in `NetworkProfile.tuning()`, read
+[NETWORK_PROFILE_TUNING.md](NETWORK_PROFILE_TUNING.md) — it
+documents every test run with raw numbers and the agent.log line
+that confirmed the applied values, so the same regressions don't
+get re-discovered.**
 
 | Profile | Brutal CC | QUIC UDP buf | FC headroom | TCP SO_*BUF | TCP bridge buf |
 | --- | --- | --- | --- | --- | --- |
-| `LOW_100` | 100 Mbps | 4 MiB | 0.75 | 2 MiB | 64 KiB |
+| `LOW_100` (default) | 100 Mbps | 4 MiB | 0.75 | 1.5 MiB | 64 KiB |
 | `MID_500` | 500 Mbps | 16 MiB | 0.60 | 2 MiB | 128 KiB |
-| `HIGH_1000` (default) | 1 Gbps | 32 MiB | 0.50 | 4 MiB | 256 KiB |
+| `HIGH_1000` | 1 Gbps | 32 MiB | 0.50 | 4 MiB | 256 KiB |
 
 - **Brutal CC target** rates the QUIC pacer's bytes/second; the
   cwnd ceiling is `2 × BDP` at this rate.
@@ -441,8 +451,9 @@ them are scaled together by a single preset
   `ConnectionFlowControl.shouldAdvertiseMaxData`). Higher =
   refresh sooner = less HoL wait on the receive direction at the
   cost of more control-frame overhead.
-- **TCP SO_RCVBUF / SO_SNDBUF** lives in a 2–4 MiB safe zone,
-  bounded by two symmetric field-test regressions:
+- **TCP SO_RCVBUF / SO_SNDBUF** lives in a 1.5–4 MiB safe zone,
+  bounded by two symmetric field-test regressions and a follow-up
+  bisection:
     - *Above the ceiling*: 12 MiB at HIGH_1000 on Samsung S Fold 7
       (q7q, kernel 6.6.98) collapsed upload to ~5 Mbps. Setting
       `SO_SNDBUF` manually disables `tcp_wmem` auto-tuning, and a
@@ -456,11 +467,18 @@ them are scaled together by a single preset
       seems to disable auto-tuning, and `tcp_adv_win_scale`
       overhead eats too much of the small buffer for window
       scaling to keep up under multi-flow load.
+    - *Floor bisection*: 1.5 MiB on the same Pixel ran clean
+      (331/299 Mbps, idle ping 84 ms) — so the lower edge of the
+      safe zone sits between 1.0 and 1.5 MiB. We pin LOW_100 at
+      1.5 to get the small bufferbloat improvement (~120 ms at
+      saturation vs ~160 ms at 2 MiB) while staying safely above
+      the regression threshold.
 
   So 4 MiB stays the ceiling (HIGH_1000, matches the pre-profile
-  hardcoded value), 2 MiB the floor (LOW_100 and MID_500). The
+  hardcoded value), 1.5 MiB the floor (LOW_100). The
   latency-vs-throughput tradeoff for TCP at the lower profiles
-  lives in the bridge buffer alone, not in SO_*BUF.
+  lives mostly in the bridge buffer, with a smaller assist from
+  SO_*BUF at LOW_100.
 - **TCP bridge buffer** is the userspace bridge ByteBuffer in
   `Uplink.bridge()` / `Uplink.copyStream()`. Smaller = more
   frequent flushes = lower latency; larger = fewer syscalls per
@@ -618,10 +636,12 @@ the per-profile values).
   during the SYN handshake based on the receive buffer size at that
   moment. Setting it after connect is a no-op for the connection's
   effective window.
-- **Why 2–4 MiB, not wider**: both extremes broke the upload
-  direction in field tests (12 MiB on Samsung, 1 MiB on Pixel).
-  Inside the safe zone, all three profiles work duplex; only the
-  bridge buffer varies for the TCP latency tradeoff. The 4 MiB
+- **Why 1.5–4 MiB, not wider**: both extremes broke the upload
+  direction in field tests (12 MiB on Samsung, 1 MiB on Pixel);
+  a follow-up bisection found 1.5 MiB still clean. Inside the
+  safe zone, all three profiles work duplex; the bridge buffer
+  carries most of the TCP latency tradeoff and SO_*BUF differs
+  meaningfully only at LOW_100 (1.5) vs HIGH_1000 (4). The 4 MiB
   upper anchor matches the pre-profile hardcoded value and works
   on every device we've measured. See the
   [NetworkProfile-driven tuning](#networkprofile-driven-tuning)
