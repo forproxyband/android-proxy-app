@@ -155,8 +155,6 @@ android {
 //     APK for Play Console's "Bundle Explorer" tab.
 //   * sdk*DependencyData + collect*Dependencies — dump the dependency
 //     graph for Google Play SDK Index / Play Integrity scanning.
-//   * write*AppMetadata — writes META-INF/com/android/build/gradle/
-//     app-metadata.properties (Play Store CDN hints).
 //
 // Also disable the native-debug-symbol pipeline (Play Console uses
 // these for symbolicating native crashes; we don't upload symbols
@@ -175,13 +173,17 @@ android {
 //     the user's first launch noticeably faster. Cheap to build,
 //     valuable to keep.
 //   - lintVital* stays — catches real bugs in release builds.
+//   - write*AppMetadata stays — looks Play-Store-only but AGP wires
+//     its output file (app-metadata.properties) as a *required input*
+//     to package{Debug,Release}. Disabling it makes packaging fail
+//     with "An input file was expected to be present but it doesn't
+//     exist" — verified the hard way. Leave alone.
 tasks.configureEach {
     if (name.startsWith("extract") && name.endsWith("NativeSymbolTables")) enabled = false
     if (name.startsWith("merge") && name.endsWith("NativeDebugMetadata")) enabled = false
     if (name.startsWith("extract") && name.endsWith("VersionControlInfo")) enabled = false
     if (name.startsWith("sdk") && name.endsWith("DependencyData")) enabled = false
     if (name.startsWith("collect") && name.endsWith("Dependencies")) enabled = false
-    if (name.startsWith("write") && name.endsWith("AppMetadata")) enabled = false
 }
 
 dependencies {
