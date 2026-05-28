@@ -57,17 +57,48 @@ internal class SpaceRecovery(val space: PacketNumberSpace) {
     private var ackElicitingOutstanding: Long = 0L
     /** True when we've received an ack-eliciting packet that hasn't
      *  yet been covered by an ACK frame we sent. The sender consults
-     *  (and clears) this via [consumeAckPending] so we emit an ACK
-     *  ONLY when there's something new to acknowledge — RFC 9000
+     *  (and clears) this via [consumeAndTakeAckDelay] so we emit an
+     *  ACK ONLY when there's something new to acknowledge — RFC 9000
      *  §13.2.1. Without this gate we flooded ~50 ACK-only packets/sec
      *  (one per sender-loop tick), which looks like a misbehaving
      *  client to quic-go's flood protection and burned packet-number
      *  space. */
     private var ackPending = false
+    /** Largest PN of an ack-eliciting packet that's still waiting to be
+     *  ACKed by the sender. -1 = nothing waiting. Drives the wire-format
+     *  ack_delay field (RFC 9000 §19.3 defines ack_delay as the time
+     *  from receiving *largestAcked* until emission of the ACK frame). */
+    private var largestPendingAckPn: Long = -1L
+    /** Wall-time when [largestPendingAckPn] was received. */
+    private var largestPendingAckTimeNanos: Long = 0L
+    /** Count of ack-eliciting packets received since our last ACK
+     *  emission. Drives the immediate-ACK threshold (RFC 9000 §13.2.2
+     *  recommends generating an ACK frame for at least every other
+     *  ack-eliciting packet — i.e. don't let the count grow without
+     *  bound or peer's CC starves on ack-clock feedback). When this
+     *  counter crosses [IMMEDIATE_ACK_THRESHOLD], [onPacketReceived]
+     *  returns true so the receiver thread can wake the sender for
+     *  prompt emission instead of waiting out the sender's poll
+     *  interval (up to 20 ms idle). */
+    private var pendingAckElicitingCount: Int = 0
     private val lock = ReentrantLock()
 
     /** Result of detectLost: frames to re-send + bytes freed. */
     data class LossOutput(val framesToRetransmit: List<Frame>, val bytesLost: Long)
+
+    /** Atomically reports the ACK-emission decision so the sender can
+     *  build a correctly-stamped ACK frame in one critical section.
+     *  See [consumeAndTakeAckDelay]. */
+    data class AckEmission(
+        /** True when ack-eliciting packets have been received since
+         *  our last ACK and the sender owes one now. */
+        val shouldEmit: Boolean,
+        /** Nanoseconds between receiving the largest-acked ack-eliciting
+         *  packet and this call — what the sender should pass to
+         *  [buildAckFrame] so quic-go on the peer subtracts the right
+         *  value from its RTT samples (RFC 9000 §19.3). */
+        val ackDelayNanos: Long,
+    )
 
     /** Called when a packet has been emitted on the wire. */
     fun onPacketSent(p: SentPacket) = lock.withLock {
@@ -75,27 +106,56 @@ internal class SpaceRecovery(val space: PacketNumberSpace) {
         if (p.ackEliciting) ackElicitingOutstanding++
     }
 
-    /** Called when we receive a packet (any packet). Used to
-     *  build the next ACK frame. Sets [ackPending] when the packet
-     *  is ack-eliciting so the sender knows to emit an ACK. */
-    fun onPacketReceived(packetNumber: Long, ackEliciting: Boolean) = lock.withLock {
+    /** Called when we receive a packet (any packet). Updates the ACK-
+     *  generation state and returns true if the receiver thread should
+     *  wake the sender for an immediate ACK. The wake is gated by
+     *  [IMMEDIATE_ACK_THRESHOLD] (every Nth ack-eliciting packet) so
+     *  high-pps inbound flows don't pin the sender CPU on a wake-per-
+     *  packet treadmill; in between thresholds the sender's natural
+     *  poll cadence handles ACK emission as before. */
+    fun onPacketReceived(packetNumber: Long, ackEliciting: Boolean): Boolean = lock.withLock {
         received.add(packetNumber)
-        if (ackEliciting) ackPending = true
+        var wake = false
+        if (ackEliciting) {
+            ackPending = true
+            if (packetNumber > largestPendingAckPn) {
+                largestPendingAckPn = packetNumber
+                largestPendingAckTimeNanos = System.nanoTime()
+            }
+            pendingAckElicitingCount++
+            if (pendingAckElicitingCount >= IMMEDIATE_ACK_THRESHOLD) wake = true
+        }
         if (received.size > MAX_RANGES_BUFFERED) {
             // Drop the smallest entries — they're so old the peer
             // has stopped caring. Keeps the ACK-frame size bounded.
             received.pollFirst()
         }
+        wake
     }
 
-    /** Returns true (and clears the flag) if we owe the peer an ACK
-     *  for ack-eliciting packets received since our last ACK. The
-     *  sender calls this once per loop tick; only when it returns
-     *  true do we actually build + emit an ACK frame. */
-    fun consumeAckPending(): Boolean = lock.withLock {
-        val p = ackPending
+    /**
+     * Single critical section that consumes [ackPending] AND takes the
+     * delay measurement for the largest-acked packet. The sender must
+     * call this exactly when it is about to emit the ACK frame so the
+     * reported delay matches reality.
+     *
+     * Reset behaviour: clears the pending-count and largest-acked
+     * tracking; subsequent ack-eliciting packets start a fresh batch.
+     * Note that the [Ack] frame built right after this call will cover
+     * ALL packets currently in [received] (including any that arrive
+     * between this call and [buildAckFrame]); only the *delay* field
+     * is locked to the snapshot taken here. The extra (microsecond-
+     * scale) error is below the wire encoding's resolution.
+     */
+    fun consumeAndTakeAckDelay(now: Long): AckEmission = lock.withLock {
+        val emit = ackPending
+        val refTime = largestPendingAckTimeNanos
         ackPending = false
-        p
+        largestPendingAckPn = -1L
+        largestPendingAckTimeNanos = 0L
+        pendingAckElicitingCount = 0
+        val delay = if (refTime == 0L) 0L else (now - refTime).coerceAtLeast(0L)
+        AckEmission(emit, delay)
     }
 
     /**
@@ -216,5 +276,23 @@ internal class SpaceRecovery(val space: PacketNumberSpace) {
         const val LOSS_THRESHOLD: Int = 3
         /** Cap on tracked received-PN set; older entries get dropped. */
         const val MAX_RANGES_BUFFERED: Int = 1024
+        /** Every Nth ack-eliciting packet wakes the sender for an
+         *  immediate ACK. Picked at 10 because:
+         *  - RFC 9000 §13.2.2 strongly recommends ACKing every 2 to
+         *    keep peer CC's ack-clock fed.
+         *  - At 100 Mbps inbound (≈10 kpps) waking on every packet
+         *    pins the sender CPU on wakeup churn; every-10 yields
+         *    ~1000 wakes/s and ~1 ms ACK delay — well under the
+         *    advertised `max_ack_delay` (25 ms) and the old idle-poll
+         *    cadence (20 ms) that left peer's quic-go starved on
+         *    ack-clock feedback in duplex tests (build 99: QUIC
+         *    upload tanked to single-digit Mbps while TCP duplex
+         *    held 300 Mbps both directions).
+         *
+         *  Lower → faster RX-direction throughput, more CPU on the
+         *  sender thread; higher → less CPU, more inflation of peer's
+         *  RTT estimate (peer's BBR/CUBIC throttles cwnd growth on
+         *  inflated RTT). */
+        const val IMMEDIATE_ACK_THRESHOLD: Int = 10
     }
 }

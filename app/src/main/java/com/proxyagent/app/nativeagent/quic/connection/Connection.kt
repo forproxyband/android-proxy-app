@@ -464,7 +464,14 @@ internal class Connection(
             // Parse frames and dispatch.
             val frames = Frame.parseAll(ByteBuffer.wrap(plaintext))
             val ackElic = frames.any { it.ackEliciting }
-            cs.recovery.onPacketReceived(pn, ackElic)
+            // Wake the sender promptly when the receiver crosses the
+            // immediate-ACK threshold; without this the sender's idle
+            // 20 ms poll bounds ACK latency to the same 20 ms, starving
+            // peer's CC ack-clock under heavy RX (the QUIC-upload-in-
+            // duplex regression — see SpaceRecovery.IMMEDIATE_ACK_THRESHOLD).
+            if (cs.recovery.onPacketReceived(pn, ackElic)) {
+                sendQueue.offer(QueuedSendWork.Tick)
+            }
             dispatchFrames(space, frames)
             payloadEnd - datagramStart
         } catch (t: Throwable) {
@@ -527,7 +534,12 @@ internal class Connection(
             if (pn > cs.largestReceivedPn) cs.largestReceivedPn = pn
             val frames = Frame.parseAll(ByteBuffer.wrap(plaintext))
             val ackElic = frames.any { it.ackEliciting }
-            cs.recovery.onPacketReceived(pn, ackElic)
+            // See processLongPacket for why we wake the sender here: the
+            // 1-RTT space carries application data, so this is where the
+            // duplex-upload starvation actually manifested.
+            if (cs.recovery.onPacketReceived(pn, ackElic)) {
+                sendQueue.offer(QueuedSendWork.Tick)
+            }
             dispatchFrames(PacketNumberSpace.ONE_RTT, frames)
             datagramEnd - datagramStart  // short header packets consume the rest of the datagram
         } catch (_: Throwable) {
@@ -838,11 +850,24 @@ internal class Connection(
                 // owe one (received an ack-eliciting packet since the
                 // last ACK). Previously we emitted an ACK every tick
                 // unconditionally → ~50 ACK-only packets/sec flood.
+                //
+                // Report the ACTUAL ack-delay (build 99 fix): we used
+                // to pass 0L unconditionally, which made peer's quic-go
+                // subtract 0 from its RTT samples — so when our sender
+                // sat idle for 20 ms before emitting an ACK, peer's
+                // RTT_min inflated by 20 ms. Peer's BBR/CUBIC then
+                // throttled cwnd growth in the upload direction (the
+                // duplex regression: QUIC upload tanked below TCP). A
+                // single atomic critical section yields both the
+                // emit-decision and the delay snapshot so no packet
+                // arrival can race between consume and read.
                 for (space in listOf(PacketNumberSpace.INITIAL, PacketNumberSpace.HANDSHAKE, PacketNumberSpace.ONE_RTT)) {
                     val cs = spaceFor(space)
                     if (!cs.ready()) continue
-                    if (!cs.recovery.consumeAckPending()) continue
-                    val ack = cs.recovery.buildAckFrame(0L, peerTransportParameters?.ackDelayExponent ?: 3)
+                    val emission = cs.recovery.consumeAndTakeAckDelay(System.nanoTime())
+                    if (!emission.shouldEmit) continue
+                    val ack = cs.recovery.buildAckFrame(emission.ackDelayNanos,
+                        peerTransportParameters?.ackDelayExponent ?: 3)
                     if (ack != null) {
                         emitPacketInSpace(space, listOf(ack), ackEliciting = false, inFlight = false)
                     }
