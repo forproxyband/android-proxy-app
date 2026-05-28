@@ -338,6 +338,7 @@ internal class Connection(
             try {
                 socket.receive(pkt)
                 packetCount++
+                lastRxProgressNanos = System.nanoTime()
                 if (verboseWire) log("recv: pkt#$packetCount size=${pkt.length} firstByte=0x${(buf[0].toInt() and 0xFF).toString(16)}")
                 processDatagram(buf, pkt.length)
             } catch (_: java.net.SocketTimeoutException) {
@@ -403,6 +404,19 @@ internal class Connection(
     // — the supervisor reopens a fresh one and resumes.
     @Volatile private var stallStartNanos: Long = 0L
     private val stallTimeoutNanos: Long = 5_000_000_000L  // 5 s — fast self-heal
+    /** Wall-clock of the last UDP datagram we received. Gates the
+     *  stall self-heal: a connection that's actively pulling bytes
+     *  off the wire is NOT actually dead even if our TX side is
+     *  flow-blocked. The build-97 self-heal trigger
+     *  (workRemains && sendCredit==0) fires on the perfectly common
+     *  speedtest pattern of "download leaves a stuck stream with
+     *  queued bytes and proxy-server-go's MAX_DATA never re-grows" —
+     *  which is exactly when the upload stream then starts flowing
+     *  inbound. Closing then is wrong: peer doesn't care about the
+     *  un-delivered tail of the dead download stream, and the live
+     *  upload stream gets killed for no reason. Updated on every
+     *  successful socket.receive(). */
+    @Volatile private var lastRxProgressNanos: Long = System.nanoTime()
     /** How many times we've force-closed for stall self-heal. */
     private val statsStallReconnects = java.util.concurrent.atomic.AtomicLong(0L)
 
@@ -950,12 +964,26 @@ internal class Connection(
                 // connection so the supervisor reopens a fresh one. See
                 // the field-block comment above for why DATA_BLOCKED
                 // alone doesn't get us out (proxy-server-go ignores it).
+                //
+                // Build-99 refinement: also require RX to be quiet. The
+                // bare (workRemains && sendCredit==0) trigger fires on
+                // every speedtest download→upload transition — the dead
+                // download stream leaves queued bytes behind (workRemains
+                // stays true), proxy-server-go's MAX_DATA pins (sendCredit
+                // stays 0), and then the fresh upload stream starts
+                // pumping inbound bytes. Closing then KILLS the upload.
+                // Gating on `lastRxProgressNanos` makes the close
+                // conditional on the connection being truly dead — no
+                // packets at all — which is the case the self-heal was
+                // designed for (build-97: idle agent with stuck send
+                // credit after a long-finished download).
                 val nowStallNs = System.nanoTime()
-                val stalled = workRemains && flow.sendCredit() <= 0L
+                val rxIdle = nowStallNs - lastRxProgressNanos > stallTimeoutNanos
+                val stalled = workRemains && flow.sendCredit() <= 0L && rxIdle
                 if (stalled) {
                     if (stallStartNanos == 0L) {
                         stallStartNanos = nowStallNs
-                        logStat("send-side stall started (sendCredit=0 with work pending)")
+                        logStat("send-side stall started (sendCredit=0 with work pending AND rx idle ${(nowStallNs - lastRxProgressNanos) / 1_000_000}ms)")
                     } else if (nowStallNs - stallStartNanos > stallTimeoutNanos) {
                         statsStallReconnects.incrementAndGet()
                         logStat("STALL TIMEOUT >${stallTimeoutNanos / 1_000_000_000}s — closing for reconnect (count=${statsStallReconnects.get()})")
@@ -963,7 +991,7 @@ internal class Connection(
                     }
                 } else {
                     if (stallStartNanos != 0L) {
-                        logStat("send-side stall cleared (sendCredit recovered)")
+                        logStat("send-side stall cleared (sendCredit recovered or rx resumed)")
                         stallStartNanos = 0L
                     }
                 }
