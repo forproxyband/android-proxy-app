@@ -417,7 +417,20 @@ to the next if the previous can't be used:
    buffer → kernel) but no JVM heap allocation and no GC pressure.
    Used when splice can't be (see fd extraction below). At 50 Mbps
    costs ~10-15% of one core — acceptable for typical mobile uplinks
-   where the radio is the limiter anyway.
+   where the radio is the limiter anyway. **Also the mandatory path on
+   Android < 11 (API < 30):** `SpliceShim.ensureLoaded()` refuses to
+   load `libagentsplice.so` there. Reason — on Xiaomi Redmi Note 5
+   (Android 9, kernel 4.4.153) the JNI `SocketChannelImpl.fdVal`
+   strategy returns the JVM NIO subsystem's own fd (not a dup'd one);
+   modern Android's hidden-API blocklist would have forced PFD instead,
+   but older Android still permits the read and kernel-4.4 splice can't
+   share an fd with concurrent JVM reads. Field-observed symptom: native
+   TCP collapsed to 7 Mbps with mid-run speedtest crashes while native
+   QUIC on the same device (userspace tier #3) sustained 32 Mbps. Don't
+   try to be cleverer here — the API-30 gate is a hard kill, not a
+   per-strategy nuance, because the warmup probe (unconnected channel)
+   misleadingly succeeds and we can't tell from inside the JVM whether
+   the fd is actually shared with NIO until data corruption shows up.
 
 3. **InputStream/OutputStream + byte[]** — only used as the QUIC
    bridge's target-side path, since kwik exposes streams not

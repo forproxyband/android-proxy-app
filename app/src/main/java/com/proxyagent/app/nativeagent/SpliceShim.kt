@@ -329,9 +329,35 @@ internal class SpliceShim {
          *  Logs the outcome exactly once via the compareAndSet on
          *  [available]: only the thread that wins the race actually
          *  emits a log line, even though multiple bridge threads can
-         *  hit ensureLoaded concurrently. */
+         *  hit ensureLoaded concurrently.
+         *
+         *  Hard-gate on Android API: on **API < 30 (Android 10 and
+         *  below)** we refuse to load the .so and force the NIO
+         *  fallback. Reason — on Xiaomi Redmi Note 5 (API 28, kernel
+         *  4.4.153) the JNI `SocketChannelImpl.fdVal` strategy *appears*
+         *  to extract a valid fd (warmup succeeds, real tunnels start)
+         *  but data flow then collapses to ~7 Mbps with frequent
+         *  speedtest crashes, while the userspace QUIC bridge (no
+         *  splice) on the same device sustains 32 Mbps cleanly. On
+         *  newer Android the hidden-API blocklist forces us onto the
+         *  PFD path (Samsung A55+) which dup's a fresh fd cleanly, but
+         *  on older Android `fdVal` returns the SAME fd the JVM NIO
+         *  subsystem is reading from concurrently, and kernel-4.4
+         *  splice semantics don't cope. NIO tier is well-tested across
+         *  every Android version and gives ~30-50 Mbps — vastly better
+         *  than the broken splice path here. */
         private fun ensureLoaded(): Boolean {
             available.get()?.let { return it }
+            if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) {
+                if (available.compareAndSet(null, false)) {
+                    logger?.invoke(
+                        "INFO",
+                        "splice: gated off on API<30, NIO fallback only",
+                        mapOf("sdk" to android.os.Build.VERSION.SDK_INT.toString()),
+                    )
+                }
+                return false
+            }
             val ok = try {
                 System.loadLibrary("agentsplice")
                 true
