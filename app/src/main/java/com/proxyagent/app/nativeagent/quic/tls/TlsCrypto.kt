@@ -56,6 +56,13 @@ internal object TlsCrypto {
     private val P25519: BigInteger = BigInteger.ONE.shiftLeft(255).subtract(BigInteger.valueOf(19))
     /** Montgomery curve constant (A-2)/4 = 121665. */
     private val A24: BigInteger = BigInteger.valueOf(121665L)
+    /** Polyfill for `BigInteger.TWO`, which is Java 9+/Android API 31+
+     *  only. Android 9 (API 28, e.g. the Redmi Note 5 in the field) throws
+     *  NoSuchFieldError when accessing `BigInteger.TWO` — that crashed every
+     *  in-house QUIC handshake on older devices until we switched to this
+     *  literal. Used by [scalarMult] for the Fermat modular inverse
+     *  `z^(p-2) mod p`. */
+    private val BI_TWO: BigInteger = BigInteger.valueOf(2L)
     /** Base point u-coordinate = 9 (little-endian: byte 0 = 9, rest 0). */
     private val BASE_POINT: ByteArray = ByteArray(32).also { it[0] = 9 }
 
@@ -134,7 +141,7 @@ internal object TlsCrypto {
         }
 
         // x2 / z2 = x2 * z2^(p-2) mod p (Fermat inverse).
-        val zInv = z2.modPow(P25519.subtract(BigInteger.TWO), P25519)
+        val zInv = z2.modPow(P25519.subtract(BI_TWO), P25519)
         val result = x2.multiply(zInv).mod(P25519)
         return encodeLE32(result)
     }
