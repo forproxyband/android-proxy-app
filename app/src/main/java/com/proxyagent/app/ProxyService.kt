@@ -1443,7 +1443,26 @@ class ProxyService : Service() {
                     // Default kwik until the in-house QUIC is field-
                     // validated (Phase 11 in nativeagent/quic/DESIGN.md).
                     quicTransportFactory = when (quicImpl) {
-                        "native" -> com.proxyagent.app.nativeagent.quic.NativeQuicTransport.Factory()
+                        "native" -> {
+                            // Wi-Fi-return for the in-house QUIC uplink: bind
+                            // the UDP socket to whatever Network WifiReturnRelay
+                            // currently considers Wi-Fi. Closure is re-invoked
+                            // on every (re)dial including stall self-heal, so a
+                            // network handover between dials is picked up cleanly.
+                            // If wifi_return is off or no Wi-Fi is acquired, the
+                            // lookup returns null and the socket falls back to
+                            // the process default route (cellular under wifi_return,
+                            // OS default otherwise). Kwik already does the
+                            // equivalent via its socketFactory, so this is only
+                            // for the native path.
+                            val service = this@ProxyService
+                            val binder: (java.net.DatagramSocket) -> Unit = { sock ->
+                                service.wifiRelay?.currentWifiNetwork()?.bindSocket(sock)
+                            }
+                            com.proxyagent.app.nativeagent.quic.NativeQuicTransport.Factory(
+                                uplinkSocketBinder = binder,
+                            )
+                        }
                         else -> com.proxyagent.app.nativeagent.KwikQuicTransport.Factory()
                     },
                 )

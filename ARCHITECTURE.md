@@ -338,6 +338,65 @@ that are easy to regress:
      `CryptoSpace.largestAckedSentPn` must be updated from incoming ACKs
      — it anchors the sent-PN encoding length (RFC 9000 §A.2).
 
+- **RTT samples come from the largest-acked packet ONLY (RFC 9002 §5).**
+  Sampling every packet in a batched ACK feeds seconds-old `sentTime`
+  values into the EWMA — under heavy burst this drifted `smoothedRtt`
+  to multiple seconds and ballooned `cc.congestionWindow` to 100+ MiB
+  (build 93 stats). `Connection.dispatchFrames`' Ack handler passes
+  `rttNanos>0` only for the largest acked packet; `BrutalCongestionControl.onPacketAcked`
+  skips the EWMA update when `rttNanos<=0`. Don't sample per-packet.
+
+- **Send-side stall self-heal (proxy-server-go MAX_DATA quirk).** After
+  a heavy download, `flow.send_credit` can pin at 0 indefinitely:
+  proxy-server-go (quic-go) extends MAX_DATA strictly off its own
+  consume position, and once the test client stops draining the
+  download payload the consume halts and our send window never reopens.
+  Build-97 confirmed empirically — **224 DATA_BLOCKED frames over 3m40s
+  produced zero MAX_DATA responses**. DATA_BLOCKED is correct per RFC
+  9000 §19.12 (we still emit it, periodically, in case a future
+  proxy reacts) but quic-go on the server side does not treat it as a
+  trigger. So the connection layer self-heals: if `workRemains &&
+  flow.sendCredit()<=0` persists for `stallTimeoutNanos` (5 s),
+  `Connection.close()` tears down the QUIC connection and the supervisor
+  redials a fresh one — the user's own observation was that fresh
+  connections always work. Two correctness invariants make the close
+  propagate:
+  1. **`Connection.acceptStream` MUST be poll-based, not blocking
+     `.take()`.** It checks `closed.get()` between 500 ms polls so a
+     parked accept caller unblocks promptly; `NativeQuicTransport`
+     turns the `null` into `IOException` so `quicAcceptLoop` exits and
+     the supervisor reconnects. The old `incomingServerStreams.take()`
+     wedged forever after a force-close (build 98 logged STALL TIMEOUT
+     but the agent stayed "CONNECTED" because the accept caller was
+     parked, the bridge threads were parked, and nothing surfaced the
+     disconnect upward).
+  2. **`Connection.close()` MUST signal EOF on every stream's
+     `recvBuffer`.** Each `Stream.closeOnConnectionTermination()` flips
+     `eofReached` and `signalAll`s the not-empty condition so bridge
+     threads parked in `Stream.input.read` unblock, drop out of
+     `copyStream`, and let the tunnels tear down cleanly. Without this
+     they leak indefinitely.
+
+  Diagnostic counters surfaced in the 5-second `stats:` line:
+  `db_sent` (DATA_BLOCKED frames sent), `md_recv` (MAX_DATA frames
+  received), `stall_reconnects` (times the self-heal fired). A run
+  where `db_sent` climbs but `md_recv` stays flat is exactly the
+  quic-go behavior described above.
+
+- **Wi-Fi-return uplink binding must precede `socket.connect`.** When
+  the user has wifi_return enabled, the in-house QUIC UDP uplink socket
+  needs to live on the Wi-Fi network (uplink is free) while target
+  dials use cellular (the public exit IP we sell). The kwik path gets
+  this via its `socketFactory`; the native path takes an optional
+  `uplinkSocketBinder: ((DatagramSocket) -> Unit)?` through
+  `NativeQuicTransport.Factory` → `Connection` and invokes it inside
+  `Connection.connect()` BEFORE `socket.connect(resolvedAddress)`.
+  Android silently no-ops `Network.bindSocket()` once a socket has a
+  peer, so the order matters. ProxyService passes a closure that reads
+  `WifiReturnRelay.currentWifiNetwork()` at each call — so stall
+  self-heal redials and mid-session Wi-Fi handovers pick up the
+  current `Network` reference without manual wiring.
+
 ### NATIVE engine TCP fast path
 
 The TCP bridge between a registrator-side data socket and the dialed

@@ -89,6 +89,15 @@ internal class Connection(
     private val alpn: String,
     private val ourTransportParameters: TransportParameters,
     private val ccTargetMbps: Int = 100,
+    /** Wi-Fi-return hook: invoked on the raw UDP uplink socket BEFORE
+     *  [connect] binds the remote address. The Android pattern is
+     *  `Network.bindSocket(socket)`, which must precede `connect()` — once
+     *  the socket has a peer it can no longer be moved to a different
+     *  network. Re-evaluated on every (re)dial because [Connection] is
+     *  recreated by the supervisor on stall self-heal, so each fresh
+     *  attempt picks up the current Wi-Fi network. Null = no binding,
+     *  socket uses the process default route. */
+    private val uplinkSocketBinder: ((java.net.DatagramSocket) -> Unit)? = null,
 ) {
 
     // ── Connection IDs (RFC 9000 §5) ──────────────────────────
@@ -192,6 +201,17 @@ internal class Connection(
      *  or a fatal error occurs. */
     fun connect(timeoutMs: Long) {
         log("connect: dcid=${originalDcid.toHex()} scid=${sourceCid.toHex()} timeout=${timeoutMs}ms")
+        // Wi-Fi-return: bind the uplink socket to the chosen network BEFORE
+        // we connect to the peer. After `socket.connect(...)`, Android no
+        // longer allows moving the socket to a different network — the bind
+        // becomes a no-op silently. The binder closure is supplied per-dial
+        // by ProxyService so reconnects (e.g. stall self-heal) pick up the
+        // current Wi-Fi `Network` reference even after a Wi-Fi handover.
+        try {
+            uplinkSocketBinder?.invoke(socket)
+        } catch (t: Throwable) {
+            log("connect: uplink bind failed (${t.javaClass.simpleName}: ${t.message}) — falling back to default route")
+        }
         socket.connect(resolvedAddress)
         socket.soTimeout = 250  // ms — short so receive thread can poll closed flag
         log("connect: udp connected to $resolvedAddress, local=${socket.localPort}")
@@ -364,7 +384,7 @@ internal class Connection(
     // has been pinned at 0 for [stallTimeoutNanos], close the connection
     // — the supervisor reopens a fresh one and resumes.
     @Volatile private var stallStartNanos: Long = 0L
-    private val stallTimeoutNanos: Long = 15_000_000_000L  // 15 s
+    private val stallTimeoutNanos: Long = 5_000_000_000L  // 5 s — fast self-heal
     /** How many times we've force-closed for stall self-heal. */
     private val statsStallReconnects = java.util.concurrent.atomic.AtomicLong(0L)
 

@@ -70,7 +70,16 @@ class NativeQuicTransport private constructor(
      * the same way. NativeProxyAgent doesn't need to know
      * which factory it's using — both produce a `QuicTransport`.
      */
-    class Factory : QuicTransport.Factory {
+    class Factory(
+        /** Optional Wi-Fi-return hook applied to the UDP uplink socket
+         *  before connect. ProxyService passes a lambda that resolves to
+         *  the current Wi-Fi `Network` and calls `bindSocket(...)`; null
+         *  means "use the process default route" (no Wi-Fi return). The
+         *  binder is re-invoked on every (re)dial including stall
+         *  self-heal, so each fresh QUIC socket lands on the right
+         *  network even after a Wi-Fi handover. */
+        private val uplinkSocketBinder: ((java.net.DatagramSocket) -> Unit)? = null,
+    ) : QuicTransport.Factory {
         override fun connect(
             host: String,
             port: Int,
@@ -110,6 +119,7 @@ class NativeQuicTransport private constructor(
                 alpn = alpn,
                 ourTransportParameters = ourTp,
                 ccTargetMbps = 100,
+                uplinkSocketBinder = uplinkSocketBinder,
             )
             conn.connect(timeoutMs = dialTimeoutMs.toLong())
             return NativeQuicTransport(conn)
