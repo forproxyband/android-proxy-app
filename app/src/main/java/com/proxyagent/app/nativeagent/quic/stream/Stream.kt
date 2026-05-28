@@ -176,6 +176,15 @@ internal class Stream(
 
     /** Mark send side closed (FIN to be set on next/last frame). */
     fun closeSend() = lock.withLock { sendBuffer.close() }
+
+    /** Called by [Connection.close] to wake any bridge thread parked in
+     *  this stream's [input.read]. Without this, force-closing the QUIC
+     *  connection leaves bridge threads dangling and the agent never
+     *  notices the disconnect. */
+    fun closeOnConnectionTermination() {
+        recvBuffer.closeOnConnectionTermination()
+        sendBuffer.close()
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -358,6 +367,18 @@ internal class ReceiveBuffer(initialMaxOffset: Long) {
     /** Update the flow-control window we advertise to the peer. */
     fun updateMaxOffset(newMax: Long) = lock.withLock {
         if (newMax > maxOffsetAllowed) maxOffsetAllowed = newMax
+    }
+
+    /**
+     * Force EOF and wake every reader. Called by [Connection.close] when
+     * the underlying QUIC connection is being torn down (e.g. by the
+     * stall self-heal). Without this, bridge threads parked in
+     * [readBlocking] would stay parked forever, leaking tunnels and
+     * preventing the supervisor from seeing the disconnect.
+     */
+    fun closeOnConnectionTermination() = lock.withLock {
+        eofReached = true
+        notEmpty.signalAll()
     }
 
     /**

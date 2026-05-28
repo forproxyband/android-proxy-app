@@ -245,15 +245,32 @@ internal class Connection(
     }
 
     /** Block waiting for a server-initiated stream (each tunnel
-     *  arrives as one). Returns null if connection closes. */
+     *  arrives as one). Returns null when the connection closes — the
+     *  caller (NativeQuicTransport.acceptStream) turns that into an
+     *  IOException so the supervisor's accept loop can exit and trigger
+     *  a reconnect. We poll in 500 ms slices instead of `take()`-ing
+     *  forever so a [close] call propagates promptly to a parked
+     *  accept caller. */
     fun acceptStream(timeoutMs: Long = Long.MAX_VALUE): Stream? {
-        val s = if (timeoutMs == Long.MAX_VALUE) incomingServerStreams.take()
-                else incomingServerStreams.poll(timeoutMs, TimeUnit.MILLISECONDS)
-        return s
+        if (timeoutMs != Long.MAX_VALUE) {
+            if (closed.get()) return null
+            return incomingServerStreams.poll(timeoutMs, TimeUnit.MILLISECONDS)
+        }
+        while (!closed.get()) {
+            val s = incomingServerStreams.poll(500, TimeUnit.MILLISECONDS) ?: continue
+            return s
+        }
+        return null
     }
 
     /** Tear down the connection. Best-effort — sends a
-     *  CONNECTION_CLOSE then closes the socket. */
+     *  CONNECTION_CLOSE then closes the socket. Also forces EOF on
+     *  every stream's receive buffer so bridge threads parked in
+     *  [Stream.input.read] unblock immediately — otherwise they leak,
+     *  the agent's quicAcceptLoop never notices the disconnect (it was
+     *  parked too), and the supervisor never gets a chance to reopen
+     *  the QUIC connection (build-98 logged STALL TIMEOUT but the
+     *  supervisor never reconnected because every caller was wedged). */
     fun close() {
         if (!closed.compareAndSet(false, true)) return
         try {
@@ -266,6 +283,10 @@ internal class Connection(
             emitOneRttPacket(listOf(cc))
         } catch (_: Throwable) {}
         try { socket.close() } catch (_: Throwable) {}
+        // Unblock everything parked on this connection's streams.
+        for (s in streams.values) {
+            try { s.closeOnConnectionTermination() } catch (_: Throwable) {}
+        }
     }
 
     // ── Internals: receive loop ───────────────────────────────
