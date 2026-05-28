@@ -318,6 +318,16 @@ internal class Connection(
      *  climbing means we're dropping the peer's packets (e.g. an
      *  unhandled key update, which is exactly what froze build 92). */
     private val statsDecryptFailures = java.util.concurrent.atomic.AtomicLong(0L)
+    /** DATA_BLOCKED frames we've sent (RFC 9000 §19.12). Non-zero
+     *  means we hit send-side flow control and signalled the peer to
+     *  extend MAX_DATA. If this climbs but `flow.send_credit` never
+     *  recovers, the peer is ignoring our signal (proxy-server-go
+     *  quirk) and we need a different unsticking mechanism. */
+    private val statsDataBlockedSent = java.util.concurrent.atomic.AtomicLong(0L)
+    /** MAX_DATA frames the peer has sent us — i.e. how many times the
+     *  peer extended our send-side connection window. Pair with
+     *  [statsDataBlockedSent] to tell if DATA_BLOCKED is doing its job. */
+    private val statsMaxDataRecv = java.util.concurrent.atomic.AtomicLong(0L)
 
     private fun processLongPacket(bytes: ByteArray, datagramStart: Int, datagramEnd: Int, buf: ByteBuffer): Int {
         return try {
@@ -521,6 +531,7 @@ internal class Connection(
                 }
                 is MaxData -> {
                     flow.applyPeerMaxData(frame.maxData)
+                    statsMaxDataRecv.incrementAndGet()
                     // The peer just widened our connection send window — a
                     // sender parked on flow control can resume now, so wake it.
                     sendQueue.offer(QueuedSendWork.Tick)
@@ -721,6 +732,8 @@ internal class Connection(
                         " stream_frames=${statsStreamFrames.get()}" +
                         " new_server_streams=${statsNewServerStreams.get()}" +
                         " decrypt_fails=${statsDecryptFailures.get()}" +
+                        " db_sent=${statsDataBlockedSent.get()}" +
+                        " md_recv=${statsMaxDataRecv.get()}" +
                         " accept_queue=${incomingServerStreams.size}" +
                         " streams_map=${streams.size}" +
                         " cc.in_flight=${cc.bytesInFlight}" +
@@ -909,6 +922,7 @@ internal class Connection(
         // once per unique blocking event so we don't spam.
         if (workRemains && flow.sendCredit() <= 0L) {
             flow.shouldEmitDataBlocked()?.let { limit ->
+                statsDataBlockedSent.incrementAndGet()
                 log("send DATA_BLOCKED: $limit (sendCredit exhausted)")
                 emitOneRttPacket(listOf(DataBlocked(limit)))
             }
