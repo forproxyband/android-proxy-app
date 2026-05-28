@@ -17,13 +17,9 @@ import android.os.BatteryManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
-import android.system.Os
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import java.io.BufferedReader
 import java.io.File
-import java.io.FileInputStream
-import java.io.InputStreamReader
 import java.io.PrintWriter
 import java.io.StringWriter
 import java.text.SimpleDateFormat
@@ -37,8 +33,7 @@ class ProxyService : Service() {
     enum class ConnStatus { STARTING, CONNECTING, CONNECTED, RECONNECTING, ERROR, STOPPED }
     // NATIVE: pure-Kotlin port of the Go SDK, runs in-process. Default for
     // new installs. BINARY: ProcessBuilder fork of libproxyagent.so (legacy).
-    // AAR: gomobile-built SDK (.so) loaded via Class.forName.
-    enum class Engine { NATIVE, BINARY, AAR }
+    enum class Engine { NATIVE, BINARY }
     enum class Mode { MODEM, BALANCER }
 
     private var wakeLock: PowerManager.WakeLock? = null
@@ -52,13 +47,17 @@ class ProxyService : Service() {
     // QUIC implementation choice ("kwik" | "native"), passed via the
     // start intent (NOT SharedPreferences — the :proxy process caches
     // prefs and misses cross-process writes from the settings UI).
-    @Volatile private var quicImpl: String = "kwik"
+    // Default is the in-house QUIC stack; kwik adapter is kept compiled
+    // as a manual override but no longer exposed through the Settings UI
+    // (the picker was removed). Set via the optional `quic_impl=kwik`
+    // start intent extra for the rare regression-debug scenario.
+    @Volatile private var quicImpl: String = "native"
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var analytics: AnalyticsRecorder? = null
     @Volatile private var lastNatRefreshMs = 0L
     // Loopback relay that puts the agent↔registrator uplink on Wi-Fi while
     // outbound target dials stay on cellular. Lifecycle owned by the runX
-    // engine call sites — see runBinaryEngine / runAarEngine. Lives only
+    // engine call sites — see runNativeEngine / runBinaryEngine. Lives only
     // when wifi_return=true && mode=MODEM (see WifiReturnRelay top-of-file).
     @Volatile private var wifiRelay: WifiReturnRelay? = null
     // Real upstream (host, port) the agent should ultimately talk to —
@@ -200,7 +199,12 @@ class ProxyService : Service() {
         // v1 = first layout with heartbeat (field 9) + pid (field 10) +
         // schema_version (field 11). Older snapshots have neither and the
         // heartbeat-stale check naturally treats them as void.
-        private const val CONN_INFO_SCHEMA_VERSION = 1
+        // Bump on every new field added to writeConnInfo's pipe-delimited
+        // line. Readers can use this to switch parsing strategy when the
+        // tail grows — though getOrNull(N) keeps forward-compat free.
+        //   v1: + heartbeat / pid / schema version (fields 9-11)
+        //   v2: + Wi-Fi return session byte counters (fields 12-17)
+        private const val CONN_INFO_SCHEMA_VERSION = 2
     }
 
     private fun state(s: String) {
@@ -223,14 +227,25 @@ class ProxyService : Service() {
             // ProxyService process means the file is a leftover from a
             // previous incarnation); field 11 is CONN_INFO_SCHEMA_VERSION
             // so future readers can branch on layout without sniffing field
-            // counts. Readers must use getOrNull(N) for forward compatibility
-            // so the tail fields stay optional if a downgrade ever writes
-            // shorter rows. `|` is escaped in cycleStage so a stray pipe in
-            // a log line can't shift the field count.
+            // counts. Fields 12-17 are Wi-Fi return session byte counters,
+            // refreshed on every writeConnInfo from the live relay +
+            // native agent (zero when relay is off — MainActivity hides
+            // the session-traffic widget line in that case). Readers must
+            // use getOrNull(N) for forward compatibility so the tail
+            // fields stay optional if a downgrade ever writes shorter
+            // rows. `|` is escaped in cycleStage so a stray pipe in a
+            // log line can't shift the field count.
             val safeStage = cycleStage.replace('|', '/')
             val pid = android.os.Process.myPid()
+            val relay = wifiRelay
+            val wifiUp = relay?.wifiUpBytes() ?: 0L
+            val wifiDown = relay?.wifiDownBytes() ?: 0L
+            val fbUp = relay?.fallbackUpBytes() ?: 0L
+            val fbDown = relay?.fallbackDownBytes() ?: 0L
+            val tgtUp = nativeAgent?.targetUpBytes() ?: 0L
+            val tgtDown = nativeAgent?.targetDownBytes() ?: 0L
             File(filesDir, "conn_info").writeText(
-                "${connStatus.name}|$rxRate|$txRate|$currentRegistrator|$activeTunnels|$connectedSinceMs|$currentUplinkTransport|$safeStage|$wifiReturnStatus|${System.currentTimeMillis()}|$pid|$CONN_INFO_SCHEMA_VERSION"
+                "${connStatus.name}|$rxRate|$txRate|$currentRegistrator|$activeTunnels|$connectedSinceMs|$currentUplinkTransport|$safeStage|$wifiReturnStatus|${System.currentTimeMillis()}|$pid|$CONN_INFO_SCHEMA_VERSION|$wifiUp|$wifiDown|$fbUp|$fbDown|$tgtUp|$tgtDown"
             )
         } catch (_: Exception) {}
     }
@@ -263,8 +278,8 @@ class ProxyService : Service() {
 
     // SDK ≥ v2.0.10 dropped WebSocket and now uses plain TCP + yamux on the
     // uplink. Log strings changed too, so we match both old and new wording
-    // here — keeping the old keys means older binaries (and the AAR before
-    // it gets bumped) keep parsing correctly during the rollout.
+    // here — keeping the old keys means older binaries keep parsing correctly
+    // during the rollout.
     //
     //   old WS                          new yamux uplink
     //   "ws connected"                  "uplink connected"
@@ -320,9 +335,9 @@ class ProxyService : Service() {
                 // at "uplink connected" time (the first tunnel hasn't opened),
                 // so we start with a neutral "TCP" and refine to either
                 // "TCP (splice)" or "TCP (NIO)" when the splice subsystem
-                // reports its outcome on the first bridge call. BINARY/AAR
-                // engines reliably do splice via Go's io.Copy on TCPConn,
-                // so for them we keep "TCP (splice)" as before.
+                // reports its outcome on the first bridge call. The BINARY
+                // engine reliably does splice via Go's io.Copy on TCPConn,
+                // so for it we keep "TCP (splice)" as before.
                 currentUplinkTransport = if (line.contains("uplink connected")) {
                     when (transportRe.find(line)?.groupValues?.get(1)?.lowercase(Locale.US)) {
                         "quic" -> "QUIC"
@@ -515,8 +530,8 @@ class ProxyService : Service() {
                 if (!stopRequested) {
                     // For BINARY this kills the subprocess + interrupts our
                     // runner so it re-dials with fresh state on the new IP.
-                    // For AAR this is a no-op; the in-process SDK reconnects
-                    // on its own after the WS read error from the toggle.
+                    // For NATIVE this stops the in-process supervisor and
+                    // wakes the runner so it respawns on the new IP.
                     forceReconnect("REBOOT auto-cycle")
                     log("REBOOT auto-cycle: reconnect kicked")
                 }
@@ -671,17 +686,16 @@ class ProxyService : Service() {
         val dnsRaw = intent.getStringExtra("dns")?.trim().orEmpty()
         val dns = dnsRaw.ifEmpty { "1.1.1.1,8.8.8.8" }
         engine = when (intent.getStringExtra("engine")) {
-            "aar" -> Engine.AAR
             "binary" -> Engine.BINARY
             else -> Engine.NATIVE   // "native" or unset → default to native
         }
         mode = if (intent.getStringExtra("mode") == "balancer") Mode.BALANCER else Mode.MODEM
-        quicImpl = intent.getStringExtra("quic_impl") ?: "kwik"
+        quicImpl = intent.getStringExtra("quic_impl") ?: "native"
         if (host.isEmpty()) { stopSelf(); return START_NOT_STICKY }
 
         // Defensive bind reset. The :proxy process survives stops in
-        // NATIVE/BINARY (only AAR self-kills), so a previous Wi-Fi
-        // return session could have left this process bound to cellular
+        // NATIVE/BINARY, so a previous Wi-Fi return session could have
+        // left this process bound to cellular
         // even when the user has since unticked the checkbox. Without
         // an explicit reset here, all outbound traffic from :proxy
         // (registrator dial, NAT-IP probe, target dials) would silently
@@ -720,7 +734,48 @@ class ProxyService : Service() {
 
         // Spin up the analytics recorder before any agent log lines arrive so
         // tunnel-open/close events are counted from the very first connection.
-        analytics = AnalyticsRecorder(this)
+        // Wire the recorder into the Wi-Fi return counters — but ONLY
+        // when the relay is alive. Wi-Fi return is opt-in; without it
+        // we don't have `bindProcessToNetwork(cellular)` and the default
+        // route on dual-transport devices is Wi-Fi, not cellular. So
+        // NativeProxyAgent.targetUp/Down counters tick under wifi_return=
+        // off too, but the bytes they're counting traversed Wi-Fi, not
+        // cellular — attributing them to `cellRx/Tx` would lie.
+        //
+        // Honest stance: when the relay is null (wifi_return disabled,
+        // or it was disabled mid-session by split_failed), we don't
+        // actually know which interface the target dials used —
+        // TrafficStats per-UID isn't split by interface. Return 0 for
+        // both legs; the analytics bucket stores only the UID-wide
+        // total rx/tx (still correct) and per-interface stays zero
+        // until the user opts in. Down the line a NetworkStatsManager-
+        // based recorder could fill those in without the relay, but
+        // that needs PACKAGE_USAGE_STATS runtime permission.
+        //
+        // When the relay IS alive:
+        //   wifi* = relay's upstream socket bytes bound to Wi-Fi
+        //   cell* = relay fallback bytes (cellular default route)
+        //         + native-agent target-dial bytes (cellular via
+        //           process bind)
+        // Lambdas dereference wifiRelay / nativeAgent on every tick,
+        // so a relay tear-down (wifi_return disabled mid-session)
+        // gracefully drops back to 0 — the recorder's baseline-delta
+        // pattern with coerceAtLeast(0) absorbs the discontinuity.
+        analytics = AnalyticsRecorder(
+            ctx = this,
+            readWifiRx = { wifiRelay?.wifiDownBytes() ?: 0L },
+            readWifiTx = { wifiRelay?.wifiUpBytes() ?: 0L },
+            readCellRx = {
+                val r = wifiRelay
+                if (r == null) 0L
+                else r.fallbackDownBytes() + (nativeAgent?.targetDownBytes() ?: 0L)
+            },
+            readCellTx = {
+                val r = wifiRelay
+                if (r == null) 0L
+                else r.fallbackUpBytes() + (nativeAgent?.targetUpBytes() ?: 0L)
+            },
+        )
 
         try {
             val pm = getSystemService(POWER_SERVICE) as PowerManager
@@ -801,7 +856,6 @@ class ProxyService : Service() {
         val runner = when (engine) {
             Engine.NATIVE -> Thread { runNativeEngine(host, port, key, agentId, dns) }
             Engine.BINARY -> Thread { runBinaryEngine(host, port, key, agentId, dns) }
-            Engine.AAR -> Thread { runAarEngine(host, port, key, agentId, dns) }
         }
         runner.name = "AgentRunner"
         runner.isDaemon = true
@@ -850,8 +904,8 @@ class ProxyService : Service() {
             return host to port
         }
         // Engine-specific behaviour for the cellular process bind:
-        //   - In-process engines (NATIVE, AAR): bindProcessToNetwork(cellular)
-        //     so target dials default-route through cellular. Per-socket
+        //   - NATIVE (in-process): bindProcessToNetwork(cellular) so
+        //     target dials default-route through cellular. Per-socket
         //     wifiNet.bindSocket() in the relay overrides this for the
         //     uplink only. Skip the relay if cellular isn't reachable —
         //     no point running with a guaranteed target-dial leak.
@@ -898,10 +952,10 @@ class ProxyService : Service() {
     }
 
     // Acquires a cellular Network via requestNetwork and binds the :proxy
-    // process to it so all sockets created after this — including the Go
-    // SDK's target dials in the AAR engine — egress through cellular by
-    // default. The relay's outbound sockets override this back to Wi-Fi
-    // per-socket via wifiNet.bindSocket().
+    // process to it so all sockets created after this — including target
+    // dials from the NATIVE engine's in-process supervisor — egress through
+    // cellular by default. The relay's outbound sockets override this back
+    // to Wi-Fi per-socket via wifiNet.bindSocket().
     //
     // Blocking up to 10s for the cellular Network to appear; returns false
     // on timeout / system error. Caller is expected to bail (skip relay)
@@ -1012,9 +1066,9 @@ class ProxyService : Service() {
 
     // Shared split-routing failure handler. Both the initial self-test and
     // the post-rotation retest call this when SAME_IP comes back, instead
-    // of each route capturing its own onSplitFail lambda. BINARY rolls back
-    // the effective env vars and respawns the subprocess; AAR stops the
-    // whole service (in-process Go env can't be re-initialised cleanly).
+    // of each route capturing its own onSplitFail lambda. Both engines roll
+    // back the effective host/port and trip the runner so the next dial uses
+    // the real upstream.
     private fun handleSplitFailureForCurrentEngine() {
         when (engine) {
             Engine.BINARY -> {
@@ -1025,17 +1079,12 @@ class ProxyService : Service() {
                 try { agentProcess?.destroy() } catch (_: Throwable) {}
                 runnerThread?.interrupt()
             }
-            Engine.AAR -> {
-                log("wifi_return: AAR engine can't roll back in-process; auto-stopping")
-                doStop("Wi-Fi return: split routing not confirmed — disable the checkbox to use cellular directly")
-            }
             Engine.NATIVE -> {
-                // Same posture as BINARY — the native agent reads
-                // effectiveHost/Port on every dial loop iteration via
-                // NativeProxyAgent.Config, so we just stop the current
-                // agent and let the runner respawn with the rolled-back
-                // (host, port). No subprocess to kill — stop the in-
-                // process supervisor instead.
+                // The native agent reads effectiveHost/Port on every dial
+                // loop iteration via NativeProxyAgent.Config, so we just
+                // stop the current agent and let the runner respawn with
+                // the rolled-back (host, port). No subprocess to kill —
+                // stop the in-process supervisor instead.
                 log("wifi_return: rolling back NATIVE engine to direct dial " +
                     "($originalHost:$originalPort)")
                 effectiveHost = originalHost
@@ -1191,19 +1240,19 @@ class ProxyService : Service() {
                     // instead of cellular. Two scenarios with different
                     // remediation:
                     //
-                    //   - In-process engine (NATIVE / AAR): this is
-                    //     UNEXPECTED — bindProcessToNetwork(cellular) was
-                    //     supposed to route target dials through cellular.
-                    //     Something failed silently (ROM quirk, race with
-                    //     network state). Disable the relay to avoid
-                    //     exposing the Wi-Fi IP to targets.
+                    //   - NATIVE engine: this is UNEXPECTED —
+                    //     bindProcessToNetwork(cellular) was supposed to
+                    //     route target dials through cellular. Something
+                    //     failed silently (ROM quirk, race with network
+                    //     state). Disable the relay to avoid exposing the
+                    //     Wi-Fi IP to targets.
                     //
                     //   - BINARY engine: this is EXPECTED. Subprocess
                     //     doesn't inherit bindProcessToNetwork, so target
                     //     dials go through the default route (Wi-Fi). The
                     //     user accepted this trade-off (UI normally
-                    //     forces an in-process engine; getting here means
-                    //     they explicitly chose BINARY). Keep the relay
+                    //     forces NATIVE; getting here means they
+                    //     explicitly chose BINARY). Keep the relay
                     //     running for the mobile-data savings on the
                     //     uplink, but flag the leak in the widget so
                     //     they're not surprised when targets see Wi-Fi IP.
@@ -1345,19 +1394,19 @@ class ProxyService : Service() {
     // In-process engine using the pure-Kotlin port of the SDK (see
     // com.proxyagent.app.nativeagent.NativeProxyAgent). Default engine
     // for new installs — no subprocess, no Go runtime, no JNI. Speaks
-    // the same TCP/QUIC wire protocol as the binary and AAR engines, so
-    // it pairs with the same registrator infrastructure.
+    // the same TCP/QUIC wire protocol as the binary engine, so it pairs
+    // with the same registrator infrastructure.
     //
     // Logging is bridged into parseAgentLine() via a LogSink that emits
-    // the same line vocabulary the binary/AAR engines write to stdout —
+    // the same line vocabulary the binary engine writes to stdout —
     // "uplink connected ... transport=tcp", "opening tunnel target=...",
     // "REBOOT received from registrator reason=...", etc. — so the
     // existing status parser keeps working without changes.
     private fun runNativeEngine(host: String, port: String, key: String, agentId: String, dns: String) {
         try {
-            // Same Wi-Fi return wiring as the AAR engine — see
-            // maybeStartWifiRelay() for the conditions. NATIVE also
-            // runs in-process so bindProcessToNetwork(cellular) sticks.
+            // Same Wi-Fi return wiring as the binary engine — see
+            // maybeStartWifiRelay() for the conditions. NATIVE runs
+            // in-process so bindProcessToNetwork(cellular) sticks.
             originalHost = host
             originalPort = port
             val initialEffective = maybeStartWifiRelay(host, port)
@@ -1617,206 +1666,6 @@ class ProxyService : Service() {
         log("Runner loop exited")
     }
 
-    // In-process engine using the gomobile AAR (proxyagent.sdk.agent.Agent).
-    //
-    // Go's runtime caches env into runtime.envs at JNI_OnLoad time and never
-    // re-reads it afterwards. libc's setenv() does NOT update that cache, so
-    // any config we want Go to see must be in libc's environ BEFORE
-    // libgojni.so is loaded.
-    //
-    // To prevent ART from eagerly resolving go.Seq / Agent during method
-    // verification (which would load the .so before our setenv runs), we
-    // pull those classes via Class.forName AFTER setenv. This pushes the
-    // System.loadLibrary("gojni") call past our environment setup.
-    //
-    // On stop we kill the :proxy process so the next start re-initializes
-    // with fresh env.
-    private fun runAarEngine(host: String, port: String, key: String, agentId: String, dns: String) {
-        try {
-            log("Capturing native stdout/stderr…")
-            captureNativeOutput()
-
-            // Same Wi-Fi return wiring as the binary engine — see
-            // maybeStartWifiRelay() for the conditions. The AAR's in-process
-            // Go runtime also dials whatever (host, port) we set in env, so
-            // the loopback substitution works identically. Note: the relay
-            // lives in the :proxy process alongside the Go runtime, so it
-            // dies with the AAR's process kill in doStop (no separate
-            // teardown ordering needed beyond stopWifiRelayIfRunning()).
-            originalHost = host
-            originalPort = port
-            val initialEffective = maybeStartWifiRelay(host, port)
-            effectiveHost = initialEffective.first
-            effectivePort = initialEffective.second
-            val relayActive = effectiveHost != host
-            val hostLog = if (relayActive) "$effectiveHost:$effectivePort→$host:$port" else host
-            log("Setting environment: mode=${mode.name} host=$hostLog port=$port key=${mask(key)} id=${if (agentId.isEmpty()) "<empty>" else mask(agentId)} dns=$dns")
-
-            // Self-test for AAR: can't roll back in-process (Go env is
-            // cached at JNI_OnLoad), so on split-routing failure we must
-            // auto-stop the whole service (see handleSplitFailureForCurrentEngine).
-            if (wifiRelay != null) scheduleWifiReturnSelfTest()
-            // The SDK's Go config helper checks both lowercase ("balancer_host")
-            // and SCREAMING_SNAKE ("BALANCER_HOST") names — set both so we
-            // don't depend on the SDK's casing convention.
-            fun setBoth(name: String, value: String) {
-                Os.setenv(name, value, true)
-                Os.setenv(name.uppercase(Locale.ROOT), value, true)
-            }
-            setBoth("agent_key", key)
-            setBoth("enable_netagent", "true")
-            setBoth("dns_servers", dns)
-            Os.setenv("HOME", filesDir.absolutePath, true)
-            Os.setenv("TMPDIR", cacheDir.absolutePath, true)
-
-            when (mode) {
-                Mode.MODEM -> {
-                    // Direct registrator: SDK has no Java setRegistrator helper,
-                    // so we rely on env vars (config.FromEnvAndFlags reads
-                    // registrator_host/REGISTRATOR_HOST). Set BEFORE Go runtime
-                    // initializes via Class.forName("go.Seq") below.
-                    // effectiveHost/effectivePort point at the Wi-Fi return
-                    // relay's loopback address when that feature is enabled;
-                    // otherwise they're identical to host/port.
-                    setBoth("registrator_host", effectiveHost)
-                    setBoth("registrator_port", effectivePort)
-                    if (agentId.isNotEmpty()) setBoth("agent_uuid", agentId)
-                }
-                Mode.BALANCER -> {
-                    // Balancer never goes through the Wi-Fi relay — see
-                    // maybeStartWifiRelay() for the reason.
-                    setBoth("balancer_host", host)
-                    setBoth("balancer_port", port)
-                    setBoth("fallback_file_url",
-                        "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json")
-                }
-            }
-
-            connStatus = ConnStatus.CONNECTING
-
-            // Diagnostic: dump what libc reports back, to confirm setenv stuck
-            // in the current process. Shorter form so the agent_key isn't logged.
-            try {
-                val k = Os.getenv("agent_key") ?: "<null>"
-                val keyMsg = "agent_key=${if (k == "<null>") k else "set(${k.length}b)"}"
-                when (mode) {
-                    Mode.MODEM -> {
-                        val rh = Os.getenv("registrator_host") ?: "<null>"
-                        val rp = Os.getenv("registrator_port") ?: "<null>"
-                        val uu = Os.getenv("agent_uuid") ?: "<null>"
-                        log("libc env check: registrator_host=$rh registrator_port=$rp agent_uuid=${if (uu == "<null>") uu else "set(${uu.length}b)"} $keyMsg")
-                    }
-                    Mode.BALANCER -> {
-                        val h = Os.getenv("balancer_host") ?: "<null>"
-                        val p = Os.getenv("balancer_port") ?: "<null>"
-                        log("libc env check: balancer_host=$h balancer_port=$p $keyMsg")
-                    }
-                }
-            } catch (_: Throwable) {}
-
-            log("Loading Go runtime via Class.forName(\"go.Seq\")…")
-            val seqClass = Class.forName("go.Seq")
-            seqClass.getMethod("setContext", android.content.Context::class.java)
-                .invoke(null, applicationContext)
-
-            log("Loading Agent class via Class.forName…")
-            val agentClass = Class.forName("proxyagent.sdk.agent.Agent")
-
-            // Newer SDKs expose Java setters that call Go's os.Setenv internally
-            // — that's the only way to get values into runtime.envs from JNI.
-            // Fall back to setenv-only on older AARs that don't have them.
-            var sdkSettersOk = true
-            fun callSetter(name: String, argTypes: Array<Class<*>>, vararg args: Any?) {
-                try {
-                    agentClass.getMethod(name, *argTypes).invoke(null, *args)
-                } catch (t: NoSuchMethodException) {
-                    sdkSettersOk = false
-                    log("Agent.$name not found — falling back to libc setenv only")
-                } catch (t: Throwable) {
-                    sdkSettersOk = false
-                    log("Agent.$name error: ${t.message}")
-                }
-            }
-            val portLong = port.toLongOrNull() ?: 0L
-            callSetter("setAgentKey",
-                arrayOf<Class<*>>(String::class.java), key)
-            callSetter("setEnableNetAgent",
-                arrayOf<Class<*>>(Boolean::class.javaPrimitiveType!!), true)
-            if (mode == Mode.BALANCER) {
-                callSetter("setBalancer",
-                    arrayOf<Class<*>>(String::class.java, Long::class.javaPrimitiveType!!),
-                    host, portLong)
-                callSetter("setFallbackURL",
-                    arrayOf<Class<*>>(String::class.java),
-                    "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json")
-            }
-            // For modem mode, registrator_host/port/agent_uuid go via env only —
-            // the SDK has no Java setRegistrator/setAgentUUID at this AAR version.
-            log("SDK setters ${if (sdkSettersOk) "applied" else "partial — some fell back to env"}")
-
-            try {
-                agentClass.getMethod("setDNSServers", String::class.java).invoke(null, dns)
-                log("Agent.setDNSServers applied")
-            } catch (t: Throwable) {
-                log("Agent.setDNSServers unavailable: ${t.message}")
-            }
-
-            log("Calling Agent.startAgent()")
-            agentClass.getMethod("startAgent").invoke(null)
-            state("running")
-            log("Agent.startAgent returned")
-        } catch (e: Throwable) {
-            val sw = StringWriter(); e.printStackTrace(PrintWriter(sw))
-            log("AAR engine error: $sw")
-            connStatus = ConnStatus.ERROR
-            state("error"); writeConnInfo()
-        }
-    }
-
-    // Pipe Go's stdout/stderr (fd 1/2) into our log so log parsing works.
-    // Also tail logcat for tags gomobile typically writes to.
-    private fun captureNativeOutput() {
-        try {
-            val fds = Os.pipe()
-            val readFd = fds[0]
-            val writeFd = fds[1]
-            Os.dup2(writeFd, 1)
-            Os.dup2(writeFd, 2)
-            Os.close(writeFd)
-            Thread {
-                try {
-                    val reader = BufferedReader(InputStreamReader(FileInputStream(readFd)))
-                    while (true) {
-                        val line = reader.readLine() ?: break
-                        parseAgentLine(line)
-                        log("[go] $line")
-                    }
-                } catch (_: Throwable) {}
-            }.apply { name = "NativeStdoutReader"; isDaemon = true; start() }
-        } catch (e: Throwable) {
-            log("stdout capture failed: ${e.message}")
-        }
-
-        try {
-            val proc = ProcessBuilder(
-                "logcat", "-T", "1", "-v", "time",
-                "GoLog:V", "Go:V", "*:S"
-            ).redirectErrorStream(true).start()
-            Thread {
-                try {
-                    val reader = proc.inputStream.bufferedReader()
-                    while (true) {
-                        val line = reader.readLine() ?: break
-                        parseAgentLine(line)
-                        log("[logcat] $line")
-                    }
-                } catch (_: Throwable) {}
-            }.apply { name = "LogcatTailer"; isDaemon = true; start() }
-        } catch (e: Throwable) {
-            log("logcat tail failed: ${e.message}")
-        }
-    }
-
     private fun registerNetworkCallback() {
         try {
             val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -1872,15 +1721,11 @@ class ProxyService : Service() {
                 try { agentProcess?.destroy() } catch (_: Throwable) {}
                 runnerThread?.interrupt()
             }
-            Engine.AAR -> {
-                // AAR engine handles network changes internally via the Go-side
-                // dial loop; nothing to tear down here.
-            }
             Engine.NATIVE -> {
-                // Same model as AAR: the native supervisor's dial loop
-                // re-resolves and re-dials each iteration. Stopping the
-                // current uplink wakes the loop without tearing down the
-                // supervisor, so it reconnects on the new interface.
+                // The native supervisor's dial loop re-resolves and
+                // re-dials each iteration. Stopping the current uplink
+                // wakes the loop without tearing down the supervisor,
+                // so it reconnects on the new interface.
                 try { nativeAgent?.stop() } catch (_: Throwable) {}
                 runnerThread?.interrupt()
             }
@@ -1924,11 +1769,6 @@ class ProxyService : Service() {
                     } catch (_: InterruptedException) { p.destroyForcibly() }
                 }
             } catch (t: Throwable) { log("Stop error: ${t.message}") }
-            Engine.AAR -> try {
-                log("Calling Agent.stopAgent()")
-                Class.forName("proxyagent.sdk.agent.Agent")
-                    .getMethod("stopAgent").invoke(null)
-            } catch (t: Throwable) { log("Agent.stopAgent error: ${t.message}") }
             Engine.NATIVE -> try {
                 log("Stopping native agent")
                 nativeAgent?.stop(timeoutMs = 3_000L)
@@ -1971,18 +1811,6 @@ class ProxyService : Service() {
             } catch (_: Throwable) {}
         }
         stopSelf()
-
-        // libc setenv does not update Go's cached env after runtime init, so the
-        // AAR engine cannot be cleanly restarted in the same process. Killing
-        // the :proxy process forces the next Start to load a fresh Go runtime
-        // with the new env. The binary engine re-execs the subprocess instead,
-        // so it doesn't need this.
-        if (engine == Engine.AAR) {
-            Thread {
-                try { Thread.sleep(400) } catch (_: InterruptedException) {}
-                android.os.Process.killProcess(android.os.Process.myPid())
-            }.apply { name = "AarProcKiller"; isDaemon = true; start() }
-        }
     }
 
     override fun onDestroy() { doStop(); super.onDestroy() }

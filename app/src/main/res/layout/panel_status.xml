@@ -85,6 +85,22 @@
         android:layout_marginTop="2dp"
         android:visibility="gone" />
 
+    <!-- Session-lifetime byte counters from conn_info fields 12-17.
+         Format: "Session: Wi-Fi ↑12.4M ↓48.1M · Cell ↑8.2M ↓2.1M · saved 60.5M"
+         The "saved" number is wifiUp+wifiDown (traffic that didn't ride
+         cellular). Hidden when relay isn't running OR when there's nothing
+         meaningful to show (all zero). -->
+    <TextView
+        android:id="@+id/tvSessionTraffic"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text=""
+        android:textColor="#88ffaa"
+        android:textSize="10sp"
+        android:fontFamily="monospace"
+        android:layout_marginTop="2dp"
+        android:visibility="gone" />
+
     <TextView
         android:id="@+id/tvSwipeHint"
         android:layout_width="wrap_content"

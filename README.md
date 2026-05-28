@@ -43,13 +43,13 @@ fixes, troubleshooting) → **[ADMIN_GUIDE.md](ADMIN_GUIDE.md)**.
 ## How it works inside
 
 Two processes (`:main` for UI, `:proxy` for the foreground
-service), three swappable agent engines (NATIVE Kotlin port —
-default; BINARY subprocess; AAR in-process Go — legacy),
-file-based IPC through `filesDir`, no Binder.
+service), two swappable agent engines (NATIVE Kotlin port —
+default; BINARY subprocess — legacy), file-based IPC through
+`filesDir`, no Binder.
 
 Full write-up — **[ARCHITECTURE.md](ARCHITECTURE.md)**:
 - Process model + IPC files
-- Agent engines (NATIVE / BINARY / AAR trade-offs)
+- Agent engines (NATIVE / BINARY trade-offs)
 - TCP fast path (kernel `splice(2)` shim, NIO fallback)
 - IP rotation algorithm + interrupted-cycle recovery
 - Wi-Fi return relay (split-routing, self-test, OEM caveats)
@@ -81,5 +81,5 @@ CI builds on every push — see `.github/workflows/build.yml`.
 ## Status
 
 Active development. NATIVE engine is the production path; BINARY
-and AAR are kept for testing/comparison and slated for removal once
-NATIVE has enough field hours (see `ARCHITECTURE.md` §Agent engines).
+is kept for testing/comparison and slated for removal once NATIVE
+has enough field hours (see `ARCHITECTURE.md` §Agent engines).

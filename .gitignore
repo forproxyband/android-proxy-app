@@ -39,6 +39,4 @@ bin/
 ### Mac OS ###
 .DS_Store
 /.claude/settings.local.json
-/proxyagent.aar
-/proxy-agent-linux-x86
 /proxy-agent-linux-arm64

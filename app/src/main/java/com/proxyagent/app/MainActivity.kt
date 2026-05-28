@@ -324,11 +324,11 @@ class MainActivity : AppCompatActivity() {
         val rgEngine = view.findViewById<RadioGroup>(R.id.rgEngine)
         val rbEngineNative = view.findViewById<RadioButton>(R.id.rbEngineNative)
         val rbEngineBinary = view.findViewById<RadioButton>(R.id.rbEngineBinary)
-        val rbEngineAar = view.findViewById<RadioButton>(R.id.rbEngineAar)
-        val quicImplBlock = view.findViewById<android.widget.LinearLayout>(R.id.quicImplBlock)
-        val rgQuicImpl = view.findViewById<RadioGroup>(R.id.rgQuicImpl)
-        val rbQuicImplNative = view.findViewById<RadioButton>(R.id.rbQuicImplNative)
-        val rbQuicImplKwik = view.findViewById<RadioButton>(R.id.rbQuicImplKwik)
+        // QUIC implementation picker (rgQuicImpl + rbQuicImplNative/Kwik)
+        // was removed from the layout — the in-house QUIC stack is the
+        // default and only UI-selectable path. The `quic_impl` pref is
+        // also no longer read here; ProxyService falls back to "native"
+        // when the start intent omits the extra (which we now always do).
         val rgMode = view.findViewById<RadioGroup>(R.id.rgMode)
         val rbModeModem = view.findViewById<RadioButton>(R.id.rbModeModem)
         val rbModeBalancer = view.findViewById<RadioButton>(R.id.rbModeBalancer)
@@ -361,22 +361,21 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Wi-Fi return requires an in-process engine (NATIVE or AAR) —
+        // Wi-Fi return requires the in-process NATIVE engine —
         // bindProcessToNetwork(cellular) sets a per-process default
         // route that doesn't survive ProcessBuilder fork+exec, so a
         // BINARY subprocess wouldn't inherit it and target dials would
         // leak through Wi-Fi (default route on dual-transport devices).
         // We gate the engine radio accordingly: when the Wi-Fi return
-        // checkbox is on, BINARY is disabled and NATIVE is auto-
-        // selected if no in-process engine is currently picked.
+        // checkbox is on, BINARY is disabled and NATIVE is auto-selected.
         fun applyEngineGateForWifiReturn() {
             val wifiOn = cbWifiReturn.isChecked && cbWifiReturn.isEnabled
             rbEngineBinary.isEnabled = !wifiOn
-            if (wifiOn && !rbEngineNative.isChecked && !rbEngineAar.isChecked) {
+            if (wifiOn && !rbEngineNative.isChecked) {
                 rbEngineNative.isChecked = true
             }
             rbEngineBinary.text = if (wifiOn) {
-                "Binary subprocess  (disabled — needs in-process engine for Wi-Fi return)"
+                "Binary subprocess  (disabled — needs NATIVE engine for Wi-Fi return)"
             } else {
                 "Binary subprocess"
             }
@@ -428,26 +427,19 @@ class MainActivity : AppCompatActivity() {
             val rIdx = retentionDays.indexOf(savedRet).let { if (it < 0) 2 else it }
             spRetention.setSelection(rIdx)
             when (prefs.getString("engine", "native")) {
-                "aar" -> rbEngineAar.isChecked = true
                 "binary" -> rbEngineBinary.isChecked = true
                 else -> rbEngineNative.isChecked = true     // "native" or unset
             }
-            // QUIC implementation picker, persisted per `quic_impl` key.
-            // Default to "kwik" — the in-house QUIC is still under
-            // interop testing; users opt in explicitly.
-            when (prefs.getString("quic_impl", "kwik")) {
-                "native" -> rbQuicImplNative.isChecked = true
-                else -> rbQuicImplKwik.isChecked = true
-            }
-            // Visibility tied to engine choice — kwik vs in-house only
-            // matters when NATIVE is the agent engine; the binary
-            // subprocess and the AAR drop-in carry their own QUIC.
-            quicImplBlock.visibility = if (rbEngineNative.isChecked)
-                android.view.View.VISIBLE else android.view.View.GONE
-            rgEngine.setOnCheckedChangeListener { _, _ ->
-                quicImplBlock.visibility = if (rbEngineNative.isChecked)
-                    android.view.View.VISIBLE else android.view.View.GONE
-            }
+            // QUIC implementation picker removed from the dialog: the
+            // in-house QUIC stack is now the default and only UI-visible
+            // path for the NATIVE engine. The `quic_impl` SharedPreferences
+            // key is intentionally NOT cleared — if a user had it set to
+            // "kwik" from before, that value lingers but ProxyService
+            // ignores it (always selects native when the start intent
+            // omits the extra). The kwik adapter is still compiled in as
+            // a safety-net override accessible via `quic_impl=kwik` start
+            // intent extra; the library will be removed entirely in a
+            // follow-up commit once the in-house path has more field hours.
             val modemMode = prefs.getString("mode", "modem") == "modem"
             if (modemMode) rbModeModem.isChecked = true else rbModeBalancer.isChecked = true
             applyModeVisibility(modemMode)
@@ -485,7 +477,7 @@ class MainActivity : AppCompatActivity() {
         cbWifiReturn.setOnCheckedChangeListener { _, isChecked ->
             // Whether the checkbox came on or off, the engine gate must
             // refresh — turning the box off should re-enable BINARY, and
-            // turning it on must force AAR even before preflight returns.
+            // turning it on must force NATIVE even before preflight returns.
             applyEngineGateForWifiReturn()
             if (!isChecked || !cbWifiReturn.isEnabled) return@setOnCheckedChangeListener
             // Fast path: known-bad device from a previous self-test.
@@ -524,19 +516,14 @@ class MainActivity : AppCompatActivity() {
                     spRetention.selectedItemPosition.coerceIn(0, retentionDays.size - 1)]
                 val retentionChanged = prefs.getInt("analytics_retention_days", 30) != newRetention
                 val newEngine = when (rgEngine.checkedRadioButtonId) {
-                    R.id.rbEngineAar -> "aar"
                     R.id.rbEngineBinary -> "binary"
                     else -> "native"   // rbEngineNative or nothing checked
                 }
-                // QUIC implementation choice. Only consumed when engine
-                // == "native"; for binary / aar this value is ignored
-                // (those agents ship their own QUIC). We persist either
-                // way so the radio retains its selection when the user
-                // flips back to NATIVE.
-                val newQuicImpl = when (rgQuicImpl.checkedRadioButtonId) {
-                    R.id.rbQuicImplNative -> "native"
-                    else -> "kwik"  // rbQuicImplKwik or nothing
-                }
+                // QUIC implementation choice removed from the UI — see
+                // the "QUIC implementation picker removed" comment in
+                // the dialog-binding block. We no longer write the
+                // `quic_impl` pref; ProxyService falls back to "native"
+                // when the start intent omits the extra.
                 val newMode = if (rgMode.checkedRadioButtonId == R.id.rbModeBalancer) "balancer" else "modem"
                 val imeiMethodKey = imeiMethodKeys[
                     spImeiMethod.selectedItemPosition.coerceIn(0, imeiMethodKeys.size - 1)]
@@ -547,13 +534,13 @@ class MainActivity : AppCompatActivity() {
                 // a relay that can't intercept the balancer-discovered
                 // registrator.
                 val effectiveWifiReturn = cbWifiReturn.isChecked && newMode == "modem"
-                // Wi-Fi return REQUIRES an in-process engine (NATIVE or
-                // AAR) — see runBinaryEngine guard + bindProcessToNetwork
-                // comment in ProxyService. If we somehow end up saving
-                // with wifi_return=true and engine=binary (e.g. stale
-                // dialog state or pref tampering), the ProxyService
-                // guard would silently disable the relay, leaving the
-                // user confused. Clamp it here to NATIVE.
+                // Wi-Fi return REQUIRES the NATIVE in-process engine —
+                // see runBinaryEngine guard + bindProcessToNetwork comment
+                // in ProxyService. If we somehow end up saving with
+                // wifi_return=true and engine=binary (e.g. stale dialog
+                // state or pref tampering), the ProxyService guard would
+                // silently disable the relay, leaving the user confused.
+                // Clamp it here to NATIVE.
                 val effectiveEngine = if (effectiveWifiReturn && newEngine == "binary") "native" else newEngine
                 val engineClampedForWifiReturn = effectiveWifiReturn && newEngine == "binary"
                 // engineChanged tracks what actually goes into prefs — i.e.
@@ -561,7 +548,6 @@ class MainActivity : AppCompatActivity() {
                 // way the "stop & restart to apply" hint fires even when
                 // engine was clamped by the Wi-Fi return gate.
                 val engineChanged = prefs.getString("engine", "native") != effectiveEngine
-                val quicImplChanged = prefs.getString("quic_impl", "kwik") != newQuicImpl
                 val modeChanged = prefs.getString("mode", "modem") != newMode
                 prefs.edit()
                     .putString("h", h).putString("p", p).putString("k", k)
@@ -569,7 +555,6 @@ class MainActivity : AppCompatActivity() {
                     .putBoolean("speed_bytes", speedBytes)
                     .putInt("analytics_retention_days", newRetention)
                     .putString("engine", effectiveEngine)
-                    .putString("quic_impl", newQuicImpl)
                     .putString("mode", newMode)
                     .putBoolean("apn_swap", cbApnSwap.isChecked)
                     .putBoolean("imei_rotate", cbImeiRotate.isChecked)
@@ -580,7 +565,7 @@ class MainActivity : AppCompatActivity() {
                 if (engineClampedForWifiReturn) {
                     Toast.makeText(
                         this,
-                        "Wi-Fi return requires an in-process engine — switched to Native",
+                        "Wi-Fi return requires the NATIVE engine — switched automatically",
                         Toast.LENGTH_LONG,
                     ).show()
                 }
@@ -607,7 +592,7 @@ class MainActivity : AppCompatActivity() {
                 catch (_: Throwable) {}
                 val running = readFile("proxy_state").let { it == "running" || it == "starting" }
                 val msg = when {
-                    running && (engineChanged || modeChanged || quicImplChanged) -> "Saved — stop & restart to apply"
+                    running && (engineChanged || modeChanged) -> "Saved — stop & restart to apply"
                     running -> "Saved — restart agent to apply"
                     else -> "Saved"
                 }
@@ -1093,19 +1078,19 @@ class MainActivity : AppCompatActivity() {
 
         val engine = prefs.getString("engine", "native") ?: "native"
         val mode = prefs.getString("mode", "modem") ?: "modem"
-        // QUIC impl is passed via intent (like engine/mode) NOT read from
-        // SharedPreferences in the :proxy process — that process caches
-        // prefs in memory and doesn't see cross-process writes, so a
-        // settings change wouldn't take effect. Intent extras are always
-        // fresh.
-        val quicImpl = prefs.getString("quic_impl", "kwik") ?: "kwik"
+        // QUIC implementation chooser was removed from the UI — the
+        // in-house stack is the default. We deliberately do NOT pass a
+        // `quic_impl` extra so ProxyService applies its own default
+        // ("native"), even if the user has a stale "kwik" value lingering
+        // in SharedPreferences from before. The kwik adapter is still
+        // wired in ProxyService for emergency overrides via adb, but
+        // there's no UI path to it any more.
         return try {
             val svc = Intent(this, ProxyService::class.java).apply {
                 putExtra("host", h); putExtra("port", po); putExtra("key", k)
                 putExtra("id", id); putExtra("dns", d)
                 putExtra("engine", engine)
                 putExtra("mode", mode)
-                putExtra("quic_impl", quicImpl)
             }
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc) else startService(svc)
             tvStatus.text = "STARTING..."
@@ -1453,6 +1438,35 @@ class MainActivity : AppCompatActivity() {
                 val testDetail = info.optString("test_detail", "")
                 if (testDetail.isNotEmpty()) kv("Self-Test-Detail", testDetail)
             }
+
+            // Session byte counters from conn_info fields 12-17 (schema v2).
+            // Surface them here so log readers can see exactly how much
+            // traffic the relay actually moved over each interface — the
+            // most useful single number for "is Wi-Fi return doing its
+            // job" diagnostics. We pull the live conn_info (already read
+            // into `info` above for the cellular-IP fallback) to avoid a
+            // double read.
+            val connInfoFields = readFile("conn_info").split("|")
+            val sWifiUp = connInfoFields.getOrNull(12)?.toLongOrNull() ?: 0L
+            val sWifiDown = connInfoFields.getOrNull(13)?.toLongOrNull() ?: 0L
+            val sFbUp = connInfoFields.getOrNull(14)?.toLongOrNull() ?: 0L
+            val sFbDown = connInfoFields.getOrNull(15)?.toLongOrNull() ?: 0L
+            val sTgtUp = connInfoFields.getOrNull(16)?.toLongOrNull() ?: 0L
+            val sTgtDown = connInfoFields.getOrNull(17)?.toLongOrNull() ?: 0L
+            if (sWifiUp + sWifiDown + sFbUp + sFbDown + sTgtUp + sTgtDown > 0L) {
+                // Format with humanBytes() (already in this file for the
+                // panel charts) so readers see "12.4 MB" instead of raw
+                // byte counts.
+                if (sWifiUp > 0L) kv("Wi-Fi-Session-Tx", humanBytes(sWifiUp))
+                if (sWifiDown > 0L) kv("Wi-Fi-Session-Rx", humanBytes(sWifiDown))
+                if (sWifiUp + sWifiDown > 0L) {
+                    kv("Wi-Fi-Session-Saved", humanBytes(sWifiUp + sWifiDown))
+                }
+                if (sFbUp > 0L) kv("Cellular-Fallback-Tx", humanBytes(sFbUp))
+                if (sFbDown > 0L) kv("Cellular-Fallback-Rx", humanBytes(sFbDown))
+                if (sTgtUp > 0L) kv("Cellular-Target-Tx", humanBytes(sTgtUp))
+                if (sTgtDown > 0L) kv("Cellular-Target-Rx", humanBytes(sTgtDown))
+            }
         }
 
         section("APP")
@@ -1607,6 +1621,19 @@ class MainActivity : AppCompatActivity() {
         // "wifi_fallback" when the relay is up but no Wi-Fi held (sockets
         // fall through to cellular). See ProxyService.writeConnInfo.
         val wifiReturnStatus = connInfo.getOrNull(8).orEmpty()
+        // Fields 12-17 — Wi-Fi return session byte counters (schema v2+).
+        // wifiUp/wifiDown = bytes traversed the relay upstream socket while
+        // bound to Wi-Fi (the savings); fallbackUp/fallbackDown = bytes
+        // through the relay when no Wi-Fi was held (no savings); targetUp/
+        // targetDown = bytes the native agent dialed to/from target hosts
+        // (cellular when process bind is active). getOrNull keeps the read
+        // forward-compat against older proxies that wrote fewer fields.
+        val sessWifiUp = connInfo.getOrNull(12)?.toLongOrNull() ?: 0L
+        val sessWifiDown = connInfo.getOrNull(13)?.toLongOrNull() ?: 0L
+        val sessFallbackUp = connInfo.getOrNull(14)?.toLongOrNull() ?: 0L
+        val sessFallbackDown = connInfo.getOrNull(15)?.toLongOrNull() ?: 0L
+        val sessTargetUp = connInfo.getOrNull(16)?.toLongOrNull() ?: 0L
+        val sessTargetDown = connInfo.getOrNull(17)?.toLongOrNull() ?: 0L
 
         val running = proxyState == "running" || proxyState == "starting"
         val configured = hasConnectionConfig()
@@ -1702,7 +1729,12 @@ class MainActivity : AppCompatActivity() {
                 // proving split routing works. Both populate from
                 // conn_info field 8 + wifi_info.json (cached on disk by
                 // ProxyService).
-                updateWifiReturnPanel(wifiReturnStatus)
+                updateWifiReturnPanel(
+                    wifiReturnStatus,
+                    sessWifiUp, sessWifiDown,
+                    sessFallbackUp, sessFallbackDown,
+                    sessTargetUp, sessTargetDown,
+                )
                 // Refresh charts at most every 30s — they cover 24h, sub-minute updates
                 // are visually pointless and re-reading the JSONL on every tick wastes IO.
                 val nowMs = System.currentTimeMillis()
@@ -1749,13 +1781,20 @@ class MainActivity : AppCompatActivity() {
     //   "split_failed"  — self-test rejected the relay. Red, sticky.
     //                     Detail shows last known IPs from wifi_info.json
     //                     when available, with a clear "ignored" note.
-    private fun updateWifiReturnPanel(status: String) {
+    private fun updateWifiReturnPanel(
+        status: String,
+        wifiUp: Long, wifiDown: Long,
+        fallbackUp: Long, fallbackDown: Long,
+        targetUp: Long, targetDown: Long,
+    ) {
         val viaView = pagerRefs.tvUplinkVia ?: return
         val detailView = pagerRefs.tvUplinkDetail ?: return
+        val sessView = pagerRefs.tvSessionTraffic
 
         if (status.isEmpty()) {
             viaView.visibility = View.GONE
             detailView.visibility = View.GONE
+            sessView?.visibility = View.GONE
             return
         }
 
@@ -1820,6 +1859,71 @@ class MainActivity : AppCompatActivity() {
                 detailView.visibility = View.GONE
             }
         }
+
+        // Session traffic line. Shown only when the relay is up in any
+        // capacity (not "split_failed" — relay is dead there) and at
+        // least one counter is non-zero. Format examples:
+        //   "Session: Wi-Fi ↑12.4M ↓48.1M · Cell ↑8.2M ↓2.1M · saved 60.5M"
+        //   "Session: Cell-fallback ↑5.0M ↓20.1M · target ↑8.2M ↓2.1M"  (relay in fallback)
+        //   "Session: target ↑8.2M ↓2.1M"  (split_failed — only target counter meaningful)
+        if (sessView != null) {
+            val showSession = status != "" && (
+                wifiUp + wifiDown + fallbackUp + fallbackDown + targetUp + targetDown > 0L
+            )
+            if (!showSession) {
+                sessView.visibility = View.GONE
+            } else {
+                sessView.visibility = View.VISIBLE
+                sessView.text = formatSessionTrafficLine(
+                    status, wifiUp, wifiDown, fallbackUp, fallbackDown, targetUp, targetDown,
+                )
+                // Match the colour of the main status line so the block reads
+                // as one — cyan for healthy, amber for warning, red for split_failed.
+                sessView.setTextColor(when (status) {
+                    "wifi" -> 0xFF88FFAA.toInt()
+                    "wifi_fallback", "leak_known" -> 0xFFFFCC66.toInt()
+                    "split_failed" -> 0xFFFF9999.toInt()
+                    else -> 0xFF88FFAA.toInt()
+                })
+            }
+        }
+    }
+
+    // Builds the session-traffic widget line. Suppresses zero blocks so
+    // the line stays compact (e.g. when relay is in fallback the Wi-Fi
+    // counters are 0 — we drop them and just show fallback + target).
+    private fun formatSessionTrafficLine(
+        status: String,
+        wifiUp: Long, wifiDown: Long,
+        fallbackUp: Long, fallbackDown: Long,
+        targetUp: Long, targetDown: Long,
+    ): String {
+        val parts = mutableListOf<String>()
+        if (wifiUp + wifiDown > 0L) {
+            parts.add("Wi-Fi ↑${humanBytesCompact(wifiUp)} ↓${humanBytesCompact(wifiDown)}")
+        }
+        if (fallbackUp + fallbackDown > 0L) {
+            parts.add("Cell-fb ↑${humanBytesCompact(fallbackUp)} ↓${humanBytesCompact(fallbackDown)}")
+        }
+        if (targetUp + targetDown > 0L) {
+            parts.add("target ↑${humanBytesCompact(targetUp)} ↓${humanBytesCompact(targetDown)}")
+        }
+        val main = parts.joinToString(" · ")
+        // Only show "saved" when the relay actually rode Wi-Fi for some
+        // bytes. In fallback or split_failed there's nothing saved.
+        val saved = wifiUp + wifiDown
+        val tail = if (saved > 0L && status == "wifi") "  ·  saved ${humanBytesCompact(saved)}" else ""
+        return "Session: $main$tail"
+    }
+
+    // Compact "12.4M" / "768K" / "503" formatter for the widget line.
+    // Keeps each leg short so 4 of them fit on a phone width without wrap.
+    private fun humanBytesCompact(n: Long): String {
+        if (n < 1024) return n.toString()
+        if (n < 1024 * 1024) return "${(n + 512) / 1024}K"
+        val mb = n.toDouble() / (1024.0 * 1024.0)
+        return if (mb >= 100) "%.0fM".format(Locale.US, mb)
+            else "%.1fM".format(Locale.US, mb)
     }
 
     // Builds the headline link description: "↺ uplink: Wi-Fi · 433 Mbps ·

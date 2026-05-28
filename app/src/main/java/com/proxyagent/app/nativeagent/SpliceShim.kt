@@ -211,8 +211,21 @@ internal class SpliceShim {
          * On false the caller MUST fall back to a userspace copy. Once
          * splice has moved any bytes, this method commits to it — never
          * returns false mid-stream.
+         *
+         * [onBytes] (optional) is invoked exactly once on a successful
+         * splice with the total byte count the kernel reported moving
+         * for this direction. This is how the host wires per-direction
+         * accounting (targetUp vs targetDown in NativeProxyAgent) into
+         * the zero-copy path — without it the splice fast path silently
+         * undercounts because no JVM-side write barrier ever fires.
+         * Not called on fallback paths; the caller's NIO loop accounts
+         * those itself.
          */
-        fun copy(src: SocketChannel, dst: SocketChannel): Boolean {
+        fun copy(
+            src: SocketChannel,
+            dst: SocketChannel,
+            onBytes: ((Long) -> Unit)? = null,
+        ): Boolean {
             if (!ensureLoaded()) {
                 tunnelsFallback.incrementAndGet()
                 logFallbackOnce("library_not_loaded")
@@ -302,6 +315,14 @@ internal class SpliceShim {
             tunnelsSpliced.incrementAndGet()
             if (result > 0) {
                 totalSplicedBytes.addAndGet(result)
+                // Per-call callback so the caller can route this number
+                // into its own direction-aware counter (NativeProxyAgent
+                // does targetUp / targetDown via bridge()). Wrapped in
+                // try/catch so a buggy host doesn't crash the bridge —
+                // splice already succeeded, accounting is best-effort.
+                if (onBytes != null) {
+                    try { onBytes(result) } catch (_: Throwable) {}
+                }
             }
             return true
         }

@@ -25,12 +25,10 @@ display the active transport in the status card.
 | Artifact | Role in the APK | Path in the repo |
 | --- | --- | --- |
 | `proxy-agent-linux-arm64` | `libproxyagent.so` for arm64-v8a (native executable launched by `ProxyService` via `Runtime.exec`) | `app/src/main/jniLibs/arm64-v8a/libproxyagent.so` |
-| `proxy-agent-linux-x86` | `libproxyagent.so` for x86 | `app/src/main/jniLibs/x86/libproxyagent.so` |
-| `proxyagent.aar` | gomobile AAR with the in-process engine (`proxyagent.sdk.agent.Agent`), wired in via the `fileTree` dependency in `app/build.gradle.kts` | `app/libs/proxyagent.aar` |
 
 ## How to update
 
-1. Drop the three new files into the repository root (file names must match
+1. Drop the new file into the repository root (file name must match
    the "Artifact" column).
 2. Copy them to the target paths from the table above — the root files are
    not seen by the build; they only serve as a "fresh slot" for the next
@@ -49,17 +47,6 @@ agent logs or extending the integration.
   honors `SIGINT`/`SIGTERM`. No positional args. Minimum invocations:
   - Balancer: `proxy-agent -balancer_host=H -balancer_port=P -agent_key=K`
   - Direct:   `proxy-agent -registrator_host=H -registrator_port=P -agent_key=K`
-- **gomobile AAR** built from `pkg/agent` (`make android` →
-  `gomobile bind -javapkg=proxyagent.sdk -o proxyagent.aar ./pkg/agent`).
-  Java class is `proxyagent.sdk.agent.Agent` with static methods:
-  `startAgent()`, `stopAgent()`, `getStatus()` (returns `AgentStatus`
-  with `running`, `healthy`, `registratorConnected`, `registratorHost`,
-  `registratorPort`, `lastError`, `startedAt`, `uptime`), `setDNSServers`,
-  `clearDNSServers`, plus env-shim setters `setBalancer(host, port)`,
-  `setAgentKey`, `setFallbackURL`, `setEnableNetAgent`
-  (`pkg/agent/bind_config.go`). The shims exist because gomobile callers'
-  `android.system.Os.setenv` bypasses Go's cached `runtime.envs` — see
-  Android §4 for the consequence.
 
 ### 2. Configuration
 
@@ -199,31 +186,25 @@ All logs go to stdout in slog text format
 
 ### 1. Build wiring
 
-- `app/src/main/jniLibs/{arm64-v8a,x86}/libproxyagent.so`: AGP's default
-  jniLibs source set ships it at `lib/<abi>/libproxyagent.so` in the APK;
-  the installer extracts to `applicationInfo.nativeLibraryDir` (because
-  of the `lib*.so` name — the file is a standalone Linux ELF, never
-  `dlopen()`ed).
-- The .aar via a generic fileTree at `app/build.gradle.kts:70` —
-  anything in `app/libs/*.aar` is merged:
-
-  ```kotlin
-  implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar"))))
-  ```
-
-- No `abiFilters` (both ABIs ship). Only packaging tweak:
+- `app/src/main/jniLibs/arm64-v8a/libproxyagent.so`: AGP's default
+  jniLibs source set ships it at `lib/arm64-v8a/libproxyagent.so` in
+  the APK; the installer extracts to `applicationInfo.nativeLibraryDir`
+  (because of the `lib*.so` name — the file is a standalone Linux ELF,
+  never `dlopen()`ed).
+- `abiFilters = ["arm64-v8a"]` matches the single prebuilt
+  `libproxyagent.so` ABI. Only packaging tweak:
   `packaging.jniLibs.useLegacyPackaging = true`
   (`app/build.gradle.kts:55-59`) keeps `extractNativeLibs="true"` so
   the .so lands on disk for `exec()`.
 
 ### 2. Which artifact runs when
 
-User picks. Settings radio (`MainActivity.kt:287-289`, `rgEngine`)
-writes pref `engine` = `"binary"` (default) or `"aar"`, passed as
-Intent extra (`MainActivity.kt:827`) and dispatched at
-`ProxyService.kt:512-519` (`Engine.BINARY` → `runBinaryEngine`,
-`Engine.AAR` → `runAarEngine`). No custom `Application`;
-`MainActivity` only reads state files.
+User picks. Settings radio (`MainActivity.kt`, `rgEngine`) writes pref
+`engine` = `"native"` (default, pure-Kotlin port) or `"binary"`, passed
+as Intent extra and dispatched in `ProxyService.onStartCommand`
+(`Engine.NATIVE` → `runNativeEngine`, `Engine.BINARY` →
+`runBinaryEngine`). No custom `Application`; `MainActivity` only reads
+state files.
 
 ### 3. Subprocess launch (.so path)
 
@@ -244,26 +225,15 @@ Intent extra (`MainActivity.kt:827`) and dispatched at
   `destroy()`s with 2s grace then `destroyForcibly()`. Service runs in
   `:proxy` (`AndroidManifest.xml:80`), so app death kills the child.
 
-### 4. In-process engine (.aar path)
+### 4. In-process engine (NATIVE path)
 
-All in `runAarEngine` (`ProxyService.kt:622-738`):
+The Kotlin port of the SDK lives in
+`com.proxyagent.app.nativeagent.NativeProxyAgent`. Speaks the same TCP
+and QUIC wire protocol as the binary, runs entirely in the `:proxy`
+process — no subprocess, no Go runtime. Full lifecycle and config layout
+are documented in [ARCHITECTURE.md] §Agent engines.
 
-- Env set via `Os.setenv(..., true)` *before* Go loads, lowercase and
-  SCREAMING_SNAKE (`setBoth`, 631-634) — Go caches `runtime.envs` at
-  `JNI_OnLoad` and never re-reads.
-- `Class.forName("go.Seq")` + `setContext(ctx)` (682-684) triggers
-  `System.loadLibrary("gojni")`. `Class.forName("proxyagent.sdk.agent.Agent")`
-  (687) then reflective: `setAgentKey`, `setEnableNetAgent`;
-  balancer-only `setBalancer(host, port)` + `setFallbackURL`;
-  `setDNSServers`; `startAgent()` (729). Modem registrator config is
-  env-only at this AAR version (comment 717-718).
-- `stopAgent()` via reflection (866-867); `:proxy` suicides 400ms later
-  (912-917) because Go's env cache blocks clean in-process restart.
-- Native stdout/stderr captured via `Os.pipe()` + `Os.dup2(fd, 1/2)` in
-  `captureNativeOutput` (742-762), plus a `logcat … GoLog:V Go:V` tail
-  (764-781).
-
-### 5. Log parsing — `parseAgentLine` (`ProxyService.kt:177-276`)
+### 5. Log parsing — `parseAgentLine`
 
 We tail the binary's stdout line-by-line and recognise these patterns
 to drive app-side state. The reactions (state machine, `conn_info`

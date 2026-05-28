@@ -25,13 +25,13 @@ android {
         versionName = appVersionName
 
         // ABI filter for native libs. Matches the pre-built
-        // libproxyagent.so under app/src/main/jniLibs/<abi>/ so both
-        // our CMake-built libagentsplice.so and the Go binary cover
-        // the same architectures. Expand if/when the Go binary is
-        // rebuilt for armeabi-v7a / x86_64.
+        // libproxyagent.so under app/src/main/jniLibs/<abi>/ so our
+        // CMake-built libagentsplice.so and the Go binary cover the
+        // same architectures. Expand if/when the Go binary is rebuilt
+        // for additional ABIs.
         ndk {
             //noinspection ChromeOsAbiSupport
-            abiFilters += listOf("arm64-v8a", "x86")
+            abiFilters += listOf("arm64-v8a")
         }
 
         externalNativeBuild {
@@ -122,7 +122,6 @@ android {
 }
 
 dependencies {
-    implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar"))))
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")

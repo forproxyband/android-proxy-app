@@ -143,6 +143,35 @@ class NativeProxyAgent {
     )
     private val activeTunnels = AtomicInteger(0)
 
+    // Target-dial byte counters. These count what the agent shipped to /
+    // received from target hosts via its own dial — the "exit" leg of
+    // the proxy. When the host process is bound to cellular (which is
+    // what ProxyService does with bindProcessToNetwork when Wi-Fi return
+    // is on), this traffic egresses through cellular. Together with the
+    // WifiReturnRelay counters (which measure the agent↔registrator
+    // uplink) the four numbers let the UI show the full split:
+    //
+    //   relay wifiUp  ≈ targetUp   (request bytes through the agent)
+    //   relay wifiDown ≈ targetDown (response bytes back to clients)
+    //
+    // ProxyService polls these every 1s and surfaces them in conn_info.
+    private val targetUpBytes = java.util.concurrent.atomic.AtomicLong(0)
+    private val targetDownBytes = java.util.concurrent.atomic.AtomicLong(0)
+
+    /** Bytes sent FROM the local data socket TO the target host. Cellular
+     *  outbound when wifi_return is active. */
+    fun targetUpBytes(): Long = targetUpBytes.get()
+    /** Bytes received FROM the target host. Cellular inbound when
+     *  wifi_return is active. */
+    fun targetDownBytes(): Long = targetDownBytes.get()
+
+    // Called by Uplink.bridge* after each successful target-socket write.
+    // Direction is from the agent's POV:
+    //   addTargetUp(n)   — wrote n bytes TO the target (data → target)
+    //   addTargetDown(n) — read n bytes FROM the target (target → data)
+    internal fun addTargetUp(n: Long) { if (n > 0) targetUpBytes.addAndGet(n) }
+    internal fun addTargetDown(n: Long) { if (n > 0) targetDownBytes.addAndGet(n) }
+
     // Process-wide DNS override; thread-safe.
     private val dnsConfig = DnsConfig()
 
@@ -1403,22 +1432,26 @@ internal class Uplink(
      *  FIN, then close both ends so the OTHER copier exits via
      *  IOException on its read. */
     private fun bridge(a: SocketChannel, b: SocketChannel) {
-        // Wait for BOTH directions, not just the first. With a latch
-        // of 1 the first half-close (e.g. PC ends an upload-only
-        // payload) tripped the await and the close() pair below would
-        // tear the still-draining download direction down mid-flight.
-        // Matches Go's bridge in proxy-agent-sdk-go/.../uplink.go
-        // which receives from `done` twice before deferring Close().
+        // a = data channel (loopback to relay), b = target channel (cellular).
+        // Counter direction follows the agent's view of the target:
+        //   a → b = client→target (targetUp)
+        //   b → a = target→client (targetDown)
+        // Splice fast path inside copyChannel bypasses userspace entirely
+        // and won't tick the counter — known undercount on heavy paths.
+        // The NIO fallback (when splice unavailable or rejected) does
+        // account every byte. The WifiReturnRelay counters at the relay
+        // pipe always count, so the widget has a reliable Wi-Fi baseline
+        // even when target counters under-report.
         val done = java.util.concurrent.CountDownLatch(2)
         bridgeExecutor.execute {
             try {
-                copyChannel(a, b)
+                copyChannel(a, b, onBytes = { n -> agent.addTargetUp(n) })
                 try { b.socket().shutdownOutput() } catch (_: Throwable) {}
             } catch (_: Throwable) {} finally { done.countDown() }
         }
         bridgeExecutor.execute {
             try {
-                copyChannel(b, a)
+                copyChannel(b, a, onBytes = { n -> agent.addTargetDown(n) })
                 try { a.socket().shutdownOutput() } catch (_: Throwable) {}
             } catch (_: Throwable) {} finally { done.countDown() }
         }
@@ -1443,8 +1476,18 @@ internal class Uplink(
      *  SpliceShim.copy commits to splice once any bytes have moved —
      *  it never returns false mid-stream, so the fallback only runs
      *  when zero bytes were transferred (safe to retry). */
-    private fun copyChannel(src: SocketChannel, dst: SocketChannel) {
-        if (SpliceShim.copy(src, dst)) return
+    private fun copyChannel(
+        src: SocketChannel,
+        dst: SocketChannel,
+        onBytes: ((Long) -> Unit)? = null,
+    ) {
+        // Splice fast path: zero-copy in the kernel. Bytes never enter
+        // userspace, but the native side counts them and SpliceShim
+        // surfaces the total via its `onBytes` callback — we forward it
+        // straight through to the caller's accounting hook. So both the
+        // splice path and the NIO fallback feed the same counter without
+        // the host needing to know which one fired.
+        if (SpliceShim.copy(src, dst, onBytes)) return
         val buf = ByteBuffer.allocateDirect(NativeProxyAgent.BRIDGE_BUFFER_BYTES)
         while (true) {
             buf.clear()
@@ -1457,6 +1500,7 @@ internal class Uplink(
             while (buf.hasRemaining()) {
                 dst.write(buf)
             }
+            onBytes?.invoke(n.toLong())
         }
     }
 
@@ -1513,6 +1557,10 @@ internal class Uplink(
         try { done.await() } catch (_: InterruptedException) {}
         try { sock.close() } catch (_: Throwable) {}
         try { output.close() } catch (_: Throwable) {}
+        // Roll per-tunnel counts into the agent-wide totals (target dials,
+        // i.e. cellular traffic when wifi_return is on).
+        agent.addTargetUp(upBytes.get())
+        agent.addTargetDown(downBytes.get())
         agent.logInfo("tunnel closed", "up" to upBytes.get(), "down" to downBytes.get())
     }
 

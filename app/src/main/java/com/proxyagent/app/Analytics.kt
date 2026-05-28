@@ -14,14 +14,36 @@ import java.util.TimeZone
 // whole files) and crash-tolerant (only the last partial line is ever lost).
 data class AnalyticsBucket(
     val tMs: Long,            // bucket start
-    val rxBytes: Long,        // bytes received during bucket
-    val txBytes: Long,        // bytes sent during bucket
+    val rxBytes: Long,        // total bytes received (UID-wide via TrafficStats)
+    val txBytes: Long,        // total bytes sent (UID-wide via TrafficStats)
     val opens: Int,           // tunnels opened during bucket
     val closes: Int,          // tunnels closed during bucket
     val peakTunnels: Int,     // max active tunnels at any sample
     val registrator: String,  // best-known registrator at bucket end
     val natIp: String,        // best-known public IP at bucket end
     val transport: String,    // CELLULAR / WIFI / ETHERNET / ...
+    // Wi-Fi return split tracking. Optional (default 0). Written only
+    // when the relay was alive at tick() time — i.e. wifi_return is
+    // opt-in and these fields stay zero in every bucket while the
+    // feature is off. fromJsonLine fills them as 0 for pre-feature
+    // buckets too (forward-compat). When the relay is alive:
+    //   wifi* = bytes that traversed the relay's upstream socket
+    //           while bound to Wi-Fi (the real mobile-data savings)
+    //   cell* = bytes that flowed through cellular: native agent
+    //           target dials (always cellular when process bind is
+    //           on) PLUS relay fallback bytes (when wifiNet was null
+    //           and the relay routed through the default route)
+    // Sum (wifi+cell) ≈ rx/tx with a small gap = TCP/QUIC headers,
+    // AUTH handshake, heartbeat bytes our counters don't track.
+    // When wifi_return is off, per-UID TrafficStats (rx/tx) still
+    // gives the total, but we deliberately don't try to guess the
+    // split — without bindProcessToNetwork(cellular) we don't know
+    // which side of the wire any byte traversed, and pretending we
+    // do would put garbage in the analytics.
+    val wifiRxBytes: Long = 0L,
+    val wifiTxBytes: Long = 0L,
+    val cellRxBytes: Long = 0L,
+    val cellTxBytes: Long = 0L,
 ) {
     fun toJsonLine(): String {
         val o = JSONObject()
@@ -34,6 +56,10 @@ data class AnalyticsBucket(
         if (registrator.isNotEmpty()) o.put("reg", registrator)
         if (natIp.isNotEmpty()) o.put("nat", natIp)
         if (transport.isNotEmpty()) o.put("tr", transport)
+        if (wifiRxBytes != 0L) o.put("wrx", wifiRxBytes)
+        if (wifiTxBytes != 0L) o.put("wtx", wifiTxBytes)
+        if (cellRxBytes != 0L) o.put("crx", cellRxBytes)
+        if (cellTxBytes != 0L) o.put("ctx", cellTxBytes)
         return o.toString()
     }
 
@@ -51,6 +77,10 @@ data class AnalyticsBucket(
                     registrator = o.optString("reg", ""),
                     natIp = o.optString("nat", ""),
                     transport = o.optString("tr", ""),
+                    wifiRxBytes = o.optLong("wrx", 0L),
+                    wifiTxBytes = o.optLong("wtx", 0L),
+                    cellRxBytes = o.optLong("crx", 0L),
+                    cellTxBytes = o.optLong("ctx", 0L),
                 )
             } catch (_: Throwable) { null }
         }

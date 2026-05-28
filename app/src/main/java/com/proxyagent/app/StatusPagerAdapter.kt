@@ -32,6 +32,9 @@ class StatusPagerAdapter(
         // after a successful split-routing self-test (wifi_info.json
         // present with test_result=SUCCESS).
         var tvUplinkDetail: TextView? = null
+        // Session-lifetime byte counters split by interface (Wi-Fi via
+        // relay vs cellular via target dials). Hidden when relay is off.
+        var tvSessionTraffic: TextView? = null
 
         var trafficRoot: View? = null
         var trafficTitle: TextView? = null
@@ -64,6 +67,7 @@ class StatusPagerAdapter(
                 refs.tvActivity = v.findViewById(R.id.tvActivity)
                 refs.tvUplinkVia = v.findViewById(R.id.tvUplinkVia)
                 refs.tvUplinkDetail = v.findViewById(R.id.tvUplinkDetail)
+                refs.tvSessionTraffic = v.findViewById(R.id.tvSessionTraffic)
                 VH(v)
             }
             1 -> {

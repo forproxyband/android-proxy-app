@@ -1,13 +1,13 @@
 # App architecture
 
 How `ProxyService` + `MainActivity` orchestrate the proxy-agent runtime
-and expose state to the user. Three engines are supported (see
+and expose state to the user. Two engines are supported (see
 [Agent engines](#agent-engines) below): **NATIVE** (default, pure-Kotlin
-port at `app/src/main/java/com/proxyagent/app/nativeagent/`), **BINARY**
-(bundled `.so` subprocess — see [BINARIES.md]), and **AAR** (gomobile
-in-process). The three speak the same wire protocol to the registrator
-infrastructure; the choice trades off startup cost, subprocess
-isolation, and Wi-Fi-return compatibility.
+port at `app/src/main/java/com/proxyagent/app/nativeagent/`) and
+**BINARY** (bundled `.so` subprocess — see [BINARIES.md]). Both speak
+the same wire protocol to the registrator infrastructure; the choice
+trades off startup cost, subprocess isolation, and Wi-Fi-return
+compatibility.
 
 [BINARIES.md]: ./BINARIES.md
 
@@ -21,14 +21,11 @@ isolation, and Wi-Fi-return compatibility.
   `filesDir`; UI → service uses `startService` with Intent extras
   and `action=STOP`. No Binder, no LocalBroadcastManager, no shared
   Application.
-- Reconfig = stop-and-restart (`MainActivity.kt:374-379`). The Go
-  runtime in the AAR engine caches env at `JNI_OnLoad` and can't be
-  cleanly re-initialised in-process, which forces the same
-  stop-and-restart contract on the binary and native engines for
-  consistency. (The native engine could in principle be reconfigured
-  in-place — `NativeProxyAgent.start(Config)` accepts a fresh config —
-  but we keep the same contract so the UI layer doesn't have to
-  fork per engine.)
+- Reconfig = stop-and-restart. The BINARY engine forks a subprocess
+  so any env change requires a fresh exec; the NATIVE engine could in
+  principle be reconfigured in-place (`NativeProxyAgent.start(Config)`
+  accepts a fresh config) but we keep the same contract so the UI
+  layer doesn't have to fork per engine.
 
 ## State files in `filesDir`
 
@@ -43,6 +40,7 @@ isolation, and Wi-Fi-return compatibility.
 | `speed_units` | UI | text | `bits`/`bytes` for rate display. |
 | `cycle_cfg.json` | UI writes, both read | JSON | Cross-process mirror of the cycle settings (`apn_swap`, `imei_rotate`, `imei_method`, `imei_cmd`). SharedPreferences are per-process — the REBOOT auto-cycle in `:proxy` would otherwise miss toggle changes made in `:main`. Rewritten on every settings save and re-mirrored on app launch as a back-fill. |
 | `analytics/cycle_events.jsonl` | both write | JSONL | One row per rotation attempt with old/new IP, success flag, attempts and duration. Read by the swipe-panel chart, the analytics screen, and the CSV export. Pruned by the same retention policy as bucket files. |
+| `analytics/<yyyy-MM-dd>.jsonl` | service writes | JSONL | One per-minute `AnalyticsBucket` row per active minute. Keys: `t` (start ms), `rx/tx` (UID-wide TrafficStats deltas — always present and correct regardless of wifi_return state), `op/cl/pk` (tunnel events), `reg/nat/tr` (last-known registrator / public IP / default transport). When Wi-Fi return is **opt-in active** (relay alive at tick time), four extra keys appear: `wrx/wtx` (relay's Wi-Fi-bound upstream bytes) and `crx/ctx` (native agent target-dial bytes + relay fallback bytes — both cellular by construction). The `wrx+wtx` sum across buckets ≈ "mobile data saved" for the period. When Wi-Fi return is **off**, those four keys stay zero (we don't have per-interface visibility without the relay's bind, and refuse to guess); `rx/tx` totals remain the source of truth. Optional keys are emitted only when non-zero; readers use `optLong("...", 0L)` for forward/backward compat. Pruned by retention policy at app launch. |
 | `wifi_info.json` | service | JSON | Latest Wi-Fi return split-routing self-test result + Wi-Fi link snapshot. Keys: `public_ip_wifi`, `public_ip_cell`, `public_ip_default` (process default route, used to detect target-dial leak), `link_speed_mbps`, `frequency_mhz`, `band` (`"2.4 GHz"`/`"5 GHz"`/`"6 GHz"`), `standard` (`"Wi-Fi 5 (802.11ac)"` etc.), `wifi_attached`, `test_result` (`SUCCESS`/`SAME_IP`/`LEAK_DETECTED`/`WIFI_PROBE_FAILED`/`CELL_PROBE_FAILED`/`BOTH_FAILED`), `test_detail`, `test_duration_ms`, `tested_at_ms`. Written by ProxyService after each self-test; read by MainActivity for the widget two-IP block and the log-export header. |
 | `was_running` | service | text (`"1"`) | Auto-restart breadcrumb. Written by `ProxyService.onStartCommand` after `startForeground` and **deleted by `doStop`**. Present-after-kill means the previous session ended unexpectedly (PACKAGE_REPLACED, low-memory kill); `PackageReplacedReceiver` gates auto-restart on this file so an intentional STOP doesn't get resurrected. See [Surviving an app update](#surviving-an-app-update). |
 | `ip_cycle_in_progress` | service | epoch ms (informational) | Crash-recovery breadcrumb for `IpCycle.cycleAndVerify`. Written on entry, deleted in `finally`. A leftover file at app launch means the rotation was killed mid-sequence and `recoverInterruptedCycle` should flip `airplane_mode_on` back to 0. See [IP rotation — interrupted-cycle recovery](#interrupted-cycle-recovery). |
@@ -51,7 +49,7 @@ isolation, and Wi-Fi-return compatibility.
 ## `conn_info` schema
 
 One pipe-delimited line written by `writeConnInfo`
-(`ProxyService.kt:198-227`). Twelve fields (0-indexed):
+(`ProxyService.kt:198-227`). Eighteen fields (0-indexed):
 
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
@@ -61,12 +59,18 @@ One pipe-delimited line written by `writeConnInfo`
 | 3 | `currentRegistrator` | string | `host:port` of the selected registrator. |
 | 4 | `activeTunnels` | int | Currently open tunnel count. |
 | 5 | `connectedSinceMs` | long | Epoch ms of last successful AUTH; 0 when not CONNECTED. |
-| 6 | `currentUplinkTransport` | string | One of: `QUIC` (all engines) / `TCP (splice)` (BINARY/AAR always, NATIVE when the kernel zero-copy shim activated) / `TCP (NIO)` (NATIVE when splice couldn't be used and the bridge fell back to NIO + DirectByteBuffer) / `TCP` (NATIVE momentary state between `uplink connected` and the first splice/fallback decision — usually invisible thanks to `SpliceShim.warmup()` resolving it before the supervisor dials) / `TCP+yamux` / `WebSocket` (legacy pre-2.0.14 SDKs). Added v2.0.14-quic; splice/NIO distinction added with the NATIVE engine. |
+| 6 | `currentUplinkTransport` | string | One of: `QUIC` (both engines) / `TCP (splice)` (BINARY always, NATIVE when the kernel zero-copy shim activated) / `TCP (NIO)` (NATIVE when splice couldn't be used and the bridge fell back to NIO + DirectByteBuffer) / `TCP` (NATIVE momentary state between `uplink connected` and the first splice/fallback decision — usually invisible thanks to `SpliceShim.warmup()` resolving it before the supervisor dials) / `TCP+yamux` / `WebSocket` (legacy pre-2.0.14 SDKs). Added v2.0.14-quic; splice/NIO distinction added with the NATIVE engine. |
 | 7 | `cycleStage` | string | Non-empty only during REBOOT auto-cycle. UI shows `ROTATING · <stage>`. Added with `IpCycle.cycleAndVerify` rework. |
 | 8 | `wifiReturnStatus` | string | `""` (relay off) / `"wifi"` (uplink on Wi-Fi, split routing verified) / `"wifi_fallback"` (relay up, no Wi-Fi held — flowing through cellular) / `"leak_known"` (BINARY engine: relay running for uplink savings, but target dials leak Wi-Fi IP — expected on BINARY) / `"split_failed"` (sticky: self-test rejected the relay on an in-process engine, relay disabled). UI maps to cyan / amber / amber-warning / red respectively. Added with Wi-Fi return relay. |
 | 9 | `heartbeatMs` | long | Wall-clock epoch ms of the most recent `writeConnInfo` call. Refreshed by the 1Hz status updater + on every transition. `MainActivity.readLiveProxyFiles` treats the file as stale when `now - heartbeatMs > STALE_CONN_INFO_MS` (5 s) — the writer is dead and the file is wiped so the UI doesn't keep showing fake CONNECTED + accumulating uptime. See [Surviving an app update](#surviving-an-app-update). |
 | 10 | `pid` | int | `android.os.Process.myPid()` of the writer. Debug aid: a pid in `conn_info` that doesn't match any live `ProxyService` process is direct proof the file is a leftover from a previous incarnation. Not currently consumed by code — readers gate on the heartbeat alone. |
-| 11 | `schemaVersion` | int | Layout version. v1 = first layout with fields 9–11. Not gated on (readers use positional `getOrNull(N)` for forward/backward compat); recorded so future readers could branch on layout if/when fields get dropped or reordered. |
+| 11 | `schemaVersion` | int | Layout version. v1 = + heartbeat/pid/schema (fields 9–11). v2 = + Wi-Fi return session byte counters (fields 12–17). Not gated on (readers use positional `getOrNull(N)` for forward/backward compat); recorded so future readers could branch on layout if/when fields get dropped or reordered. |
+| 12 | `wifiUpBytes` | long | Session-lifetime bytes sent through the relay's upstream socket **while bound to Wi-Fi** (the actual savings). Source: `WifiReturnRelay.wifiUpBytes()`. |
+| 13 | `wifiDownBytes` | long | Bytes received from the relay's upstream socket while bound to Wi-Fi (the "обратный трафик" — response data flowing back to clients). |
+| 14 | `fallbackUpBytes` | long | Bytes through the relay's upstream socket **while wifiNet was null** (relay accepted but routed through process default — typically cellular when process bind is on). No savings. |
+| 15 | `fallbackDownBytes` | long | Inbound counterpart of fallback. |
+| 16 | `targetUpBytes` | long | Bytes the native agent dialed *to* target hosts (cellular when process bind is active). From `NativeProxyAgent.targetUpBytes()`. Accurate on both fast paths: the NIO fallback ticks per `SocketChannel.read`, and `SpliceShim.copy` invokes a per-call `onBytes` callback with the kernel-reported total once the splice loop completes. So Wi-Fi return widget numbers are honest even when zero-copy is fully engaged. |
+| 17 | `targetDownBytes` | long | Inbound counterpart. Same accounting path. |
 
 `MainActivity.refresh()` polls every 3s, reads with `getOrNull(N)` so
 forward-compat survives older downgrades that write fewer fields. `|`
@@ -113,7 +117,7 @@ Backed by the dialog at `MainActivity.kt:278-408` (XML
 | --- | --- | --- | --- |
 | `mode` | string | `"modem"` | Connection mode dispatch — see below. |
 | `h`, `p`, `k`, `id`, `dns` | strings | — | Host, port, key, agent UUID, DNS overrides. |
-| `engine` | string | `"native"` | `"native"` (in-process Kotlin port — default), `"binary"` (subprocess `.so`), or `"aar"` (in-process gomobile). See [Agent engines](#agent-engines). |
+| `engine` | string | `"native"` | `"native"` (in-process Kotlin port — default) or `"binary"` (subprocess `.so`). See [Agent engines](#agent-engines). |
 | `speed_bytes` | bool | false | Rate display unit. |
 | `analytics_retention_days` | int | 30 | Older analytics buckets are pruned on app launch. |
 | `apn_swap` | bool | false | Enable APN swap fallback during cycle (see IP rotation §). |
@@ -125,14 +129,14 @@ Backed by the dialog at `MainActivity.kt:278-408` (XML
 
 ## Agent engines
 
-Three runtimes for the proxy-agent client live side-by-side in the
-APK, but **only NATIVE is production-viable**. BINARY and AAR are
-kept short-term for testing/comparison and will be removed once
-NATIVE has enough field hours. All three speak the same wire protocol
-(TCP/QUIC uplink with the `TUNL` magic-header framing, JSON-line
-control channel, 32-hex-byte per-stream tokens — see [BINARIES.md] §3
-for the byte-level details) so the registrator infrastructure pairs
-with any of them interchangeably. `engine` pref selects which one
+Two runtimes for the proxy-agent client live side-by-side in the
+APK, but **only NATIVE is production-viable**. BINARY is kept
+short-term for testing/comparison and will be removed once NATIVE
+has enough field hours. Both speak the same wire protocol (TCP/QUIC
+uplink with the `TUNL` magic-header framing, JSON-line control
+channel, 32-hex-byte per-stream tokens — see [BINARIES.md] §3 for
+the byte-level details) so the registrator infrastructure pairs
+with either interchangeably. `engine` pref selects which one
 `runX-Engine()` in `ProxyService.onStartCommand` dispatches to.
 
 **Why only NATIVE works for the full feature set:**
@@ -143,14 +147,8 @@ with any of them interchangeably. `engine` pref selects which one
   catches this as `LEAK_DETECTED`. Acceptable as a baseline modem
   client without Wi-Fi return, but the whole split-routing feature
   is off-limits.
-- **AAR** has a deeper reliability issue: Modem mode in this SDK
-  build doesn't even reach AUTH — log shows `no registrator
-  available; backing off` despite a verified `libc env check`. Root
-  cause is under investigation. Until that's resolved, AAR shouldn't
-  be assumed to work end-to-end in any mode.
 - **NATIVE** runs in `:proxy` so process bind sticks for target
-  dials; has no Go runtime to wrestle with (vs AAR's `JNI_OnLoad`
-  env caching, vs BINARY's subprocess pipes). Uses a tiny optional
+  dials; no Go runtime, no subprocess pipes. Uses a tiny optional
   JNI shim (`libagentsplice.so`, ~15 KiB per ABI) for the TCP
   zero-copy fast path; the agent runs fine without it too. Can be
   dropped into third-party apps as a small Kotlin module — see
@@ -159,8 +157,7 @@ with any of them interchangeably. `engine` pref selects which one
 | Engine | Where it lives | Process | Notes |
 | --- | --- | --- | --- |
 | `NATIVE` (default) | `app/src/main/java/com/proxyagent/app/nativeagent/` + `app/src/main/cpp/` | In-process (`:proxy`) | Pure-Kotlin port of the Go SDK. No subprocess, no Go runtime. Optional ~15 KiB JNI shim for kernel `splice(2)` zero-copy on the TCP fast path — automatic NIO fallback if the .so isn't present or fd extraction fails. Drop-in reusable in third-party apps — see [Drop-in for third-party apps](#drop-in-for-third-party-apps) below. |
-| `BINARY` | `proxy-agent-linux-{arm64,x86}` packed as `libproxyagent.so` (see [BINARIES.md]) | Subprocess via `ProcessBuilder` | Forked `:proxy` child runs the Go SDK as an unmanaged ELF; we parse its stdout. Wi-Fi return cannot bind it to cellular (`bindProcessToNetwork` doesn't survive `fork+exec`), so Wi-Fi-return target dials leak — UI shows `leak_known`. |
-| `AAR` | `proxyagent.aar` (gomobile-built) at repo root | In-process (`:proxy`) | Loaded via `Class.forName("proxyagent.sdk.agent.Agent")` after `Os.setenv` so the Go runtime sees our config at `JNI_OnLoad`. Cannot be cleanly re-initialised in-process — service kills `:proxy` on stop so the next start gets a fresh Go runtime. **Modem-mode reliability issue currently observed** — see the trade-off matrix at [Engine-vs-Wi-Fi-return trade-off matrix](#engine-vs-wi-fi-return-trade-off-matrix-current-sdk). |
+| `BINARY` | `proxy-agent-linux-arm64` packed as `libproxyagent.so` (see [BINARIES.md]) | Subprocess via `ProcessBuilder` | Forked `:proxy` child runs the Go SDK as an unmanaged ELF; we parse its stdout. Wi-Fi return cannot bind it to cellular (`bindProcessToNetwork` doesn't survive `fork+exec`), so Wi-Fi-return target dials leak — UI shows `leak_known`. |
 
 ### NATIVE engine — internal layout
 
@@ -538,7 +535,7 @@ The JNI shim is built by AGP's CMake integration. Relevant files:
   ≤ 15 KiB per ABI.
 - `app/build.gradle.kts` — `android.externalNativeBuild.cmake` block
   points at the CMakeLists; `defaultConfig.ndk.abiFilters` is
-  `["arm64-v8a", "x86"]` to match the pre-built `libproxyagent.so`
+  `["arm64-v8a"]` to match the pre-built `libproxyagent.so`
   in `app/src/main/jniLibs/`. `ndkVersion = "26.3.11579264"`,
   `cmake.version = "3.22.1"` — both pinned and matched in
   `.github/workflows/build.yml` so CI uses the same toolchain.
@@ -636,10 +633,10 @@ some splice activity is better than none.
 ### REBOOT path differences
 
 Server-initiated REBOOT arrives as a `{"command":"REBOOT","reason":"..."}`
-JSON line on the control channel in all three engines. The UI
-auto-cycle hook (`triggerAutoIpCycle`) is reachable from all three.
+JSON line on the control channel in both engines. The UI auto-cycle
+hook (`triggerAutoIpCycle`) is reachable from either.
 
-- **BINARY / AAR**: REBOOT is detected by parsing the SDK's
+- **BINARY**: REBOOT is detected by parsing the SDK's
   `"REBOOT received from registrator reason=..."` log line in
   `parseAgentLine`. The same line also drops out of the Go SDK's own
   log when it tears down the tunnel session for reconnect.
@@ -658,9 +655,9 @@ auto-cycle hook (`triggerAutoIpCycle`) is reachable from all three.
 
 ### Wi-Fi return engine gate
 
-`maybeStartWifiRelay` requires an in-process engine — NATIVE or AAR —
-because `ConnectivityManager.bindProcessToNetwork(cellular)` does not
-survive `fork+exec` into the BINARY subprocess. The settings dialog
+`maybeStartWifiRelay` requires the NATIVE in-process engine because
+`ConnectivityManager.bindProcessToNetwork(cellular)` does not survive
+`fork+exec` into the BINARY subprocess. The settings dialog
 auto-disables `rbEngineBinary` when the Wi-Fi-return checkbox is on
 and clamps `engine="native"` on save if the user somehow lands with
 `wifi_return=true && engine=binary` (e.g. stale dialog state or
@@ -729,25 +726,21 @@ import force-selects Modem (`MainActivity.kt:430, 438`).
 - **Modem (direct):** env `registrator_host`, `registrator_port`,
   optional `agent_uuid` for BINARY (subprocess reads its environment).
   NATIVE receives the same fields as typed `Config` constructor args
-  (`registratorHost`, `registratorPort`, `agentUuid`). AAR has no Java
-  setter for the modem path; modem config is env-only at the current
-  SDK version.
+  (`registratorHost`, `registratorPort`, `agentUuid`).
 - **Balancer:** env `balancer_host`, `balancer_port`,
   `fallback_file_url` for BINARY. NATIVE takes the same as `Config`
-  fields (`balancerHost`, `balancerPort`, `fallbackFileUrl`). AAR
-  also calls `Agent.setBalancer(host, port)` + `Agent.setFallbackURL`
-  to satisfy the explicit Java init contract.
+  fields (`balancerHost`, `balancerPort`, `fallbackFileUrl`).
 
-Fallback URL hard-coded across all three engines:
+Fallback URL hard-coded across both engines:
 `https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json`.
 
 ## App → agent commands
 
-There aren't any out-of-band channels for BINARY / AAR — the
-subprocess is read-only from our side (we only call `readLine()` on
-its stdout, never write to `outputStream`), and we don't run a local
-WebSocket client to consume the SDK's `LocalBroadcaster` REBOOT relay
-either. REBOOT is detected solely by parsing the binary's stdout (see
+There aren't any out-of-band channels for BINARY — the subprocess is
+read-only from our side (we only call `readLine()` on its stdout,
+never write to `outputStream`), and we don't run a local WebSocket
+client to consume the SDK's `LocalBroadcaster` REBOOT relay either.
+REBOOT is detected solely by parsing the binary's stdout (see
 [BINARIES.md] §5).
 
 The NATIVE engine adds typed in-process callbacks alongside the same
@@ -756,7 +749,7 @@ log-string interface — `setRebootListener` for REBOOT and
 sink and runs the lines through `parseAgentLine` so the UI behaviour
 stays identical across engines).
 
-Reconfig = stop-and-restart on all three engines.
+Reconfig = stop-and-restart on both engines.
 
 ## IP rotation — `IpCycle.cycleAndVerify`
 
@@ -943,13 +936,14 @@ same callback output to `tvStatus` directly via `runOnUiThread`.
 ## Wi-Fi return relay — `WifiReturnRelay`
 
 Optional split-routing layer added when `cycle_cfg.json.wifi_return=true`,
-the connection mode is Modem, **and the engine is in-process** (NATIVE
-or AAR — not BINARY). Lets the agent↔registrator uplink ride Wi-Fi
-while the agent→target dial keeps using cellular — preserving the
-mobile exit IP that clients see at the target, while removing the
-uplink relay traffic from the mobile data bill.
+the connection mode is Modem, **and the engine is NATIVE** (not BINARY,
+because BINARY's subprocess can't inherit the process-wide cellular bind).
+Lets the agent↔registrator uplink ride Wi-Fi while the agent→target dial
+keeps using cellular — preserving the mobile exit IP that clients see at
+the target, while removing the uplink relay traffic from the mobile data
+bill.
 
-### Why process binding is required (and why in-process engines only)
+### Why process binding is required (and why NATIVE only)
 
 The original v1 design relied on Android's default routing for "target
 dials should use cellular", with explicit `wifiNet.bindSocket` only for
@@ -975,11 +969,10 @@ the relay. After that:
 BINARY engine cannot safely use Wi-Fi return: its subprocess would
 always egress through Wi-Fi for target dials. UI auto-disables the
 BINARY radio when the user ticks the Wi-Fi-return box (and selects
-NATIVE if neither in-process engine is currently picked), the save
-handler clamps `engine="native"` if the user somehow saves with
-`engine="binary" && wifi_return=true`, and `maybeStartWifiRelay`
-has a final guard that bails out if it ever sees
-`engine == BINARY && wifi_return`.
+NATIVE), the save handler clamps `engine="native"` if the user
+somehow saves with `engine="binary" && wifi_return=true`, and
+`maybeStartWifiRelay` has a final guard that bails out if it ever
+sees `engine == BINARY && wifi_return`.
 
 ### Lifecycle
 
@@ -989,8 +982,8 @@ has a final guard that bails out if it ever sees
   availability checks happen before relay startup:
   1. `mode == Modem` (Balancer not supported).
   2. `cfg.wifi_return && cfg.wifi_return_method == "local_relay"`.
-  3. `engine != BINARY` (NATIVE or AAR — process binding doesn't
-     reach subprocesses).
+  3. `engine != BINARY` (only NATIVE — process binding doesn't reach
+     subprocesses).
   4. `bindProcessToCellularBlocking()` — requests
      `TRANSPORT_CELLULAR + INTERNET` Network, awaits with 10s
      `CountDownLatch`, calls `cm.bindProcessToNetwork(cellular)` on
@@ -1038,8 +1031,8 @@ are up *and the proxy's UID isn't bound to a specific network*.
 - **Construction**: `maybeStartWifiRelay(host, port)` in `ProxyService`
   reads `cycle_cfg.json`, returns either `(realHost, realPort)` (relay
   disabled) or `("127.0.0.1", localPort)` (relay up). Called once per
-  engine launch from `runNativeEngine`, `runBinaryEngine`, and
-  `runAarEngine` before config/env is composed.
+  engine launch from `runNativeEngine` and `runBinaryEngine` before
+  config/env is composed.
 - **Per-session**: a single `accept()` thread spawns two daemon pipe
   threads per accepted connection. Each session captures the current
   `wifiNet` at dial time — a later network change doesn't disturb the
@@ -1060,9 +1053,8 @@ are up *and the proxy's UID isn't bound to a specific network*.
   callback, unregisters the cellular callback registered for process
   binding, calls `bindProcessToNetwork(null)` to restore default
   routing, and lets in-flight pipe threads drain naturally on EOF.
-  On the AAR path the subsequent process kill cleans up anything
-  wedged. NATIVE doesn't need the process kill — stopping the agent
-  releases its sockets cleanly because there's no captured Go env.
+  Stopping the NATIVE agent releases its sockets cleanly; on BINARY
+  the subprocess teardown in `doStop` makes the SDK side hang up.
 
 ### Cellular network lifecycle — `bindProcessToCellularBlocking`
 
@@ -1105,14 +1097,12 @@ registrator's connection counter.
 |---|---|---|---|
 | **NATIVE + wifi_return** (default) | Wi-Fi (relay binds) | Cellular (process bind inherited) | Works correctly — native agent owns all socket creation in `:proxy`, so `bindProcessToNetwork(cellular)` sticks for target dials. Default for new installs. |
 | NATIVE (no wifi_return) | n/a | Cellular (single default route when no Wi-Fi held, else inherits default — usually Wi-Fi) | Baseline native path. No mobile-data savings; no IP leak as long as `wifi_return=false`. |
-| BINARY + wifi_return | Wi-Fi (via relay's explicit `bindSocket`) | **Wi-Fi (default route)** — subprocess doesn't inherit `bindProcessToNetwork(cellular)` | **Leaks Wi-Fi IP** to targets. Self-test reports `LEAK_DETECTED`; widget shows `leak_known` (amber); relay stays running for uplink mobile-data savings. UI nudges users toward NATIVE / AAR. |
+| BINARY + wifi_return | Wi-Fi (via relay's explicit `bindSocket`) | **Wi-Fi (default route)** — subprocess doesn't inherit `bindProcessToNetwork(cellular)` | **Leaks Wi-Fi IP** to targets. Self-test reports `LEAK_DETECTED`; widget shows `leak_known` (amber); relay stays running for uplink mobile-data savings. UI nudges users toward NATIVE. |
 | BINARY (no wifi_return) | n/a | Cellular (single default route) | Legacy modem path. No mobile-data savings; no IP leak. |
-| AAR + anything | — | — | **Non-functional in this SDK build.** A reproduced symptom on Modem mode (Xiaomi Redmi Note 5 / Android 9) is `no registrator available; backing off` despite a verified `libc env check`. Cause is suspected to be deeper than the Modem-specific `setRegistrator` gap originally hypothesised — under investigation. Do not assume AAR works in any mode until verified end-to-end. |
 
 `maybeStartWifiRelay` policy:
 - `engine == BINARY` → relay still starts (for uplink savings) but we skip `bindProcessToCellularBlocking` (process bind is meaningless when the consumer is a subprocess). The self-test's `LEAK_DETECTED` verdict translates to `wifiReturnStatus = "leak_known"`, not a hard disable.
-- `engine == NATIVE` or `AAR` → `bindProcessToCellularBlocking` must succeed before the relay starts. If it can't acquire cellular within 10s, we bail. Both engines run in-process so the bind sticks; NATIVE is the default and recommended path.
-- Note: there is **no** in-service guard against `engine=AAR + mode=Modem` despite that combination being broken — the SDK's backoff loop already surfaces the failure in logs, and adding a guard here would mask the diagnostic.
+- `engine == NATIVE` → `bindProcessToCellularBlocking` must succeed before the relay starts. If it can't acquire cellular within 10s, we bail. The agent runs in-process so the bind sticks; NATIVE is the default and recommended path.
 
 ### Split-routing self-test — `SplitRoutingSelfTest`
 
@@ -1183,17 +1173,12 @@ future engine experiments). Behaviour:
   flip back to the real upstream, `nativeAgent.stop()` makes the
   in-process supervisor return, and the outer respawn loop in
   `runNativeEngine` picks up the new effective host/port on its next
-  iteration. No service restart needed; no Go runtime to worry about.
+  iteration. No service restart needed.
 - **BINARY engine**: in-place rollback. `effectiveHost`/`effectivePort`
   (declared as `var` for this purpose) flip back to the real upstream;
   `agentProcess.destroy()` trips the runner's readLine EOF, which
   loops back to `ProcessBuilder` with the updated env. Subprocess
   reconnects directly to the registrator, no service restart needed.
-- **AAR engine**: can't roll back in-process (Go env is cached at
-  JNI_OnLoad). Calls `doStop("Wi-Fi return: split routing not
-  confirmed — disable the checkbox to use cellular directly")`. User
-  sees an auto-stopped notification with the reason, unticks the
-  checkbox, and starts again.
 
 The flag clears on next `doStop` / new service start — a fresh test
 runs on the new session.

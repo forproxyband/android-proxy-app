@@ -21,9 +21,10 @@ import java.util.concurrent.atomic.AtomicInteger
 //
 // Why this exists
 // ───────────────
-// The proxy-agent binary (or AAR engine) opens a single control TCP socket
-// to the registrator plus a pool of data sockets, and all per-client tunnel
-// traffic flows over those — both directions. On a stock setup those sockets
+// The proxy-agent binary (and the NATIVE Kotlin port) opens a single control
+// TCP socket to the registrator plus a pool of data sockets, and all
+// per-client tunnel traffic flows over those — both directions. On a stock
+// setup those sockets
 // ride whatever route Android picked as default; on a phone with both Wi-Fi
 // and cellular up, that's Wi-Fi (good for us, free of charge) UNLESS the
 // device went cellular-only for some reason, or the OS forced cellular
@@ -32,11 +33,10 @@ import java.util.concurrent.atomic.AtomicInteger
 // fall back to cellular and the agent stays connected.
 //
 // The Go binary doesn't have access to Android's Network API (it's a plain
-// Linux ELF, no JNI), and the AAR engine's Go side calls net.Dial without a
-// way to ask Android "please bind this fd to network X". So we put a proxy
-// in between: SDK dials 127.0.0.1:<localPort>, we accept, we dial the real
-// registrator with the outgoing socket explicitly bound to the Wi-Fi Network,
-// then io.Copy in both directions. Two pipe threads per session.
+// Linux ELF, no JNI). So we put a proxy in between: SDK dials
+// 127.0.0.1:<localPort>, we accept, we dial the real registrator with the
+// outgoing socket explicitly bound to the Wi-Fi Network, then io.Copy in
+// both directions. Two pipe threads per session.
 //
 // Fallback behavior
 // ─────────────────
@@ -79,10 +79,40 @@ class WifiReturnRelay(
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var acceptThread: Thread? = null
 
-    // Per-session activity stats (best-effort, debug visibility only). We
-    // don't surface these through conn_info — the user-facing rx/tx already
-    // come from TrafficStats and double-count irrelevantly anyway.
+    // Per-session activity stats (best-effort, debug visibility only).
     private val activeSessions = AtomicInteger(0)
+
+    // Session-level byte counters. Split four ways so the UI can show
+    // exactly what the relay routed via each interface:
+    //
+    //   wifi*  — bytes that traversed the upstream socket while wifiNet
+    //            was non-null at dial time, i.e. genuinely on the Wi-Fi
+    //            interface (relay's mobile-data savings).
+    //   fallback*  — bytes routed via the process default route (cellular
+    //            when bindProcessToNetwork is active) because the relay
+    //            couldn't acquire a Wi-Fi Network at dial time. Still
+    //            counts as "through the relay", but no savings.
+    //
+    // Direction is named from the relay's POV facing the registrator:
+    //   *Up   — local (loopback from SDK) → upstream socket
+    //           = bytes the agent SENT to the registrator
+    //   *Down — upstream socket → local
+    //           = bytes the agent RECEIVED from the registrator (this is
+    //             the "обратный трафик" — response data flowing back to
+    //             clients through the tunnel)
+    //
+    // Counters are session-lifetime (reset on relay restart). ProxyService
+    // exposes them in conn_info fields 9-12 every 1s for the widget +
+    // logs.
+    @Volatile private var wifiUpBytes = java.util.concurrent.atomic.AtomicLong(0)
+    @Volatile private var wifiDownBytes = java.util.concurrent.atomic.AtomicLong(0)
+    @Volatile private var fallbackUpBytes = java.util.concurrent.atomic.AtomicLong(0)
+    @Volatile private var fallbackDownBytes = java.util.concurrent.atomic.AtomicLong(0)
+
+    fun wifiUpBytes(): Long = wifiUpBytes.get()
+    fun wifiDownBytes(): Long = wifiDownBytes.get()
+    fun fallbackUpBytes(): Long = fallbackUpBytes.get()
+    fun fallbackDownBytes(): Long = fallbackDownBytes.get()
 
     fun start(): Int {
         if (!running.compareAndSet(false, true)) {
@@ -144,10 +174,9 @@ class WifiReturnRelay(
         unregisterWifiCallback()
         // We don't actively kill open sessions: io.Copy threads will exit
         // naturally when either side closes. The ServerSocket close stops
-        // new accepts; existing flows drain. If something is wedged, the
-        // process death on doStop()→killProcess (AAR path) cleans up; on
-        // BINARY path the subprocess is destroyed first which makes the
-        // local side hang up too.
+        // new accepts; existing flows drain. On BINARY the subprocess is
+        // destroyed first which makes the local side hang up too; on
+        // NATIVE the supervisor stop closes the SDK-side socket.
         acceptThread?.interrupt()
         acceptThread = null
     }
@@ -181,9 +210,17 @@ class WifiReturnRelay(
                     try { client.close() } catch (_: Throwable) {}
                     return@Thread
                 }
-                val via = if (net != null) "wifi" else "default"
+                val viaWifi = net != null
+                val via = if (viaWifi) "wifi" else "default"
                 activeSessions.incrementAndGet()
                 log("session $sid: connected via $via (active=${activeSessions.get()})")
+
+                // Pick the right counter pair for this session. The "via"
+                // label captured at dial time wins for the whole session —
+                // even if wifiNet flips later, the existing sockets stay
+                // on whatever network they were bound to at connect().
+                val upCounter = if (viaWifi) wifiUpBytes else fallbackUpBytes
+                val downCounter = if (viaWifi) wifiDownBytes else fallbackDownBytes
 
                 // Two pipe threads. Both close BOTH sockets on EOF/error so
                 // we never leak half-open state — the SDK's own retry loop
@@ -192,10 +229,10 @@ class WifiReturnRelay(
                     try { client.close() } catch (_: Throwable) {}
                     try { upstream.close() } catch (_: Throwable) {}
                 }
-                // local → upstream
+                // local → upstream (SDK sending data to the registrator)
                 Thread {
                     try {
-                        pipe(client, upstream)
+                        pipe(client, upstream, upCounter)
                     } catch (_: Throwable) {
                     } finally {
                         closeBoth()
@@ -207,10 +244,10 @@ class WifiReturnRelay(
                     isDaemon = true
                     start()
                 }
-                // upstream → local (this thread; saves one Thread object per
-                // session vs. spawning two and joining)
+                // upstream → local (server sending response data back —
+                // this is the "обратный трафик" the feature exists for).
                 try {
-                    pipe(upstream, client)
+                    pipe(upstream, client, downCounter)
                 } catch (_: Throwable) {
                 } finally {
                     closeBoth()
@@ -273,7 +310,9 @@ class WifiReturnRelay(
     // and is what java.io BufferedStream defaults to internally on Android.
     // We don't use NIO because the volume here is per-client request/reply
     // bursts, not high-fanout — the simplicity is worth more than the wins.
-    private fun pipe(src: Socket, dst: Socket) {
+    // Counter is incremented after each successful write so partial reads
+    // never inflate the number.
+    private fun pipe(src: Socket, dst: Socket, counter: java.util.concurrent.atomic.AtomicLong) {
         val input = src.getInputStream()
         val output = dst.getOutputStream()
         val buf = ByteArray(16 * 1024)
@@ -287,30 +326,41 @@ class WifiReturnRelay(
             }
             output.write(buf, 0, n)
             output.flush()
+            counter.addAndGet(n.toLong())
         }
     }
 
     // ── Wi-Fi acquisition ───────────────────────────────────────────────
     private fun registerWifiCallback() {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        // Request VALIDATED Wi-Fi specifically (API 23+). Without VALIDATED
-        // we'd grab captive-portal Wi-Fi that fails for real HTTP, and the
-        // relay would silently funnel uplink into a dead network. The
-        // capability constant only exists from M onwards — on L (API 21–22)
-        // we fall back to a vanilla Wi-Fi+INTERNET request. On Lollipop the
-        // OS doesn't surface a validation signal anyway, so this is the
-        // closest equivalent.
-        val reqBuilder = NetworkRequest.Builder()
+        // IMPORTANT: requestNetwork() forbids NET_CAPABILITY_VALIDATED in
+        // the NetworkRequest itself — it's a system-managed capability,
+        // only registerNetworkCallback() can filter on it. Earlier
+        // revisions of this file added VALIDATED here as a "captive-portal
+        // guard"; on every Android version that surfaced as
+        //   "Cannot request network with VALIDATED — relay will run on
+        //    default route"
+        // which dropped wifiNet=null forever — uplink ran on the process
+        // default (cellular when bindProcessToNetwork is on, Wi-Fi
+        // otherwise) and the savings the whole feature exists for never
+        // happened. Reproduced on Xiaomi Redmi Note 5 / Android 9 with
+        // 1.0.102 — fix is to keep the request simple and check
+        // VALIDATED reactively in onCapabilitiesChanged.
+        val req = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-        if (Build.VERSION.SDK_INT >= 23) {
-            reqBuilder.addCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-        }
-        val req = reqBuilder.build()
+            .build()
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                wifiNet = network
-                log("Wi-Fi available: $network — new uplink connections will ride Wi-Fi")
+                // Don't claim it yet — wait for onCapabilitiesChanged to
+                // confirm VALIDATED (or for API 21–22 where we can't
+                // tell, accept on first sight). Avoids brief windows
+                // where we route through a captive-portal Wi-Fi that
+                // can't actually reach the registrator.
+                if (Build.VERSION.SDK_INT < 23) {
+                    wifiNet = network
+                    log("Wi-Fi available: $network (API<23, no validation signal — accepting blind)")
+                }
             }
             override fun onLost(network: Network) {
                 if (wifiNet == network) {
@@ -319,22 +369,23 @@ class WifiReturnRelay(
                 }
             }
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                // Pick up validation transitions: a network that's TRANSPORT_WIFI
-                // but loses VALIDATED (captive portal goes stale) should drop us
-                // off it; the inverse means a previously unvalidated Wi-Fi just
-                // passed the captive check. Validation tracking is API 23+.
+                // Primary acceptance / drop path (API 23+). A network that's
+                // TRANSPORT_WIFI + INTERNET + VALIDATED is good for our
+                // uplink. Losing VALIDATED (captive portal staled) means
+                // we should fall back to the process default until the
+                // OS revalidates or another Wi-Fi shows up.
                 val baseOk = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
                     caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
                 val validated = if (Build.VERSION.SDK_INT >= 23) {
                     caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
                 } else true   // L can't tell us; trust onAvailable.
                 val ok = baseOk && validated
-                if (ok && wifiNet == null) {
+                if (ok && wifiNet != network) {
                     wifiNet = network
-                    log("Wi-Fi validated: $network")
+                    log("Wi-Fi validated and bound: $network — new uplink connections will ride Wi-Fi")
                 } else if (!ok && wifiNet == network) {
                     wifiNet = null
-                    log("Wi-Fi de-validated: $network")
+                    log("Wi-Fi de-validated: $network — falling back to default route")
                 }
             }
         }

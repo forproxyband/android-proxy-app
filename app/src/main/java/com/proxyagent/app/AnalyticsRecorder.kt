@@ -11,16 +11,37 @@ import java.io.File
 // them to AnalyticsStore. Used inside ProxyService — single-threaded access
 // from the StatusUpdater thread + occasional onTunnel{Open,Close} from the
 // agent line parser, so all mutators are @Synchronized for safety.
-class AnalyticsRecorder(private val ctx: Context) {
+//
+// The four read* lambdas hook the recorder into the Wi-Fi return counters
+// (WifiReturnRelay + NativeProxyAgent) without a direct dependency. Recorder
+// just polls each tick and tracks deltas. When wifi_return is off (or the
+// counter source isn't wired) the lambdas return 0 and the corresponding
+// per-interface fields stay zero in the bucket — read by the Analytics
+// screen the same way as old buckets that pre-date the split.
+class AnalyticsRecorder(
+    private val ctx: Context,
+    private val readWifiRx: () -> Long = { 0L },
+    private val readWifiTx: () -> Long = { 0L },
+    private val readCellRx: () -> Long = { 0L },
+    private val readCellTx: () -> Long = { 0L },
+) {
 
     private val uid = android.os.Process.myUid()
 
     @Volatile private var bucketStartMs = floorToMinute(System.currentTimeMillis())
     @Volatile private var rxBaseline = currentRx()
     @Volatile private var txBaseline = currentTx()
+    @Volatile private var wifiRxBaseline = readWifiRx()
+    @Volatile private var wifiTxBaseline = readWifiTx()
+    @Volatile private var cellRxBaseline = readCellRx()
+    @Volatile private var cellTxBaseline = readCellTx()
 
     private var rxAccum = 0L
     private var txAccum = 0L
+    private var wifiRxAccum = 0L
+    private var wifiTxAccum = 0L
+    private var cellRxAccum = 0L
+    private var cellTxAccum = 0L
     private var opens = 0
     private var closes = 0
     private var peakTunnels = 0
@@ -103,6 +124,27 @@ class AnalyticsRecorder(private val ctx: Context) {
         rxBaseline = rxNow
         txBaseline = txNow
 
+        // Wi-Fi return per-interface deltas. Counters live on the relay
+        // and the native agent — if either is restarted (relay torn down
+        // when the user disables wifi_return mid-session, or native agent
+        // recreated on forceReconnect) the source jumps back to 0, so the
+        // raw (now-baseline) goes negative. coerceAtLeast(0) absorbs the
+        // discontinuity without poisoning the bucket — we drop the bytes
+        // that crossed the restart boundary, which under-counts by at
+        // most one tick's worth (≈1s of traffic).
+        val wifiRxNow = readWifiRx()
+        val wifiTxNow = readWifiTx()
+        val cellRxNow = readCellRx()
+        val cellTxNow = readCellTx()
+        wifiRxAccum += (wifiRxNow - wifiRxBaseline).coerceAtLeast(0)
+        wifiTxAccum += (wifiTxNow - wifiTxBaseline).coerceAtLeast(0)
+        cellRxAccum += (cellRxNow - cellRxBaseline).coerceAtLeast(0)
+        cellTxAccum += (cellTxNow - cellTxBaseline).coerceAtLeast(0)
+        wifiRxBaseline = wifiRxNow
+        wifiTxBaseline = wifiTxNow
+        cellRxBaseline = cellRxNow
+        cellTxBaseline = cellTxNow
+
         // Flush whenever wall clock has moved past the open bucket. Handles
         // long sleeps (>1 min) by flushing once and starting a fresh bucket.
         val now = floorToMinute(System.currentTimeMillis())
@@ -117,9 +159,13 @@ class AnalyticsRecorder(private val ctx: Context) {
 
     private fun flushUnlocked() {
         // Skip empty buckets so the file doesn't bloat with zero-traffic
-        // minutes when the user's just sitting on the start screen.
+        // minutes when the user's just sitting on the start screen. The
+        // emptiness check now covers the Wi-Fi return per-interface
+        // counters too so a bucket where only those are non-zero (e.g.
+        // tunnel saw only response traffic) still flushes.
         if (rxAccum == 0L && txAccum == 0L && opens == 0 && closes == 0 &&
-            peakTunnels == 0) {
+            peakTunnels == 0 && wifiRxAccum == 0L && wifiTxAccum == 0L &&
+            cellRxAccum == 0L && cellTxAccum == 0L) {
             // Reset window-only counters so next bucket starts clean.
             opens = 0; closes = 0; peakTunnels = activeTunnels
             return
@@ -134,9 +180,15 @@ class AnalyticsRecorder(private val ctx: Context) {
             registrator = lastRegistrator,
             natIp = lastNatIp,
             transport = lastTransport,
+            wifiRxBytes = wifiRxAccum,
+            wifiTxBytes = wifiTxAccum,
+            cellRxBytes = cellRxAccum,
+            cellTxBytes = cellTxAccum,
         )
         AnalyticsStore.appendBucket(ctx, bucket)
         rxAccum = 0; txAccum = 0
+        wifiRxAccum = 0; wifiTxAccum = 0
+        cellRxAccum = 0; cellTxAccum = 0
         opens = 0; closes = 0
         // Carry active-tunnels forward as the new "peak baseline" so the next
         // minute's peak reflects sustained activity, not a ramp-up artifact.
