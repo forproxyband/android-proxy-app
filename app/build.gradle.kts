@@ -87,6 +87,18 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Skip native-debug-symbol extraction. This app isn't shipped
+            // through Google Play, so the *.so debug symbols bundle that
+            // Play Console uses to symbolicate native crashes goes
+            // straight to /dev/null. Disabling drops the
+            // extractReleaseNativeSymbolTables + mergeReleaseNativeDebugMetadata
+            // tasks (and the stripReleaseDebugSymbols still runs as part
+            // of the normal .so packaging — runtime crashes still produce
+            // useful logcat traces via `addr2line` against the unstripped
+            // build outputs in app/build/intermediates/).
+            ndk {
+                debugSymbolLevel = "none"
+            }
         }
     }
 
@@ -132,6 +144,44 @@ android {
                 .outputFileName = "proxy-agent-v$appVersionName-${buildType.name}.apk"
         }
     }
+}
+
+// Disable AGP tasks that only produce metadata Google Play Console
+// reads. This app is sideloaded as a plain APK (via `adb install` or
+// direct user install), never uploaded to Play, so these are pure
+// build-time waste:
+//
+//   * extract*VersionControlInfo — embeds git commit / branch in the
+//     APK for Play Console's "Bundle Explorer" tab.
+//   * sdk*DependencyData + collect*Dependencies — dump the dependency
+//     graph for Google Play SDK Index / Play Integrity scanning.
+//   * write*AppMetadata — writes META-INF/com/android/build/gradle/
+//     app-metadata.properties (Play Store CDN hints).
+//
+// Also disable the native-debug-symbol pipeline (Play Console uses
+// these for symbolicating native crashes; we don't upload symbols
+// anywhere). `buildTypes.release.ndk.debugSymbolLevel = "none"` already
+// makes them no-ops, but they still appear in the build log unless
+// explicitly disabled here.
+//
+// What's NOT disabled and why:
+//   - DEX tasks (dexBuilder*, merge*Dex*, mergeExtDex*, l8DexDesugarLib*)
+//     are mandatory — DEX is the bytecode format Android Runtime
+//     executes; an APK without DEX has no app code.
+//   - stripReleaseDebugSymbols stays — it shrinks the .so files we
+//     actually ship by removing unused debug info.
+//   - Baseline profile tasks (*ArtProfile*) stay — they generate a
+//     hot-path profile ART uses to JIT-compile on install, making
+//     the user's first launch noticeably faster. Cheap to build,
+//     valuable to keep.
+//   - lintVital* stays — catches real bugs in release builds.
+tasks.configureEach {
+    if (name.startsWith("extract") && name.endsWith("NativeSymbolTables")) enabled = false
+    if (name.startsWith("merge") && name.endsWith("NativeDebugMetadata")) enabled = false
+    if (name.startsWith("extract") && name.endsWith("VersionControlInfo")) enabled = false
+    if (name.startsWith("sdk") && name.endsWith("DependencyData")) enabled = false
+    if (name.startsWith("collect") && name.endsWith("Dependencies")) enabled = false
+    if (name.startsWith("write") && name.endsWith("AppMetadata")) enabled = false
 }
 
 dependencies {

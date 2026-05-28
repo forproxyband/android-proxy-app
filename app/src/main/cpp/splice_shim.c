@@ -36,6 +36,12 @@ JNIEXPORT jlong JNICALL
 Java_com_proxyagent_app_nativeagent_SpliceShim_spliceLoop(
     JNIEnv *env, jobject thiz, jint fdSrc, jint fdDst, jint chunkSize) {
 
+    // Required by the JNI ABI but unused inside the loop — we don't
+    // touch JNI state once we're on the splice path, so silence the
+    // -Wunused-parameter warning the same way extractFd does.
+    (void)env;
+    (void)thiz;
+
     int pipefd[2];
     if (pipe(pipefd) < 0) {
         // Cannot even create a pipe — caller should fall back to NIO.

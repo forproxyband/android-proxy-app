@@ -24,7 +24,7 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          # All four pins below are driven by app/build.gradle.kts and are
+          # All pins below are driven by app/build.gradle.kts and are
           # independent of `minSdk` — keep them in lock-step with the
           # build script, not the minimum Android version we ship for.
           #   * platforms;android-35 + build-tools;35.0.0 — compileSdk/targetSdk
@@ -34,7 +34,11 @@ jobs:
           # zero-copy shim, NATIVE engine TCP fast path). Lowering minSdk
           # would NOT let you drop any of these — they're host-side toolchain
           # versions, not runtime API levels.
-          packages: "platforms;android-35 build-tools;35.0.0 platform-tools ndk;26.3.11579264 cmake;3.22.1"
+          #
+          # `platform-tools` (adb, fastboot) is intentionally omitted — this
+          # workflow doesn't run adb / emulators. Add it back if a future
+          # job installs the APK on a connected device.
+          packages: "platforms;android-35 build-tools;35.0.0 ndk;26.3.11579264 cmake;3.22.1"
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -51,11 +55,15 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
-      - name: Build debug APK
-        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
-
-      - name: Build release APK
-        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+      # Build both variants in a single Gradle invocation. With --no-daemon
+      # each `./gradlew …` call boots a fresh JVM (~5-10s) and reparses the
+      # whole build, so two separate steps cost double the bootstrap. AGP
+      # already shares pre-build / merge-resources / native-build / lint
+      # work between debug and release where it can, so doing both in one
+      # task graph also lets Gradle reuse intermediates that would
+      # otherwise be re-checked.
+      - name: Build debug + release APK
+        run: ./gradlew :app:assembleDebug :app:assembleRelease --no-daemon --build-cache --stacktrace
 
       # Sanity check: the built APK's manifest must declare the minSdk we
       # set in app/build.gradle.kts (currently 23 = Android 6.0). Catches

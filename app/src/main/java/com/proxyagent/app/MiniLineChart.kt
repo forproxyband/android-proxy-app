@@ -48,7 +48,13 @@ class MiniLineChart @JvmOverloads constructor(
         strokeWidth = 1f
     }
     private val paintLabel = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        textSize = 9f * resources.displayMetrics.scaledDensity
+        // `DisplayMetrics.scaledDensity` was deprecated in API 34 — it
+        // captured fontScale at the time the DisplayMetrics object was
+        // built and went stale on per-app font-scale changes. The
+        // documented replacement is `density * configuration.fontScale`,
+        // which we read live each time the view is constructed.
+        textSize = 9f * resources.displayMetrics.density *
+            resources.configuration.fontScale
         isFakeBoldText = false
     }
 
