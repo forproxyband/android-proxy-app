@@ -5,7 +5,6 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
-import android.os.Build
 import android.util.Log
 import java.io.IOException
 import java.net.InetAddress
@@ -353,14 +352,9 @@ class WifiReturnRelay(
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 // Don't claim it yet — wait for onCapabilitiesChanged to
-                // confirm VALIDATED (or for API 21–22 where we can't
-                // tell, accept on first sight). Avoids brief windows
-                // where we route through a captive-portal Wi-Fi that
-                // can't actually reach the registrator.
-                if (Build.VERSION.SDK_INT < 23) {
-                    wifiNet = network
-                    log("Wi-Fi available: $network (API<23, no validation signal — accepting blind)")
-                }
+                // confirm VALIDATED. Avoids brief windows where we route
+                // through a captive-portal Wi-Fi that can't actually
+                // reach the registrator.
             }
             override fun onLost(network: Network) {
                 if (wifiNet == network) {
@@ -369,17 +363,14 @@ class WifiReturnRelay(
                 }
             }
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                // Primary acceptance / drop path (API 23+). A network that's
+                // Primary acceptance / drop path. A network that's
                 // TRANSPORT_WIFI + INTERNET + VALIDATED is good for our
                 // uplink. Losing VALIDATED (captive portal staled) means
                 // we should fall back to the process default until the
                 // OS revalidates or another Wi-Fi shows up.
-                val baseOk = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
-                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                val validated = if (Build.VERSION.SDK_INT >= 23) {
+                val ok = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
                     caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-                } else true   // L can't tell us; trust onAvailable.
-                val ok = baseOk && validated
                 if (ok && wifiNet != network) {
                     wifiNet = network
                     log("Wi-Fi validated and bound: $network — new uplink connections will ride Wi-Fi")

@@ -81,9 +81,7 @@ object WifiInfoProbe {
         val info = readWifiInfo(context, wifiNetwork) ?: return Snapshot.EMPTY
 
         val speed = try { info.linkSpeed } catch (_: Throwable) { -1 }
-        val freq = if (Build.VERSION.SDK_INT >= 21) {
-            try { info.frequency } catch (_: Throwable) { -1 }
-        } else -1
+        val freq = try { info.frequency } catch (_: Throwable) { -1 }
 
         val band = bandFromFrequency(freq)
         val standard = standardLabel(info)

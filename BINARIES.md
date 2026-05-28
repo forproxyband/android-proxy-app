@@ -4,6 +4,15 @@ These binaries are built from upstream `proxy-agent` and are embedded into the
 APK at build time. The files at the repository root are staging copies kept
 there for easy refresh; the actual build consumes the copies under `app/`.
 
+> **Status (2026-05-28):** the bundled binary backs the **BINARY** engine,
+> which is the **legacy** code path. NATIVE (the pure-Kotlin port at
+> `app/src/main/java/com/proxyagent/app/nativeagent/`) is the default
+> engine for new installs and the only one Wi-Fi return supports.
+> BINARY is kept short-term for testing/comparison and will be removed
+> once NATIVE has enough field hours. The AAR engine that previously
+> shipped alongside these two was removed entirely on 2026-05-28. See
+> [ARCHITECTURE.md] §Agent engines.
+
 For app-level architecture (service lifecycle, `conn_info` schema, settings,
 IP rotation algorithm, watchdog) see [ARCHITECTURE.md]. This file stays
 strictly about the bundled binary and how it's integrated.

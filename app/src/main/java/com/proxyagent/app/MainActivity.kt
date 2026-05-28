@@ -743,9 +743,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateBatteryButton() {
-        if (Build.VERSION.SDK_INT < 23) {
-            btnBattery.visibility = View.GONE; return
-        }
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         btnBattery.visibility =
             if (pm.isIgnoringBatteryOptimizations(packageName)) View.GONE else View.VISIBLE
@@ -1313,18 +1310,14 @@ class MainActivity : AppCompatActivity() {
     private fun currentTransport(): String {
         return try {
             val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-            if (Build.VERSION.SDK_INT >= 23) {
-                val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
-                when {
-                    caps == null -> "NONE"
-                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
-                    caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "CELLULAR"
-                    caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ETHERNET"
-                    caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "VPN"
-                    else -> "OTHER"
-                }
-            } else {
-                @Suppress("DEPRECATION") cm.activeNetworkInfo?.typeName ?: "NONE"
+            val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+            when {
+                caps == null -> "NONE"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "CELLULAR"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ETHERNET"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "VPN"
+                else -> "OTHER"
             }
         } catch (_: Throwable) { "?" }
     }
@@ -1485,7 +1478,7 @@ class MainActivity : AppCompatActivity() {
         kv("Release", Build.VERSION.RELEASE)
         kv("SDK", Build.VERSION.SDK_INT)
         kv("Incremental", Build.VERSION.INCREMENTAL)
-        if (Build.VERSION.SDK_INT >= 23) kv("Security-Patch", Build.VERSION.SECURITY_PATCH)
+        kv("Security-Patch", Build.VERSION.SECURITY_PATCH)
         kv("Fingerprint", Build.FINGERPRINT)
 
         section("ARCH")
@@ -1505,34 +1498,24 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Throwable) { false }
             kv(p, if (granted) "GRANTED" else "DENIED")
         }
-        if (Build.VERSION.SDK_INT >= 23) {
-            val pm = getSystemService(POWER_SERVICE) as PowerManager
-            kv("Battery-Whitelist", if (pm.isIgnoringBatteryOptimizations(packageName)) "YES" else "NO")
-        }
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        kv("Battery-Whitelist", if (pm.isIgnoringBatteryOptimizations(packageName)) "YES" else "NO")
 
         section("NETWORK")
         try {
             val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-            if (Build.VERSION.SDK_INT >= 23) {
-                val active = cm.activeNetwork
-                val caps = active?.let { cm.getNetworkCapabilities(it) }
-                val link = active?.let { cm.getLinkProperties(it) }
-                kv("Transport", currentTransport())
-                kv("Internet-Capable", caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ?: false)
-                kv("Validated", caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ?: false)
-                val ips = currentLocalIps()
-                if (ips.isNotEmpty()) kv("Local-IPs", ips.joinToString(", "))
-                if (publicIp.isNotEmpty()) kv("Public-IP", publicIp)
-                link?.interfaceName?.let { kv("Interface", it) }
-                link?.dnsServers?.takeIf { it.isNotEmpty() }?.let {
-                    kv("DNS", it.mapNotNull { dns -> dns.hostAddress }.joinToString(", "))
-                }
-            } else {
-                @Suppress("DEPRECATION") val info = cm.activeNetworkInfo
-                kv("Type", info?.typeName)
-                @Suppress("DEPRECATION") kv("Connected", info?.isConnected ?: false)
-                val ips = currentLocalIps()
-                if (ips.isNotEmpty()) kv("Local-IPs", ips.joinToString(", "))
+            val active = cm.activeNetwork
+            val caps = active?.let { cm.getNetworkCapabilities(it) }
+            val link = active?.let { cm.getLinkProperties(it) }
+            kv("Transport", currentTransport())
+            kv("Internet-Capable", caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ?: false)
+            kv("Validated", caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ?: false)
+            val ips = currentLocalIps()
+            if (ips.isNotEmpty()) kv("Local-IPs", ips.joinToString(", "))
+            if (publicIp.isNotEmpty()) kv("Public-IP", publicIp)
+            link?.interfaceName?.let { kv("Interface", it) }
+            link?.dnsServers?.takeIf { it.isNotEmpty() }?.let {
+                kv("DNS", it.mapNotNull { dns -> dns.hostAddress }.joinToString(", "))
             }
         } catch (e: Throwable) {
             kv("(error)", e.message)

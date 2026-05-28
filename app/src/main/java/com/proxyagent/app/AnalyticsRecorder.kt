@@ -88,18 +88,16 @@ class AnalyticsRecorder(
         // Refresh transport from the system (cheap; reflects current routing).
         try {
             val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-            if (Build.VERSION.SDK_INT >= 23) {
-                val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
-                val t = when {
-                    caps == null -> ""
-                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
-                    caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "CELLULAR"
-                    caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ETHERNET"
-                    caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "VPN"
-                    else -> "OTHER"
-                }
-                if (t.isNotEmpty()) lastTransport = t
+            val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+            val t = when {
+                caps == null -> ""
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "CELLULAR"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ETHERNET"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "VPN"
+                else -> "OTHER"
             }
+            if (t.isNotEmpty()) lastTransport = t
         } catch (_: Throwable) {}
 
         // Pick up NAT IP from the file the UI process writes when it refreshes.

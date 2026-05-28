@@ -19,7 +19,18 @@ android {
 
     defaultConfig {
         applicationId = "com.proxyagent.app"
-        minSdk = 21
+        // minSdk=23 (Android 6.0) — required for the load-bearing features:
+        //   * ConnectivityManager.bindProcessToNetwork (API 23+) — the
+        //     whole Wi-Fi return / split-routing story is built on it.
+        //   * NetworkCapabilities.NET_CAPABILITY_VALIDATED (API 23+) —
+        //     keeps captive-portal Wi-Fi from being treated as a real
+        //     uplink path.
+        //   * PowerManager.isIgnoringBatteryOptimizations + the
+        //     REQUEST_IGNORE_BATTERY_OPTIMIZATIONS intent flow (API 23+) —
+        //     without it long sessions get Doze-killed on every device.
+        // Android 5.x devices are vanishingly rare on fleet hardware and
+        // the agent would be missing its main features there anyway.
+        minSdk = 23
         targetSdk = 35
         versionCode = appVersionCode
         versionName = appVersionName
@@ -82,7 +93,9 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-        // java.time desugaring for kwik on minSdk 21..25.
+        // java.time desugaring for kwik on minSdk 23..25 (java.time was
+        // added to Android in API 26 / Oreo). Still required even after
+        // the minSdk=23 bump.
         isCoreLibraryDesugaringEnabled = true
     }
 
@@ -137,13 +150,17 @@ dependencies {
     implementation("androidx.viewpager2:viewpager2:1.1.0")
     // QUIC client used by the NATIVE engine (com.proxyagent.app.nativeagent.*).
     // Pure-Java QUIC v1 implementation; uses java.time.Duration so core library
-    // desugaring is enabled below to support minSdk 21. When this dependency is
-    // removed (e.g. third-party integrators using only the NativeProxyAgent.kt
-    // drop-in), the NATIVE engine silently falls back to TCP-only.
+    // desugaring is enabled in compileOptions below to make it usable on
+    // minSdk 23..25 (java.time was added to Android in API 26). When this
+    // dependency is removed (e.g. third-party integrators using only the
+    // NativeProxyAgent.kt drop-in), the NATIVE engine silently falls back
+    // to TCP-only.
     //
     // Kwik is being progressively replaced by the in-house QUIC implementation
-    // in `nativeagent/quic/` — once `NativeQuicTransport` is field-validated
-    // (see com.proxyagent.app.nativeagent.quic.DESIGN.md), this dep goes away.
+    // in `nativeagent/quic/` (NativeQuicTransport is the default since the
+    // Settings picker was removed — see com.proxyagent.app.nativeagent.quic.DESIGN.md).
+    // The dep stays compiled in as a safety net override; remove once the
+    // in-house path has more field hours.
     implementation("tech.kwik:kwik:0.10.10")
     // DO NOT add BouncyCastle here. We tried (`bcprov`/`bctls` 1.79) to get
     // X25519 for the in-house QUIC client, and it broke kwik QUIC entirely:

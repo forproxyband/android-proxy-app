@@ -8,8 +8,10 @@ key can route proxy traffic out through this phone's cellular IP.
 
 ## What it actually does
 
-- Keeps a persistent uplink to a registrator (auto-negotiated:
-  **QUIC → TCP+yamux → WebSocket** fallback).
+- Keeps a persistent uplink to a registrator. Transport is
+  **TCP** by default with **QUIC** as a fallback, auto-negotiated
+  per session and sticky-cached on disk so reconnects skip the
+  losing probe.
 - Forwards incoming proxy requests through the phone's cellular
   network — so external clients see the phone's mobile exit IP.
 - **Rotates the cellular IP** on demand or on server-side trigger:
@@ -44,19 +46,22 @@ fixes, troubleshooting) → **[ADMIN_GUIDE.md](ADMIN_GUIDE.md)**.
 
 Two processes (`:main` for UI, `:proxy` for the foreground
 service), two swappable agent engines (NATIVE Kotlin port —
-default; BINARY subprocess — legacy), file-based IPC through
-`filesDir`, no Binder.
+default; BINARY subprocess — legacy, kept for comparison),
+file-based IPC through `filesDir`, no Binder.
 
 Full write-up — **[ARCHITECTURE.md](ARCHITECTURE.md)**:
 - Process model + IPC files
-- Agent engines (NATIVE / BINARY trade-offs)
+- Agent engines (NATIVE / BINARY trade-offs; AAR was removed)
+- In-house QUIC client (default) with kwik adapter kept as a
+  manual override
 - TCP fast path (kernel `splice(2)` shim, NIO fallback)
 - IP rotation algorithm + interrupted-cycle recovery
 - Wi-Fi return relay (split-routing, self-test, OEM caveats)
 - Auto-stop watchdog
 - Surviving an app update (heartbeat-staleness, auto-restart)
 
-Binary protocol + SDK runtime surface — **[BINARIES.md](BINARIES.md)**.
+Wire protocol + SDK runtime surface of the bundled BINARY —
+**[BINARIES.md](BINARIES.md)**.
 
 ## Build
 
@@ -73,10 +78,12 @@ CI builds on every push — see `.github/workflows/build.yml`.
 
 | | Required | Optional |
 | --- | --- | --- |
-| Android | 5.0+ (API 21) | 14+ for full FGS exemption coverage |
+| Android | **6.0+ (API 23)** — `minSdk=23`, `targetSdk=35`. Android 11+ (API 30) additionally unlocks the kernel `splice(2)` zero-copy TCP fast path. | OEM autostart whitelist on Xiaomi / Huawei / Samsung / OnePlus / Oppo / Vivo — see [ADMIN_GUIDE.md §7.7](ADMIN_GUIDE.md) |
+| ABI | **arm64-v8a only** — the bundled `libproxyagent.so` and CMake-built `libagentsplice.so` ship just this ABI; armv7 / x86 devices fail to start | — |
 | SIM | with mobile data | — |
-| Root (Magisk) | — | needed for IP rotation, APN swap, RAT switch, IMEI rotation |
-| `WRITE_SECURE_SETTINGS` | — | enables airplane-mode toggle without root: `adb shell pm grant com.proxyagent.app android.permission.WRITE_SECURE_SETTINGS` |
+| Root (Magisk / SuperSU) | — | needed for IP rotation to actually change the IP (RIL restart, RAT switch, APN swap, IMEI rotation are all root-only). Without root the airplane toggle still fires but the operator usually holds the PDP context — rotation runs vacuously. See [ADMIN_GUIDE.md §4](ADMIN_GUIDE.md) |
+| `WRITE_SECURE_SETTINGS` | — | partial root substitute: enables the airplane toggle during IP rotation (still won't change IP without root) and the in-app one-tap `mobile_data_always_on=1` fix for Wi-Fi-return preflight. Grant via `adb shell pm grant com.proxyagent.app android.permission.WRITE_SECURE_SETTINGS` |
+| Battery whitelist | — | recommended for long sessions — tap `ALLOW BACKGROUND` on the main screen |
 
 ## Status
 

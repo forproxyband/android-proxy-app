@@ -24,10 +24,16 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          # NDK + CMake are required by app/src/main/cpp/CMakeLists.txt
-          # (libagentsplice.so — kernel splice(2) zero-copy shim used
-          # by the NATIVE engine's TCP bridge). Pin the same NDK
-          # version we set in app/build.gradle.kts so CI is deterministic.
+          # All four pins below are driven by app/build.gradle.kts and are
+          # independent of `minSdk` — keep them in lock-step with the
+          # build script, not the minimum Android version we ship for.
+          #   * platforms;android-35 + build-tools;35.0.0 — compileSdk/targetSdk
+          #   * ndk;26.3.11579264 — ndkVersion = "26.3.11579264" (NDK r26d)
+          #   * cmake;3.22.1 — cmake { version = "3.22.1" }
+          # The NDK + CMake are needed for libagentsplice.so (kernel splice(2)
+          # zero-copy shim, NATIVE engine TCP fast path). Lowering minSdk
+          # would NOT let you drop any of these — they're host-side toolchain
+          # versions, not runtime API levels.
           packages: "platforms;android-35 build-tools;35.0.0 platform-tools ndk;26.3.11579264 cmake;3.22.1"
 
       - name: Cache Gradle
@@ -50,6 +56,22 @@ jobs:
 
       - name: Build release APK
         run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      # Sanity check: the built APK's manifest must declare the minSdk we
+      # set in app/build.gradle.kts (currently 23 = Android 6.0). Catches
+      # accidental downgrades or AGP variant-merge weirdness. Anchor the
+      # grep to ^sdkVersion: so we don't accidentally read targetSdkVersion.
+      - name: Verify APK minSdk
+        run: |
+          set -euo pipefail
+          AAPT="$ANDROID_SDK_ROOT/build-tools/35.0.0/aapt"
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -n1)
+          MIN_SDK=$("$AAPT" dump badging "$APK" | grep -E "^sdkVersion:'[0-9]+'" | grep -oE "[0-9]+")
+          echo "APK minSdkVersion: $MIN_SDK (expected 23)"
+          if [ "$MIN_SDK" != "23" ]; then
+            echo "ERROR: built APK has minSdkVersion=$MIN_SDK, expected 23"
+            exit 1
+          fi
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4

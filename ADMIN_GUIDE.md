@@ -6,6 +6,27 @@
 
 ---
 
+## 0. Требования к устройству
+
+| | Минимум | Рекомендуется |
+| --- | --- | --- |
+| **Android** | 6.0 (API 23) | 11+ (API 30) — добавит kernel `splice(2)` zero-copy на TCP fast path (~3× ниже CPU на нагрузке) |
+| **Архитектура** | arm64-v8a | arm64-v8a — единственная поддерживаемая. armv7 / x86 устройства не запустятся (в APK нет соответствующих `.so`) |
+| **SIM** | с активным мобильным интернетом | — |
+| **Root** (Magisk / SuperSU) | не требуется для базовой работы агента | **обязателен для смены IP**. Без root ↻-ротация и серверный REBOOT-цикл отработают, но IP обычно не сменится — оператор удержит PDP-контекст (см. §4) |
+| **`WRITE_SECURE_SETTINGS`** | — | частичная замена root: даёт airplane toggle во время ротации (IP всё равно не сменится без root) и one-tap fix `mobile_data_always_on=1` для Wi-Fi return preflight. Грантится один раз: `adb shell pm grant com.proxyagent.app android.permission.WRITE_SECURE_SETTINGS` |
+| **Battery whitelist** | — | для долгих сессий — кнопка `ALLOW BACKGROUND` на главном экране |
+| **OEM autostart** | — | на Xiaomi / Huawei / Samsung / OnePlus / Oppo / Vivo одна разовая настройка, иначе сервис не поднимется автоматически после обновления APK — см. §7.7 |
+
+> **Почему минимум Android 6.0 (API 23):**
+> - `ConnectivityManager.bindProcessToNetwork` — основа split-routing'а для Wi-Fi return; до API 23 не существует.
+> - `NetworkCapabilities.NET_CAPABILITY_VALIDATED` — фильтр captive-portal Wi-Fi; без него релей мог бы тихо ехать в дохлую сеть.
+> - `PowerManager.isIgnoringBatteryOptimizations` + диалог `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` — без них Doze убивает длинные сессии.
+>
+> На Android 5.x приложение **не установится** (`minSdk=23` в манифесте — Play Store / `adb install` откажут).
+
+---
+
 ## 1. Главный экран — что где
 
 ```
@@ -228,13 +249,24 @@ DNS под конкретное окружение).
 Объём — примерно 1 MB за активный день.
 
 ### 3.6. Engine
-- **Native Kotlin (default)** — встроенный pure-Kotlin порт SDK,
+- **Native Kotlin (recommended)** — производственный путь и
+  дефолт для новых установок. Встроенный pure-Kotlin порт SDK,
   работает в том же `:proxy`-процессе. Поддерживает Wi-Fi return,
-  кернельный `splice(2)` zero-copy и QUIC. Производственный путь.
+  кернельный `splice(2)` zero-copy и in-house QUIC v1 стек с
+  Brutal congestion control (kwik-адаптер остался скомпилирован
+  как safety-net, но не выставлен в UI).
 - **Binary subprocess** — запускает встроенный ELF-бинарь
-  `libproxyagent.so` через `ProcessBuilder`. Резервный/диагностический
-  вариант. Wi-Fi return через него **не работает** (см. §3.8); смена
-  движка требует STOP → START.
+  `libproxyagent.so` через `ProcessBuilder`. Legacy /
+  диагностический вариант, **временно** оставлен для сравнения и
+  будет удалён, когда NATIVE наберёт достаточно полевых часов.
+  Wi-Fi return через него **не работает корректно** (см. §3.8);
+  смена движка требует STOP → START.
+
+> Старый AAR-движок был полностью удалён из приложения 2026-05-28 —
+> он никогда не выходил end-to-end в этой сборке SDK (Modem-режим
+> не доходил до AUTH), и 25 MiB gomobile-артефакта впустую раздували
+> APK. Если у вас в логах или прошивке упоминается AAR — это
+> устаревший след, игнорируйте.
 
 ### 3.7. IP rotation fallbacks (требуется root)
 > Root нужен для **любой** ротации (см. §4). Эти галки — дополнительные

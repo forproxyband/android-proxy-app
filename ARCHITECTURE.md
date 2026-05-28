@@ -251,13 +251,19 @@ don't want the kwik dependency take.
 
 ### In-house QUIC (`NativeQuicTransport`) — send-path regression guards
 
-The second `QuicTransport.Factory`, `NativeQuicTransport`, is our
-hand-rolled QUIC v1 client (`nativeagent/quic/`), selectable at runtime
-via the Settings `quic_impl` toggle (`native` vs `kwik`). It exists so
-we can ship Brutal CC and prioritise control-frame emission — the two
-things kwik couldn't give us (see the do-not-revisit note above). Full
-design is in `nativeagent/quic/DESIGN.md`; the load-bearing invariants
-that are easy to regress:
+The second `QuicTransport.Factory`, `NativeQuicTransport`
+(`nativeagent/quic/`), is our hand-rolled QUIC v1 client and is the
+**default** path now. The kwik adapter is still compiled in as a
+safety-net manual override but no longer exposed through the
+Settings UI — the dialog picker was removed once the in-house path
+became stable. To flip back temporarily, send the start Intent with
+extra `quic_impl=kwik` from `MainActivity.startService(...)`; with
+no extra, `ProxyService` defaults `quicImpl="native"`. The in-house
+stack exists so we can ship Brutal CC and prioritise control-frame
+emission — the two things kwik couldn't give us (see the
+do-not-revisit note above). Full design is in
+`nativeagent/quic/DESIGN.md`; the load-bearing invariants that are
+easy to regress:
 
 - **Send pacing is a wall-clock token bucket, NOT per-packet sleeps.**
   `Connection.drainStreams` drains continuously, charging wire bytes
@@ -672,7 +678,7 @@ tiers, pick what you want:
 | Tier | Files to copy | What you get | Extra deps |
 | --- | --- | --- | --- |
 | **Minimum** | `nativeagent/NativeProxyAgent.kt` + `nativeagent/QuicTransport.kt` | TCP-only agent with NIO + DirectByteBuffer bridge. Works on any Android / JVM. | None — stdlib only. |
-| **+ QUIC** | Above + `nativeagent/KwikQuicTransport.kt` | Adds QUIC uplink as an auto-negotiated fallback to TCP. | `tech.kwik:kwik:0.10.10` and core library desugaring for `java.time.Duration` (Android minSdk 21..25). Wire `quicTransportFactory = KwikQuicTransport.Factory()`. |
+| **+ QUIC** | Above + `nativeagent/KwikQuicTransport.kt` | Adds QUIC uplink as an auto-negotiated fallback to TCP. | `tech.kwik:kwik:0.10.10` and core library desugaring for `java.time.Duration` (this app's `minSdk=23..25`; integrators targeting API 26+ can skip the desugaring). Wire `quicTransportFactory = KwikQuicTransport.Factory()`. |
 | **+ splice zero-copy** | Above + `nativeagent/SpliceShim.kt` + `cpp/splice_shim.c` + `cpp/CMakeLists.txt` | TCP fast path becomes kernel `splice(2)` when supported (Linux, including Android). Userspace NIO is the automatic fallback. | AGP `externalNativeBuild` + NDK; see `app/build.gradle.kts` for the exact config. Adds ~15 KiB per ABI to the APK. |
 
 Usage:
@@ -974,42 +980,23 @@ somehow saves with `engine="binary" && wifi_return=true`, and
 `maybeStartWifiRelay` has a final guard that bails out if it ever
 sees `engine == BINARY && wifi_return`.
 
-### Lifecycle
+### Shape of the relay
 
-- **Construction**: `maybeStartWifiRelay(host, port)` in `ProxyService`
-  reads `cycle_cfg.json`, returns either `(realHost, realPort)` (relay
-  disabled) or `("127.0.0.1", localPort)` (relay up). Engine + cellular-
-  availability checks happen before relay startup:
-  1. `mode == Modem` (Balancer not supported).
-  2. `cfg.wifi_return && cfg.wifi_return_method == "local_relay"`.
-  3. `engine != BINARY` (only NATIVE — process binding doesn't reach
-     subprocesses).
-  4. `bindProcessToCellularBlocking()` — requests
-     `TRANSPORT_CELLULAR + INTERNET` Network, awaits with 10s
-     `CountDownLatch`, calls `cm.bindProcessToNetwork(cellular)` on
-     success. Keeps the NetworkCallback alive for re-bind on cellular
-     reattach. On timeout / failure → bails (no relay) so target dials
-     don't silently leak.
-  5. Start the actual relay listener.
-
-- **Per-session**: a single `accept()` thread spawns two daemon pipe
-
-### Why it's not a one-liner
-
-The agent has two distinct connection types:
+The agent has two distinct connection types and each must ride a
+different transport:
 
 1. **Uplink** (agent ↔ registrator): a control TCP/QUIC socket plus a
    pool of data sockets. *All* tunneled client bytes traverse this, in
-   both directions.
+   both directions — and this is the leg we want on Wi-Fi.
 2. **Outbound dial** (agent → target): the actual TCP connection to the
    end host. *This is the one that must use cellular* — the IP the
    target observes is the local-bound IP of that socket.
 
-A process-wide `ConnectivityManager.bindProcessToNetwork` would push (2)
-onto Wi-Fi too and lose the mobile exit IP. Per-socket binding via
-`Network.bindSocket(fd)` is a Java-only API, unreachable from the Go
-binary (which is a plain Linux ELF with no JNI). So we put a loopback
-relay in the middle:
+We solve it with a process-wide `bindProcessToNetwork(cellular)` (so
+all unmarked sockets — target dials included — default to cellular)
+plus a loopback relay in front of the uplink that overrides
+per-socket via `wifiNet.bindSocket` to push *only* the uplink onto
+Wi-Fi. Shape:
 
 ```
 SDK ── connect(127.0.0.1:<localPort>) ──► WifiReturnRelay
@@ -1022,17 +1009,35 @@ SDK ── connect(127.0.0.1:<localPort>) ──► WifiReturnRelay
                                               └─► io.Copy in both directions
 ```
 
-The SDK still dials the target directly (untouched by the relay) — those
-sockets ride the default route, which is cellular when both transports
-are up *and the proxy's UID isn't bound to a specific network*.
+A pure per-socket `Network.bindSocket(fd)` approach would have been
+nicer for the SDK target dials too, but that API is JVM-only — the
+BINARY engine's Go subprocess is a plain Linux ELF with no JNI and
+can't reach it. The loopback-relay-plus-process-bind combo works for
+NATIVE in-process and at least lets BINARY enjoy uplink savings
+(at the cost of leaking Wi-Fi IP to targets — see the trade-off
+matrix below).
 
 ### Lifecycle
 
 - **Construction**: `maybeStartWifiRelay(host, port)` in `ProxyService`
-  reads `cycle_cfg.json`, returns either `(realHost, realPort)` (relay
-  disabled) or `("127.0.0.1", localPort)` (relay up). Called once per
-  engine launch from `runNativeEngine` and `runBinaryEngine` before
-  config/env is composed.
+  reads `cycle_cfg.json` and returns either `(realHost, realPort)`
+  (relay disabled) or `("127.0.0.1", localPort)` (relay up). Called
+  once per engine launch from `runNativeEngine` / `runBinaryEngine`
+  before config/env is composed. Gating order:
+  1. `mode == Modem` (Balancer not supported).
+  2. `cfg.wifi_return && cfg.wifi_return_method == "local_relay"`.
+  3. If `engine == NATIVE` →
+     `bindProcessToCellularBlocking()` requests
+     `TRANSPORT_CELLULAR + INTERNET`, awaits with a 10s
+     `CountDownLatch`, calls `cm.bindProcessToNetwork(cellular)` on
+     success and keeps the NetworkCallback alive for re-bind on
+     cellular reattach. On timeout / failure → bails (no relay) so
+     target dials don't silently leak.
+  4. If `engine == BINARY` → skip the process-bind step (it's
+     meaningless for a subprocess) and start the relay anyway for
+     uplink savings — the self-test will surface the leak as
+     `wifiReturnStatus = "leak_known"`.
+  5. Start the relay's `accept()` listener.
 - **Per-session**: a single `accept()` thread spawns two daemon pipe
   threads per accepted connection. Each session captures the current
   `wifiNet` at dial time — a later network change doesn't disturb the
