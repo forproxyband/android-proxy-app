@@ -24,6 +24,8 @@ import com.proxyagent.app.nativeagent.quic.wire.PacketNumberSpace
 import com.proxyagent.app.nativeagent.quic.wire.PacketWire
 import com.proxyagent.app.nativeagent.quic.wire.Padding
 import com.proxyagent.app.nativeagent.quic.wire.Ping
+import com.proxyagent.app.nativeagent.quic.wire.ResetStream
+import com.proxyagent.app.nativeagent.quic.wire.StopSending
 import com.proxyagent.app.nativeagent.quic.wire.Stream as StreamFrame
 import com.proxyagent.app.nativeagent.quic.wire.encodeLongHeader
 import com.proxyagent.app.nativeagent.quic.wire.encodeShortHeader
@@ -649,6 +651,49 @@ internal class Connection(
                     closed.set(true)
                 }
                 is NewToken -> { log("recv NEW_TOKEN: ${frame.token.size}B") }
+                is StopSending -> {
+                    // Peer asks us to stop sending on this stream (RFC 9000
+                    // §3.5). Common cause: peer's downstream consumer
+                    // disconnected and the bytes we still owe are wasted —
+                    // typically what proxy-server-go does at the end of a
+                    // download speedtest. We answer with a RESET_STREAM
+                    // carrying the same error code and our current
+                    // sendOffset as Final Size; queued SendBuffer bytes
+                    // get discarded so workRemains drops and the connection
+                    // can move on without waiting out a credit-pin.
+                    //
+                    // Critical for the duplex-upload regression: kwik
+                    // handles this and quic-go appears to extend the
+                    // connection-level MAX_DATA when it sees the
+                    // RESET_STREAM (freeing the credit our finished
+                    // download stream had reserved), so the subsequent
+                    // upload phase's small TX bytes can go through.
+                    val s = streams[frame.streamId]
+                    if (s != null) {
+                        val finalSize = s.resetSendBecausePeerStopSending()
+                        pendingResetStreams.offer(
+                            ResetStream(
+                                streamId = frame.streamId,
+                                applicationProtocolErrorCode = frame.applicationProtocolErrorCode,
+                                finalSize = finalSize,
+                            )
+                        )
+                        sendQueue.offer(QueuedSendWork.Tick)
+                        log("recv STOP_SENDING: id=${frame.streamId} code=${frame.applicationProtocolErrorCode} → reset, finalSize=$finalSize")
+                    } else {
+                        log("recv STOP_SENDING: id=${frame.streamId} (no stream — dropped)")
+                    }
+                }
+                is ResetStream -> {
+                    // Peer aborted their send side on this stream (RFC 9000
+                    // §3.5). Force-EOF our recv buffer so the bridge thread
+                    // parked in input.read unblocks and exits; the stream
+                    // teardown cascades from there.
+                    streams[frame.streamId]?.acceptPeerResetStream(
+                        frame.applicationProtocolErrorCode, frame.finalSize
+                    )
+                    log("recv RESET_STREAM: id=${frame.streamId} code=${frame.applicationProtocolErrorCode} finalSize=${frame.finalSize}")
+                }
                 else -> { log("recv frame (unhandled): ${frame.javaClass.simpleName}") }
             }
         }
@@ -717,6 +762,12 @@ internal class Connection(
     // stalling the receiver. Drained ahead of new STREAM data.
     private val pendingRetransmit =
         java.util.concurrent.ConcurrentLinkedQueue<Pair<PacketNumberSpace, Frame>>()
+    /** RESET_STREAM frames the receive thread has queued for emission
+     *  in response to a peer STOP_SENDING. Drained on the sender's
+     *  control-priority tick so they go out promptly and free the
+     *  flow-control credit the dead stream had pinned. */
+    private val pendingResetStreams =
+        java.util.concurrent.ConcurrentLinkedQueue<ResetStream>()
     /** Wall-clock of the last ACK that made progress (advanced the
      *  largest-acked / acked new packets). The PTO timer measures
      *  from here: if ack-eliciting data is outstanding and no ACK
@@ -792,14 +843,19 @@ internal class Connection(
     }
 
     private fun requeueLostFrame(space: PacketNumberSpace, f: Frame) {
-        // Only CRYPTO and STREAM carry data worth retransmitting; other
-        // frame types are state-driven and re-emitted by their owning
-        // subsystem. Re-emit the ORIGINAL frame verbatim (same offset
-        // and bytes) — do NOT round-trip through SendBuffer, which would
-        // reassign a fresh offset and corrupt the stream.
+        // Only CRYPTO, STREAM, and RESET_STREAM carry data worth
+        // retransmitting; other frame types are state-driven and
+        // re-emitted by their owning subsystem. Re-emit the ORIGINAL
+        // frame verbatim (same offset and bytes) — do NOT round-trip
+        // through SendBuffer, which would reassign a fresh offset and
+        // corrupt the stream. RESET_STREAM is added so the credit-pin
+        // recovery survives a lost packet; without it, a dropped
+        // RESET_STREAM would leave peer waiting on bytes we'll never
+        // resend and the connection would stay wedged.
         when (f) {
             is Crypto -> pendingRetransmit.offer(space to f)
             is StreamFrame -> pendingRetransmit.offer(space to f)
+            is ResetStream -> pendingRetransmit.offer(space to f)
             else -> {}
         }
     }
@@ -905,6 +961,20 @@ internal class Connection(
                     }
                 }
 
+                // Priority 3b': RESET_STREAM in response to peer's
+                // STOP_SENDING (queued from receive thread). Goes out ahead
+                // of STREAM data so peer extends MAX_DATA promptly — this is
+                // the kwik-equivalent recovery path that unwedges the
+                // connection after a download speedtest. Each ResetStream
+                // is ack-eliciting, so the retransmit/PTO machinery covers
+                // packet loss.
+                if (oneRttSpace.ready()) {
+                    while (true) {
+                        val rs = pendingResetStreams.poll() ?: break
+                        emitOneRttPacket(listOf(rs))
+                    }
+                }
+
                 // Priority 3c: PTO — recover from TAIL loss. Threshold loss
                 // detection needs 3 LATER packets acked; a packet lost at the
                 // end of a burst (nothing sent after it) is never detected, so
@@ -924,7 +994,9 @@ internal class Connection(
                             val r = cs.recovery.takeOldestAckElicitingForRetransmit() ?: continue
                             if (r.inFlight) cc.onPacketLost(r.sizeBytes)
                             var enq = false
-                            for (f in r.frames) if (f is Crypto || f is StreamFrame) {
+                            for (f in r.frames) if (
+                                f is Crypto || f is StreamFrame || f is ResetStream
+                            ) {
                                 pendingRetransmit.offer(sp to f); enq = true
                             }
                             // Nothing concrete to resend (e.g. a PING-only

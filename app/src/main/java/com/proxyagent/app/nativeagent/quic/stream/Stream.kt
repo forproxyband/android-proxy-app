@@ -184,6 +184,41 @@ internal class Stream(
     /** Mark send side closed (FIN to be set on next/last frame). */
     fun closeSend() = lock.withLock { sendBuffer.close() }
 
+    /**
+     * Peer sent STOP_SENDING (RFC 9000 §3.5) — abort our send side
+     * immediately. We must drop any pending queued bytes, transition
+     * to RESET_SENT, and the caller (Connection) emits a RESET_STREAM
+     * frame back. This is the recovery path for the duplex-upload
+     * regression: without it, queued bytes for a finished tunnel sit
+     * in the SendBuffer forever, workRemains stays true, and the
+     * connection can't unstick.
+     *
+     * Returns the wire-format final size (= current sendOffset) so
+     * the caller can fill in the RESET_STREAM frame.
+     */
+    fun resetSendBecausePeerStopSending(): Long = lock.withLock {
+        if (sendState == SendState.RESET_SENT || sendState == SendState.DATA_RECVD) {
+            return@withLock sendOffset
+        }
+        sendBuffer.discardAll()
+        sendBuffer.close()  // unblocks any bridge thread parked at the cap with IOException
+        sendState = SendState.RESET_SENT
+        sentFin = true  // suppress the no-longer-applicable FIN emission
+        sendOffset
+    }
+
+    /**
+     * Peer sent RESET_STREAM — they aborted their send side. Force
+     * EOF on the receive buffer so any blocked reader unblocks and
+     * the bridge thread exits. We don't ACK this; it's a unilateral
+     * peer signal.
+     */
+    fun acceptPeerResetStream(@Suppress("UNUSED_PARAMETER") errorCode: Long, @Suppress("UNUSED_PARAMETER") finalSize: Long) = lock.withLock {
+        if (recvState == RecvState.RESET_RECVD || recvState == RecvState.RESET_READ) return@withLock
+        recvBuffer.closeOnConnectionTermination()  // forces EOF + signalAll
+        recvState = RecvState.RESET_RECVD
+    }
+
     /** Called by [Connection.close] to wake any bridge thread parked in
      *  this stream's [input.read]. Without this, force-closing the QUIC
      *  connection leaves bridge threads dangling and the agent never
@@ -302,6 +337,19 @@ internal class SendBuffer(private val maxBufferBytes: Int = DEFAULT_MAX_BUFFER_B
      *  closed — used on connection termination to free bridge
      *  threads so they can exit and let stream teardown proceed. */
     fun unblockAll() = lock.withLock { notFull.signalAll() }
+
+    /** Drop every queued byte without emitting on the wire. Called
+     *  when the stream has been reset (we sent or received
+     *  RESET_STREAM / STOP_SENDING) so the bytes will never reach
+     *  the peer anyway. Frees the memory AND wakes any blocked
+     *  writer — they'll see [closed] if the caller follows up with
+     *  [close], or the next call will succeed. */
+    fun discardAll() = lock.withLock {
+        chunks.clear()
+        headOffset = 0
+        queuedBytes = 0L
+        notFull.signalAll()
+    }
 
     companion object {
         /** Fallback when no profile-sourced cap is supplied. 1 MiB
