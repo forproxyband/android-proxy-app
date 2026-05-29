@@ -670,7 +670,7 @@ internal class Connection(
                     // upload phase's small TX bytes can go through.
                     val s = streams[frame.streamId]
                     if (s != null) {
-                        val finalSize = s.resetSendBecausePeerStopSending()
+                        val finalSize = s.resetSendAbort()
                         pendingResetStreams.offer(
                             ResetStream(
                                 streamId = frame.streamId,
@@ -762,12 +762,21 @@ internal class Connection(
     // stalling the receiver. Drained ahead of new STREAM data.
     private val pendingRetransmit =
         java.util.concurrent.ConcurrentLinkedQueue<Pair<PacketNumberSpace, Frame>>()
-    /** RESET_STREAM frames the receive thread has queued for emission
-     *  in response to a peer STOP_SENDING. Drained on the sender's
-     *  control-priority tick so they go out promptly and free the
-     *  flow-control credit the dead stream had pinned. */
+    /** RESET_STREAM frames queued for emission — either in response to
+     *  a peer STOP_SENDING (filled by the receive thread) or because
+     *  the sender's stuck-stream sweeper decided to abort a stream
+     *  whose bridge has closed but whose bytes can't drain. Either
+     *  way, drained on the sender's control-priority tick so peer
+     *  releases its accounting promptly. */
     private val pendingResetStreams =
         java.util.concurrent.ConcurrentLinkedQueue<ResetStream>()
+
+    /** How long sendBuffer.closed && queuedBytes>0 has to persist
+     *  before the sweeper force-RESETs the stream. 2 s is short
+     *  enough to recover before the user notices and long enough
+     *  that a stream whose last bytes are legitimately mid-flight
+     *  (sender just hasn't drained them yet) isn't killed. */
+    private val stuckResetTimeoutNanos: Long = 2_000_000_000L
     /** Wall-clock of the last ACK that made progress (advanced the
      *  largest-acked / acked new packets). The PTO timer measures
      *  from here: if ack-eliciting data is outstanding and no ACK
@@ -1023,6 +1032,34 @@ internal class Connection(
 
                 // Priority 4: STREAM frames, paced via the token bucket.
                 val workRemains = if (oneRttSpace.ready()) drainStreams() else false
+
+                // Priority 4b: auto-RESET stuck closed streams. When a
+                // tunnel's bridge thread exits with bytes still queued
+                // (sendBuffer.closed && queuedBytes > 0) and the
+                // connection-level credit pin prevents draining, the
+                // stream sits forever — peer holds its own state for our
+                // sake. proxy-server-go is confirmed (build-117 capture)
+                // to NOT send STOP_SENDING in this case, so the
+                // STOP_SENDING handler above never fires. Sweep here:
+                // anything stuck for [stuckResetTimeoutNanos] gets a
+                // unilateral RESET_STREAM. quic-go releases the per-
+                // stream flow control budget on receipt, which lets the
+                // connection-level MAX_DATA grow again and the next
+                // (upload) phase actually run.
+                if (oneRttSpace.ready()) {
+                    val nowSweep = System.nanoTime()
+                    for ((id, s) in streams) {
+                        if (s.sendState == Stream.SendState.RESET_SENT) continue
+                        val sb = s.sendBuffer
+                        if (!sb.closed || sb.queuedBytes <= 0L) continue
+                        if (sb.closedAtNanos == 0L) continue
+                        if (nowSweep - sb.closedAtNanos < stuckResetTimeoutNanos) continue
+                        val discarded = sb.queuedBytes
+                        val finalSize = s.resetSendAbort()
+                        pendingResetStreams.offer(ResetStream(id, 0L, finalSize))
+                        log("auto-reset stuck stream id=$id finalSize=$finalSize (discarded=$discarded, closed for ${(nowSweep - sb.closedAtNanos) / 1_000_000}ms)")
+                    }
+                }
 
                 // Priority 5: PING keepalive. ACK frames are not
                 // ack-eliciting; if we send only ACKs for too long, the

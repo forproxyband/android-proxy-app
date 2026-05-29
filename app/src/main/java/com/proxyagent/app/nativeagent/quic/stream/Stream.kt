@@ -185,18 +185,22 @@ internal class Stream(
     fun closeSend() = lock.withLock { sendBuffer.close() }
 
     /**
-     * Peer sent STOP_SENDING (RFC 9000 §3.5) — abort our send side
-     * immediately. We must drop any pending queued bytes, transition
-     * to RESET_SENT, and the caller (Connection) emits a RESET_STREAM
-     * frame back. This is the recovery path for the duplex-upload
-     * regression: without it, queued bytes for a finished tunnel sit
-     * in the SendBuffer forever, workRemains stays true, and the
-     * connection can't unstick.
+     * Abort our send side immediately. Used in two scenarios:
+     *  1. Peer sent STOP_SENDING (RFC 9000 §3.5) — we must reset
+     *     and emit RESET_STREAM back with the matching error code.
+     *  2. Our own decision — the bridge that fed this stream has
+     *     long since closed but the queued bytes haven't drained
+     *     because connection-level credit pinned at 0. Keeping the
+     *     stream in this state forever leaks memory and prevents
+     *     peer from releasing its flow-control accounting for the
+     *     stream. The sender loop's stuck-stream sweeper calls this.
      *
-     * Returns the wire-format final size (= current sendOffset) so
-     * the caller can fill in the RESET_STREAM frame.
+     * Drops any pending queued bytes, transitions to RESET_SENT,
+     * marks `sentFin` so the FIN-only emit path doesn't fire, and
+     * returns the current sendOffset for the caller to fill into
+     * the RESET_STREAM frame's Final Size field.
      */
-    fun resetSendBecausePeerStopSending(): Long = lock.withLock {
+    fun resetSendAbort(): Long = lock.withLock {
         if (sendState == SendState.RESET_SENT || sendState == SendState.DATA_RECVD) {
             return@withLock sendOffset
         }
@@ -271,6 +275,16 @@ internal class SendBuffer(private val maxBufferBytes: Int = DEFAULT_MAX_BUFFER_B
         private set
     @Volatile var closed: Boolean = false
         private set
+    /** Wall-clock (nanoTime) when [close] was first called. 0 = not
+     *  yet closed. The sender loop reads this to detect streams whose
+     *  bridge exited but whose queued bytes have been stuck for too
+     *  long — those get force-RESET so peer's flow control accounting
+     *  can release. Without this, post-download download streams would
+     *  pin connection-level credit forever (the build-99 regression:
+     *  proxy-server-go does NOT send STOP_SENDING, so there's no
+     *  externally-driven signal to kick the cleanup). */
+    @Volatile var closedAtNanos: Long = 0L
+        private set
     private val lock = ReentrantLock()
     /** Signalled by [drain] whenever bytes leave the buffer AND by
      *  [close] / [unblockAll] when the buffer is being torn down.
@@ -330,6 +344,7 @@ internal class SendBuffer(private val maxBufferBytes: Int = DEFAULT_MAX_BUFFER_B
 
     fun close() = lock.withLock {
         closed = true
+        if (closedAtNanos == 0L) closedAtNanos = System.nanoTime()
         notFull.signalAll()  // unblock any parked writers
     }
 
