@@ -40,3 +40,7 @@ bin/
 .DS_Store
 /.claude/settings.local.json
 /proxy-agent-linux-arm64
+
+### Go testserver build outputs ###
+/e2e/testserver/testserver-bin
+/e2e/testserver/testserver-bin.exe

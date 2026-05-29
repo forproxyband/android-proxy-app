@@ -1,0 +1,160 @@
+name: E2E
+
+# Manual only — emulator boot + cross-ABI build is ~10–15 min, far too
+# expensive for every PR. Trigger from the Actions UI or via gh CLI:
+#   gh workflow run E2E.yml
+on:
+  workflow_dispatch:
+    inputs:
+      api-level:
+        description: "Android API level (emulator)"
+        type: choice
+        default: "30"
+        options: ["28", "30", "33", "34"]
+      payload-bytes:
+        description: "Round-trip payload size (bytes)"
+        type: string
+        default: "65536"
+
+jobs:
+  e2e:
+    name: Emulator e2e (Go mock + connected tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Go testserver: build, then start in background ───────────────
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: e2e/testserver/go.sum
+
+      - name: Build testserver
+        working-directory: e2e/testserver
+        run: |
+          go build -o testserver-bin .
+          ls -la testserver-bin
+
+      # Stays running for the whole job. We capture the PID in $GITHUB_ENV
+      # so the cleanup step can kill it even if the test step short-circuits.
+      - name: Start testserver
+        run: |
+          nohup ./e2e/testserver/testserver-bin \
+              --bind 0.0.0.0 \
+              --tcp-port 17080 --quic-port 17080 \
+              --echo-port 17082 --api-port 17083 \
+              --auth-key e2e \
+              > testserver.log 2>&1 &
+          echo "TESTSERVER_PID=$!" >> "$GITHUB_ENV"
+          echo "started pid=$!"
+
+      # Block until both TCP + QUIC listeners are live. healthz returns 200
+      # once Hub.tcpReady && Hub.quicReady — see e2e/testserver/api.go.
+      - name: Wait for testserver healthz
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:17083/healthz > /dev/null 2>&1; then
+              echo "testserver up after $i tries"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "testserver did not come up — log follows:"
+          cat testserver.log
+          exit 1
+
+      # ── Android toolchain (parallels build.yml) ──────────────────────
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # Mirrors build.yml — these versions are driven by
+          # app/build.gradle.kts (compileSdk=35, ndkVersion=26.3.11579264,
+          # cmake.version=3.22.1). Adds `platform-tools` because the
+          # emulator runner needs `adb`.
+          packages: "platforms;android-35 build-tools;35.0.0 ndk;26.3.11579264 cmake;3.22.1 platform-tools"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          # androidTest deps differ from app deps; include the same fan
+          # of files as build.yml plus the new test source set so a test
+          # change still busts the cache.
+          key: gradle-e2e-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', '**/CMakeLists.txt', '**/*.c', '**/*.cpp', '**/*.h', 'app/src/androidTest/**') }}
+          restore-keys: gradle-e2e-${{ runner.os }}-
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      # KVM acceleration knocks emulator boot from ~5 min QEMU-only to
+      # ~30 s. ubuntu-latest images ship a KVM-capable kernel but the
+      # /dev/kvm device defaults to root-only — the udev rule below opens
+      # it up for the runner user. Standard pattern, see
+      # https://github.com/ReactiveCircus/android-emulator-runner#usage.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # Single emulator boot + connectedAndroidTest in one action. The
+      # action's `script:` runs after the emulator is fully booted, so we
+      # don't need to poll adb ourselves. -Pe2e=true flips the ABI filter
+      # to include x86_64 (see app/build.gradle.kts:isE2eBuild).
+      - name: Run connectedAndroidTest on emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ inputs.api-level }}
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          # `bytes` is forwarded into E2EConfig.payloadBytes via the
+          # AndroidJUnitRunner argument plumbing. The testserverHost
+          # default of "10.0.2.2" already points emulator → host.
+          script: |
+            ./gradlew :app:connectedDebugAndroidTest \
+              -Pe2e=true \
+              -Pandroid.testInstrumentationRunnerArguments.bytes=${{ inputs.payload-bytes }} \
+              --no-daemon --stacktrace
+
+      # ── Cleanup + artifacts ──────────────────────────────────────────
+      - name: Stop testserver
+        if: always()
+        run: |
+          if [ -n "${TESTSERVER_PID:-}" ]; then
+            kill "${TESTSERVER_PID}" 2>/dev/null || true
+          fi
+
+      - name: Upload testserver log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testserver-log-${{ github.run_number }}
+          path: testserver.log
+          if-no-files-found: warn
+
+      - name: Upload androidTest report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: androidTest-report-${{ github.run_number }}
+          path: |
+            app/build/reports/androidTests/**
+            app/build/outputs/androidTest-results/**
+          if-no-files-found: warn

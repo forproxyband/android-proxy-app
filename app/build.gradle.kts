@@ -7,6 +7,14 @@ val buildNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0
 val appVersionName = if (buildNumber > 0) "1.0.$buildNumber" else "1.0.0-dev"
 val appVersionCode = if (buildNumber > 0) buildNumber else 1
 
+// E2E build switch: `-Pe2e=true` adds x86_64 to abiFilters so the APK
+// installs on the ubuntu-latest CI emulator (x86_64). Production builds
+// stay arm64-only — libproxyagent.so (the legacy BINARY engine) is only
+// available pre-built for arm64. The NATIVE engine that the e2e tests
+// exercise has no such dep; libagentsplice.so is built from C source by
+// CMake and compiles for any ABI in the filter list.
+val isE2eBuild = (findProperty("e2e") as? String)?.equals("true", ignoreCase = true) == true
+
 android {
     namespace = "com.proxyagent.app"
     compileSdk = 35
@@ -40,10 +48,20 @@ android {
         // CMake-built libagentsplice.so and the Go binary cover the
         // same architectures. Expand if/when the Go binary is rebuilt
         // for additional ABIs.
+        //
+        // e2e: we add x86_64 so the APK runs on the ubuntu-latest CI
+        // emulator. libproxyagent.so is missing for that ABI (BINARY
+        // engine becomes unavailable), but NATIVE engine — the path
+        // the e2e tests cover — has no dep on it. libagentsplice.so is
+        // built from source for both ABIs in this list.
         ndk {
             //noinspection ChromeOsAbiSupport
-            abiFilters += listOf("arm64-v8a")
+            abiFilters += if (isE2eBuild) listOf("arm64-v8a", "x86_64") else listOf("arm64-v8a")
         }
+
+        // Instrumentation runner for `./gradlew connectedAndroidTest`.
+        // Wired regardless of -Pe2e so IDE "Run androidTest" also works.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         externalNativeBuild {
             cmake {
@@ -220,4 +238,12 @@ dependencies {
     // genuinely need BC, shade it into a private namespace first.
     // Desugaring for java.time.* on API < 26 (needed by kwik).
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
+
+    // ── Instrumentation tests (app/src/androidTest) ────────────────────
+    // Only consumed by `connectedAndroidTest` / `connected<Variant>AndroidTest`.
+    // Not in the shipping APK. AndroidX test infra at current LTS pins.
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:rules:1.6.1")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("junit:junit:4.13.2")
 }
