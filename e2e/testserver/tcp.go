@@ -171,7 +171,11 @@ func handleTCPControl(ctx context.Context, hub *Hub, c net.Conn) {
 	hub.tcpCtrl = ctrl
 	hub.mu.Unlock()
 
-	// Reader loop: log whatever the agent sends back, exit on EOF.
+	// Reader loop: parse newline-JSON from the agent and dispatch.
+	// Currently only OPEN_FAIL gets semantic handling (it must wake the
+	// API handler waiting on the pending channel — see Hub.failPending).
+	// Anything else gets logged so future commands appear in test output
+	// without changing this loop.
 	go func() {
 		<-ctx.Done()
 		ctrl.close()
@@ -181,7 +185,23 @@ func handleTCPControl(ctx context.Context, hub *Hub, c net.Conn) {
 		if err != nil {
 			break
 		}
-		log.Printf("tcp ctrl recv: %s", trimNL(l))
+		raw := trimNL(l)
+		var msg struct {
+			Command string `json:"command"`
+			Token   string `json:"token"`
+			Reason  string `json:"reason"`
+		}
+		if jerr := json.Unmarshal([]byte(raw), &msg); jerr != nil {
+			log.Printf("tcp ctrl recv (bad json): %s", raw)
+			continue
+		}
+		switch msg.Command {
+		case "OPEN_FAIL":
+			log.Printf("tcp ctrl OPEN_FAIL token=%s reason=%q", shortToken(msg.Token), msg.Reason)
+			hub.failPending(msg.Token, msg.Reason)
+		default:
+			log.Printf("tcp ctrl recv: %s", raw)
+		}
 	}
 
 	hub.mu.Lock()
@@ -209,14 +229,17 @@ func handleTCPData(hub *Hub, c net.Conn) {
 	token := string(tok)
 	ch := hub.takePending(token)
 	if ch == nil {
-		log.Printf("tcp data: no pending tunnel for token %s", shortToken(token))
+		// Mirrors production "orphan data conn" path
+		// (proxy-server-go-sdk/tunnel/server.go handleDataTCP). The agent
+		// either won the OPEN race against an OPEN_FAIL we already
+		// processed, or the API handler timed out and gave up.
+		log.Printf("tcp data: orphan socket for token %s", shortToken(token))
 		c.Close()
 		return
 	}
 	select {
-	case ch <- c:
+	case ch <- pendingResult{sock: c}:
 	default:
-		// Pending handler already gave up — drop the socket.
 		c.Close()
 	}
 }
@@ -237,9 +260,10 @@ func shortToken(t string) string {
 
 // sendOpenCommand asks the connected agent to dial host:port and bridge
 // the resulting target socket to the data socket that comes in with this
-// token. Returns the channel where that data socket will be delivered.
+// token. Returns the channel where the pendingResult will land — either
+// the agent's data socket (sock set) or an OPEN_FAIL reason (fail set).
 // Caller must call dropPending(token) on early failure paths.
-func (hub *Hub) sendOpenCommand(token, host string, port int) (chan net.Conn, error) {
+func (hub *Hub) sendOpenCommand(token, host string, port int) (chan pendingResult, error) {
 	hub.mu.Lock()
 	ctrl := hub.tcpCtrl
 	hub.mu.Unlock()

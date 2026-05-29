@@ -124,16 +124,16 @@ jobs:
           force-avd-creation: false
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          # `bytes` is forwarded into E2EConfig.payloadBytes via the
-          # AndroidJUnitRunner argument plumbing. The testserverHost
-          # default of "10.0.2.2" already points emulator → host.
+          # Knobs flow into the test runner via app/build.gradle.kts
+          # → testInstrumentationRunnerArguments (config-caching compatible).
+          # Override only `bytes` from workflow_dispatch input.
           #
           # IMPORTANT: keep the script on one line. android-emulator-runner
           # hands the value to `sh -c` without interpreting YAML literal
           # blocks specially, so backslash-newline continuations are
           # passed through as a literal `\` argument and gradle reads it
           # as a task name ("Task '\' not found").
-          script: ./gradlew :app:connectedDebugAndroidTest -Pe2e=true -Pandroid.testInstrumentationRunnerArguments.bytes=${{ inputs.payload-bytes }} --no-daemon --stacktrace
+          script: ./gradlew :app:connectedDebugAndroidTest -Pe2e=true -Pe2eBytes=${{ inputs.payload-bytes }} --no-daemon --stacktrace
 
       # ── Cleanup + artifacts ──────────────────────────────────────────
       - name: Stop testserver

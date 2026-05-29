@@ -43,6 +43,9 @@ func runAPI(ctx context.Context, hub *Hub, port int) {
 	mux.HandleFunc("/tests/tunnel-roundtrip", func(w http.ResponseWriter, r *http.Request) {
 		handleTunnelRoundtrip(r.Context(), hub, w, r)
 	})
+	mux.HandleFunc("/tests/tunnel-roundtrip-concurrent", func(w http.ResponseWriter, r *http.Request) {
+		handleTunnelConcurrent(r.Context(), hub, w, r)
+	})
 
 	srv := &http.Server{
 		Addr:         addrStr(hub.bindAddr, port),
@@ -90,6 +93,17 @@ func handleTunnelRoundtrip(ctx context.Context, hub *Hub, w http.ResponseWriter,
 	if host == "" {
 		host = "10.0.2.2" // Android emulator → host loopback
 	}
+	// target-port: defaults to our echo target. Tests for error paths
+	// (OPEN_FAIL, refused TCP, etc.) override with an unreachable port.
+	targetPort := hub.echoPort
+	if p := r.URL.Query().Get("target-port"); p != "" {
+		v, perr := strconv.Atoi(p)
+		if perr != nil || v <= 0 || v > 65535 {
+			writeErr(w, http.StatusBadRequest, "bad target-port="+p)
+			return
+		}
+		targetPort = v
+	}
 
 	payload := make([]byte, n)
 	if _, err := rand.Read(payload); err != nil {
@@ -104,9 +118,9 @@ func handleTunnelRoundtrip(ctx context.Context, hub *Hub, w http.ResponseWriter,
 	var recv []byte
 	switch transport {
 	case "tcp":
-		recv, err = roundtripTCP(pumpCtx, hub, host, payload)
+		recv, err = roundtripTCP(pumpCtx, hub, host, targetPort, payload)
 	case "quic":
-		recv, err = roundtripQUIC(pumpCtx, hub, host, payload)
+		recv, err = roundtripQUIC(pumpCtx, hub, host, targetPort, payload)
 	default:
 		writeErr(w, http.StatusBadRequest, "transport must be tcp|quic")
 		return
@@ -131,18 +145,120 @@ func handleTunnelRoundtrip(ctx context.Context, hub *Hub, w http.ResponseWriter,
 	})
 }
 
-func roundtripTCP(ctx context.Context, hub *Hub, host string, payload []byte) ([]byte, error) {
+// handleTunnelConcurrent fans out `count` parallel round-trips through
+// `count` separate tunnels and reports the aggregate. For QUIC this
+// exercises stream multiplexing on a single connection; for TCP it
+// exercises the data-socket warm pool + token matchmaking under
+// contention.
+func handleTunnelConcurrent(ctx context.Context, hub *Hub, w http.ResponseWriter, r *http.Request) {
+	count, _ := strconv.Atoi(r.URL.Query().Get("count"))
+	if count <= 0 {
+		count = 8
+	}
+	if count > 64 {
+		writeErr(w, http.StatusBadRequest, "count must be 1..64")
+		return
+	}
+	bytesParam := r.URL.Query().Get("bytes")
+	if bytesParam == "" {
+		bytesParam = "32768"
+	}
+	n, err := strconv.Atoi(bytesParam)
+	if err != nil || n <= 0 || n > 1<<20 {
+		writeErr(w, http.StatusBadRequest, "bytes must be 1..1MiB")
+		return
+	}
+	transport := r.URL.Query().Get("transport")
+	if transport == "" {
+		transport = "quic"
+	}
+	if transport != "tcp" && transport != "quic" {
+		writeErr(w, http.StatusBadRequest, "transport must be tcp|quic")
+		return
+	}
+	host := r.URL.Query().Get("target-host")
+	if host == "" {
+		host = "10.0.2.2"
+	}
+
+	type result struct {
+		Index int    `json:"index"`
+		OK    bool   `json:"ok"`
+		Error string `json:"error,omitempty"`
+		Bytes int    `json:"bytes"`
+	}
+	results := make([]result, count)
+	pumpCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			payload := make([]byte, n)
+			if _, e := rand.Read(payload); e != nil {
+				results[idx] = result{Index: idx, Error: "rand: " + e.Error()}
+				return
+			}
+			sentHash := sha256.Sum256(payload)
+			var recv []byte
+			var rerr error
+			switch transport {
+			case "tcp":
+				recv, rerr = roundtripTCP(pumpCtx, hub, host, hub.echoPort, payload)
+			case "quic":
+				recv, rerr = roundtripQUIC(pumpCtx, hub, host, hub.echoPort, payload)
+			}
+			r := result{Index: idx, Bytes: len(recv)}
+			if rerr != nil {
+				r.Error = rerr.Error()
+			} else {
+				recvHash := sha256.Sum256(recv)
+				r.OK = len(recv) == n && recvHash == sentHash
+				if !r.OK {
+					r.Error = "byte/length mismatch"
+				}
+			}
+			results[idx] = r
+		}(i)
+	}
+	wg.Wait()
+
+	succeeded := 0
+	for _, r := range results {
+		if r.OK {
+			succeeded++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        succeeded == count,
+		"total":     count,
+		"succeeded": succeeded,
+		"transport": transport,
+		"bytes":     n,
+		"results":   results,
+	})
+}
+
+func roundtripTCP(ctx context.Context, hub *Hub, host string, port int, payload []byte) ([]byte, error) {
 	token, err := randomHexToken()
 	if err != nil {
 		return nil, err
 	}
-	ch, err := hub.sendOpenCommand(token, host, hub.echoPort)
+	ch, err := hub.sendOpenCommand(token, host, port)
 	if err != nil {
 		return nil, err
 	}
 	var sock net.Conn
 	select {
-	case sock = <-ch:
+	case res := <-ch:
+		if res.fail != "" {
+			// Agent dialed the target and got a refusal/timeout — production
+			// surfaces this as an error to the OpenTunnel caller, we mirror.
+			return nil, fmt.Errorf("agent OPEN_FAIL: %s", res.fail)
+		}
+		sock = res.sock
 	case <-ctx.Done():
 		hub.dropPending(token)
 		return nil, errors.New("timed out waiting for data socket")
@@ -151,8 +267,8 @@ func roundtripTCP(ctx context.Context, hub *Hub, host string, payload []byte) ([
 	return pumpFullDuplex(ctx, sock, sock, payload)
 }
 
-func roundtripQUIC(ctx context.Context, hub *Hub, host string, payload []byte) ([]byte, error) {
-	stream, err := hub.openQUICTunnel(ctx, host, hub.echoPort)
+func roundtripQUIC(ctx context.Context, hub *Hub, host string, port int, payload []byte) ([]byte, error) {
+	stream, err := hub.openQUICTunnel(ctx, host, port)
 	if err != nil {
 		return nil, err
 	}

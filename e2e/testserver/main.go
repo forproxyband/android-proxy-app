@@ -47,10 +47,14 @@ type Hub struct {
 	// Active QUIC control: API opens server-initiated streams on this conn.
 	quicConn quic.Connection
 
-	// TCP tunnel matchmaking: key = 32-char hex token, value receives the
-	// data socket that the agent writes that token onto. The API handler
-	// registers the channel before sending OPEN and reads from it after.
-	pending map[string]chan net.Conn
+	// TCP tunnel matchmaking: key = 32-char hex token, value receives one
+	// of:
+	//   - {sock: <conn>, fail: ""}  → agent's data socket arrived
+	//   - {sock: nil,   fail: <r>}  → agent sent OPEN_FAIL with reason
+	// The API handler registers the channel before sending OPEN and reads
+	// from it after. Closing the channel without a send is not used —
+	// always deliver a result so the API handler can branch cleanly.
+	pending map[string]chan pendingResult
 
 	// Liveness flags — /healthz waits for both loops to be live before
 	// returning 200, so tests can poll without a race on startup.
@@ -58,24 +62,34 @@ type Hub struct {
 	quicReady atomic.Bool
 }
 
+// pendingResult is what the API handler waits on while the agent is
+// resolving an OPEN. Exactly one of sock or fail is meaningful: a
+// non-nil sock means the data socket arrived with a matching token,
+// and a non-empty fail means the agent reported OPEN_FAIL with that
+// reason instead.
+type pendingResult struct {
+	sock net.Conn
+	fail string
+}
+
 func newHub(bind string, echoPort int, authKey string) *Hub {
 	return &Hub{
 		bindAddr: bind,
 		echoPort: echoPort,
 		authKey:  authKey,
-		pending:  make(map[string]chan net.Conn),
+		pending:  make(map[string]chan pendingResult),
 	}
 }
 
-func (h *Hub) registerPending(token string) chan net.Conn {
-	ch := make(chan net.Conn, 1)
+func (h *Hub) registerPending(token string) chan pendingResult {
+	ch := make(chan pendingResult, 1)
 	h.mu.Lock()
 	h.pending[token] = ch
 	h.mu.Unlock()
 	return ch
 }
 
-func (h *Hub) takePending(token string) chan net.Conn {
+func (h *Hub) takePending(token string) chan pendingResult {
 	h.mu.Lock()
 	ch := h.pending[token]
 	delete(h.pending, token)
@@ -87,6 +101,24 @@ func (h *Hub) dropPending(token string) {
 	h.mu.Lock()
 	delete(h.pending, token)
 	h.mu.Unlock()
+}
+
+// failPending is the mock counterpart of production
+// `Registry.deliverDataConn(token, nil)` — wakes the API handler with
+// the OPEN_FAIL reason so the test surfaces a clean error instead of
+// timing out. No-op if the token has already been resolved or evicted.
+func (h *Hub) failPending(token, reason string) {
+	h.mu.Lock()
+	ch := h.pending[token]
+	delete(h.pending, token)
+	h.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- pendingResult{fail: reason}:
+	default:
+	}
 }
 
 func main() {

@@ -63,6 +63,22 @@ android {
         // Wired regardless of -Pe2e so IDE "Run androidTest" also works.
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
+        // Wire e2e knobs into the test runner via gradle properties.
+        // Passing them this way (vs `-Pandroid.testInstrumentationRunnerArguments.x=...`)
+        // keeps the build compatible with Gradle configuration caching.
+        // Defaults match E2EConfig.kt; overrideable per-run with
+        // `./gradlew connectedDebugAndroidTest -Pe2eBytes=1048576 ...`.
+        testInstrumentationRunnerArguments["bytes"] =
+            (findProperty("e2eBytes") as? String) ?: "65536"
+        testInstrumentationRunnerArguments["testserverHost"] =
+            (findProperty("e2eTestserverHost") as? String) ?: "10.0.2.2"
+        testInstrumentationRunnerArguments["testserverPort"] =
+            (findProperty("e2eTestserverPort") as? String) ?: "17080"
+        testInstrumentationRunnerArguments["testserverApiPort"] =
+            (findProperty("e2eTestserverApiPort") as? String) ?: "17083"
+        testInstrumentationRunnerArguments["authKey"] =
+            (findProperty("e2eAuthKey") as? String) ?: "e2e"
+
         externalNativeBuild {
             cmake {
                 cFlags += listOf("-fvisibility=hidden")
