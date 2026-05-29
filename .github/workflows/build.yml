@@ -1,10 +1,34 @@
 name: Build APK
 
+# Skip the APK build when a push / PR only touches files that do not
+# influence the compiled app:
+#   * e2e/**                       — Go testserver, used only by the E2E
+#                                    workflow on its own emulator job
+#   * docs (root *.md, etc.)       — text-only, no Kotlin / C / gradle
+#   * sibling workflow .yml files  — they manage their own triggers
+#   * .gitignore                   — affects nothing AGP reads
+#
+# Anything that does change the APK (app/**, build.gradle.kts,
+# settings.gradle.kts, gradle.properties, gradle/, gradlew*, keystore.jks,
+# and this file itself) still triggers normally.
+#
+# `workflow_dispatch` stays so an APK can be rebuilt on demand even for
+# a docs-only branch.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'e2e/**'
+      - '.github/workflows/e2e.yml'
+      - '.gitignore'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'e2e/**'
+      - '.github/workflows/e2e.yml'
+      - '.gitignore'
   workflow_dispatch:
 
 jobs:
