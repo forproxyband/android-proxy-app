@@ -277,22 +277,18 @@ internal class SpaceRecovery(val space: PacketNumberSpace) {
         /** Cap on tracked received-PN set; older entries get dropped. */
         const val MAX_RANGES_BUFFERED: Int = 1024
         /** Every Nth ack-eliciting packet wakes the sender for an
-         *  immediate ACK. Picked at 10 because:
-         *  - RFC 9000 §13.2.2 strongly recommends ACKing every 2 to
-         *    keep peer CC's ack-clock fed.
-         *  - At 100 Mbps inbound (≈10 kpps) waking on every packet
-         *    pins the sender CPU on wakeup churn; every-10 yields
-         *    ~1000 wakes/s and ~1 ms ACK delay — well under the
-         *    advertised `max_ack_delay` (25 ms) and the old idle-poll
-         *    cadence (20 ms) that left peer's quic-go starved on
-         *    ack-clock feedback in duplex tests (build 99: QUIC
-         *    upload tanked to single-digit Mbps while TCP duplex
-         *    held 300 Mbps both directions).
+         *  immediate ACK. RFC 9000 §13.2.2 recommends ACKing every
+         *  other ack-eliciting packet to give the peer's CC a tight
+         *  ack-clock — that's what we use.
          *
-         *  Lower → faster RX-direction throughput, more CPU on the
-         *  sender thread; higher → less CPU, more inflation of peer's
-         *  RTT estimate (peer's BBR/CUBIC throttles cwnd growth on
-         *  inflated RTT). */
-        const val IMMEDIATE_ACK_THRESHOLD: Int = 10
+         *  Build-119 capture (HIGH_1000, ~80 ms RTT to peer) confirmed
+         *  threshold=10 capped upload at ~6 Mbps even though the link
+         *  did 260 Mbps on TCP: quic-go's CUBIC grew cwnd off our
+         *  ~70 ACK/s feedback, far below what TCP_QUICKACK (≈ack per
+         *  packet) feeds the same path. Dropping to 2 yields ~350
+         *  ACK/s at the same RX rate — still well within sender-thread
+         *  CPU budget on modern Android, and tracks Linux TCP's
+         *  default for high-throughput flows. */
+        const val IMMEDIATE_ACK_THRESHOLD: Int = 2
     }
 }
