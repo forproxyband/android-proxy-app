@@ -1033,31 +1033,38 @@ internal class Connection(
                 // Priority 4: STREAM frames, paced via the token bucket.
                 val workRemains = if (oneRttSpace.ready()) drainStreams() else false
 
-                // Priority 4b: auto-RESET stuck closed streams. When a
-                // tunnel's bridge thread exits with bytes still queued
-                // (sendBuffer.closed && queuedBytes > 0) and the
-                // connection-level credit pin prevents draining, the
-                // stream sits forever — peer holds its own state for our
-                // sake. proxy-server-go is confirmed (build-117 capture)
-                // to NOT send STOP_SENDING in this case, so the
-                // STOP_SENDING handler above never fires. Sweep here:
-                // anything stuck for [stuckResetTimeoutNanos] gets a
-                // unilateral RESET_STREAM. quic-go releases the per-
-                // stream flow control budget on receipt, which lets the
-                // connection-level MAX_DATA grow again and the next
-                // (upload) phase actually run.
+                // Priority 4b: auto-RESET stuck streams. The build-99
+                // download→upload regression is "queued bytes can't
+                // drain because peer pinned MAX_DATA, and proxy-server-go
+                // doesn't send STOP_SENDING to give us an out". The
+                // bridge feeding the stream parks on notFull at the cap;
+                // it never reaches output.close(), so sendBuffer.closed
+                // stays false (the build-118 sweeper missed this and
+                // never fired — confirmed in 11:27-11:30 capture).
+                //
+                // Real trigger: queuedBytes>0 AND the buffer hasn't
+                // drained for [stuckResetTimeoutNanos]. lastDrainNanos
+                // is updated only when bytes actually leave for the
+                // wire (or when a fresh batch starts in an empty
+                // buffer), so during normal credit-healthy flow this
+                // timer never expires; it only goes stale when the
+                // sender can't drain. Issuing RESET_STREAM with
+                // Final Size = sendOffset lets quic-go release the
+                // per-stream FC budget so connection-level MAX_DATA
+                // can grow again. Routed through logStat so the user-
+                // exportable agent.log records each reset.
                 if (oneRttSpace.ready()) {
                     val nowSweep = System.nanoTime()
                     for ((id, s) in streams) {
                         if (s.sendState == Stream.SendState.RESET_SENT) continue
                         val sb = s.sendBuffer
-                        if (!sb.closed || sb.queuedBytes <= 0L) continue
-                        if (sb.closedAtNanos == 0L) continue
-                        if (nowSweep - sb.closedAtNanos < stuckResetTimeoutNanos) continue
+                        if (sb.queuedBytes <= 0L) continue
+                        val idleNanos = nowSweep - sb.lastDrainNanos
+                        if (idleNanos < stuckResetTimeoutNanos) continue
                         val discarded = sb.queuedBytes
                         val finalSize = s.resetSendAbort()
                         pendingResetStreams.offer(ResetStream(id, 0L, finalSize))
-                        log("auto-reset stuck stream id=$id finalSize=$finalSize (discarded=$discarded, closed for ${(nowSweep - sb.closedAtNanos) / 1_000_000}ms)")
+                        logStat("auto-reset stuck stream id=$id finalSize=$finalSize discarded=${discarded}B idle=${idleNanos / 1_000_000}ms")
                     }
                 }
 

@@ -275,15 +275,25 @@ internal class SendBuffer(private val maxBufferBytes: Int = DEFAULT_MAX_BUFFER_B
         private set
     @Volatile var closed: Boolean = false
         private set
-    /** Wall-clock (nanoTime) when [close] was first called. 0 = not
-     *  yet closed. The sender loop reads this to detect streams whose
-     *  bridge exited but whose queued bytes have been stuck for too
-     *  long — those get force-RESET so peer's flow control accounting
-     *  can release. Without this, post-download download streams would
-     *  pin connection-level credit forever (the build-99 regression:
-     *  proxy-server-go does NOT send STOP_SENDING, so there's no
-     *  externally-driven signal to kick the cleanup). */
-    @Volatile var closedAtNanos: Long = 0L
+    /** Wall-clock of the LAST event that made forward progress on this
+     *  buffer — either a successful [drain] (bytes left the buffer for
+     *  the wire) or the bytes-going-from-empty-to-non-empty [write]
+     *  that started a new queued batch. The Connection sender loop
+     *  reads this to detect "stuck" streams: a stream with queuedBytes
+     *  > 0 whose [lastDrainNanos] is older than the auto-RESET timeout
+     *  has had its bridge unable to push bytes through the wire — the
+     *  build-99 download→upload pattern where peer pins MAX_DATA after
+     *  download ends and the queued bytes never drain. We RESET those
+     *  unilaterally so peer can free its per-stream accounting and the
+     *  connection-level MAX_DATA can grow again.
+     *
+     *  Why not use sendBuffer.closed: when bridges block on the cap
+     *  (write parked on notFull) they never reach output.close() →
+     *  `closed` stays false → an earlier sweeper (build-118) skipped
+     *  exactly the streams that needed resetting. Tracking the drain
+     *  cadence directly catches "wedged with bytes" regardless of
+     *  bridge-thread state. */
+    @Volatile var lastDrainNanos: Long = System.nanoTime()
         private set
     private val lock = ReentrantLock()
     /** Signalled by [drain] whenever bytes leave the buffer AND by
@@ -311,6 +321,11 @@ internal class SendBuffer(private val maxBufferBytes: Int = DEFAULT_MAX_BUFFER_B
                 // via its catch instead of silently retrying.
                 throw java.io.IOException("send buffer closed")
             }
+            // Restart the stuck-detection timer when bytes first
+            // enter an empty buffer — a stream that's been idle
+            // (queuedBytes=0) for a long time shouldn't be flagged
+            // stuck the instant a new chunk arrives.
+            if (queuedBytes == 0L) lastDrainNanos = System.nanoTime()
             val copy = ByteArray(len)
             System.arraycopy(data, off, copy, 0, len)
             chunks.addLast(copy)
@@ -338,13 +353,15 @@ internal class SendBuffer(private val maxBufferBytes: Int = DEFAULT_MAX_BUFFER_B
             }
         }
         queuedBytes -= written
-        if (written > 0) notFull.signalAll()
+        if (written > 0) {
+            lastDrainNanos = System.nanoTime()  // forward progress — restart stuck timer
+            notFull.signalAll()
+        }
         if (written == out.size) out else out.copyOf(written)
     }
 
     fun close() = lock.withLock {
         closed = true
-        if (closedAtNanos == 0L) closedAtNanos = System.nanoTime()
         notFull.signalAll()  // unblock any parked writers
     }
 
