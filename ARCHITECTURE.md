@@ -241,6 +241,14 @@ on a separate cadence — a non-trivial kwik-internals change. Until
 then, do not re-patch `SendBuffer.maxBufferSize`; the speed cost
 of higher-throughput download is too much receive-side throughput.
 
+The same SendBuffer cap design *does* work cleanly in our own native
+QUIC stack (`NativeQuicTransport`) because there the sender loop
+prioritises control frames (ACK / MAX_DATA / MAX_STREAM_DATA /
+RESET_STREAM) ahead of STREAM data — see the "Bounded SendBuffer
+with backpressure" note under the native-QUIC invariants below.
+The kwik-side advice above is specifically about the kwik adapter
+whose internal scheduler is strictly FIFO across all frame types.
+
 ALPN is `proxy-tunnel/1`, certificate validation is disabled
 (`noServerCertificateCheck()` — same posture as the Go SDK's
 `InsecureSkipVerify: true`; identity is verified by the AUTH key on
@@ -280,12 +288,34 @@ easy to regress:
   The bucket measures elapsed time, so it is immune to sleep precision
   and mirrors quic-go's `pacer.Budget()`.
 
-- **The sender loop must be woken on writes and window grants.** It
-  otherwise idle-polls at 20 ms, adding latency to every response.
-  `Stream.sendWakeup` (installed by `Connection` on both stream-creation
-  paths) offers a `Tick` when the bridge writes; receiving
-  `MAX_DATA` / `MAX_STREAM_DATA` also offers one so a flow-blocked
-  sender resumes at once. While data remains the loop polls at 2 ms.
+- **The sender loop must be woken on writes, window grants, AND
+  inbound ack-eliciting packets.** It otherwise idle-polls at 20 ms,
+  adding latency to every response. `Stream.sendWakeup` (installed by
+  `Connection` on both stream-creation paths) offers a `Tick` when the
+  bridge writes; receiving `MAX_DATA` / `MAX_STREAM_DATA` also offers
+  one so a flow-blocked sender resumes at once. While data remains
+  the loop polls at 2 ms.
+
+  For the RX direction, `SpaceRecovery.onPacketReceived` counts
+  consecutive ack-eliciting packets and returns true once
+  `IMMEDIATE_ACK_THRESHOLD = 2` is crossed (RFC 9000 §13.2.2 — "ACK
+  every other ack-eliciting packet"). The receive thread sees the
+  signal and offers a Tick. The build-119 cap was 10 and produced
+  ~70 ACK/s at 700 pps inbound, which throttled peer's CUBIC growth
+  to ~6 Mbps even on a path the same link did 260 Mbps on TCP. Drop
+  to 2 raised the same flow to 63 Mbps — the path-limited number,
+  not our limit anymore.
+
+- **ACK frames MUST carry the real ack-delay.** The earlier code
+  unconditionally passed `0L` to `buildAckFrame`. With our 2-20 ms
+  sender poll, that under-reported ACK delay → peer's quic-go used
+  the raw RTT sample → its RTT estimate inflated by up to 20 ms →
+  its BBR/CUBIC throttled cwnd growth on the upload direction.
+  `SpaceRecovery.consumeAndTakeAckDelay(now)` takes a single
+  critical-section snapshot of `(shouldEmit, ackDelayNanos)` so the
+  delay measurement is locked to the largest-acked packet that the
+  same `buildAckFrame` call will reference (RFC 9000 §19.3 ack_delay
+  is defined as time from receiving `largestAcked` to ACK emission).
 
 - **Never `pollSendFrame` then drop the frame.** `pollSendFrame`
   dequeues from the send buffer and advances `sendOffset`; declining to
@@ -363,42 +393,77 @@ easy to regress:
   `rttNanos>0` only for the largest acked packet; `BrutalCongestionControl.onPacketAcked`
   skips the EWMA update when `rttNanos<=0`. Don't sample per-packet.
 
-- **Send-side stall self-heal (proxy-server-go MAX_DATA quirk).** After
-  a heavy download, `flow.send_credit` can pin at 0 indefinitely:
-  proxy-server-go (quic-go) extends MAX_DATA strictly off its own
-  consume position, and once the test client stops draining the
-  download payload the consume halts and our send window never reopens.
-  Build-97 confirmed empirically — **224 DATA_BLOCKED frames over 3m40s
-  produced zero MAX_DATA responses**. DATA_BLOCKED is correct per RFC
-  9000 §19.12 (we still emit it, periodically, in case a future
-  proxy reacts) but quic-go on the server side does not treat it as a
-  trigger. So the connection layer self-heals: if `workRemains &&
-  flow.sendCredit()<=0` persists for `stallTimeoutNanos` (5 s),
-  `Connection.close()` tears down the QUIC connection and the supervisor
-  redials a fresh one — the user's own observation was that fresh
-  connections always work. Two correctness invariants make the close
-  propagate:
-  1. **`Connection.acceptStream` MUST be poll-based, not blocking
-     `.take()`.** It checks `closed.get()` between 500 ms polls so a
-     parked accept caller unblocks promptly; `NativeQuicTransport`
-     turns the `null` into `IOException` so `quicAcceptLoop` exits and
-     the supervisor reconnects. The old `incomingServerStreams.take()`
-     wedged forever after a force-close (build 98 logged STALL TIMEOUT
-     but the agent stayed "CONNECTED" because the accept caller was
-     parked, the bridge threads were parked, and nothing surfaced the
-     disconnect upward).
-  2. **`Connection.close()` MUST signal EOF on every stream's
-     `recvBuffer`.** Each `Stream.closeOnConnectionTermination()` flips
-     `eofReached` and `signalAll`s the not-empty condition so bridge
-     threads parked in `Stream.input.read` unblock, drop out of
-     `copyStream`, and let the tunnels tear down cleanly. Without this
-     they leak indefinitely.
+- **Bounded SendBuffer with backpressure + auto-RESET stuck streams
+  (the build-97/99/118 saga).** After a heavy download speedtest,
+  `flow.send_credit` can pin at 0 indefinitely: proxy-server-go
+  (quic-go) extends MAX_DATA strictly off its own consume position,
+  and once the test client stops draining the download payload the
+  consume halts and our send window never reopens. Build-97 confirmed
+  empirically — **224 DATA_BLOCKED frames over 3m40s produced zero
+  MAX_DATA responses**. DATA_BLOCKED is correct per RFC 9000 §19.12
+  (we still emit it, periodically, in case a future proxy reacts) but
+  quic-go on the server side does not treat it as a trigger.
+
+  Build 97-99 mitigated this with a hard 5-second stall self-heal —
+  close the QUIC connection if `workRemains && sendCredit<=0`, force
+  the supervisor to redial. That worked but produced a visible 5 s
+  freeze in every speedtest's download→upload transition.
+
+  Build 100-120 replaces that mechanism with kwik-style backpressure
+  and proactive stream cleanup:
+
+  1. **`Stream.SendBuffer` is bounded at the active profile's
+     `sendBufferMaxBytes` (64 / 128 / 256 KB for LOW / MID / HIGH).**
+     `SendBuffer.write` parks the bridge thread on a `notFull`
+     condition variable when the cap is full; `SendBuffer.drain`
+     signals it as bytes leave for the wire. With a small cap, the
+     TCP-target socket's send buffer fills, the target backs off, and
+     the agent never accumulates gigabytes of un-sendable bytes
+     locally. This is the same design as kwik's 50 KB cap —
+     transplanted to our stack because our sender's priority ordering
+     (control frames before STREAM data) avoids the kwik regression
+     that motivated the kwik-side warning above.
+  2. **STOP_SENDING and RESET_STREAM are fully handled.** Peer's
+     STOP_SENDING calls `Stream.resetSendAbort()` which discards
+     the queued bytes (releases blocked writers with IOException)
+     and queues a matching RESET_STREAM with `finalSize=sendOffset`
+     onto `pendingResetStreams`. Peer's RESET_STREAM forces EOF on
+     `recvBuffer` so parked readers exit. Both are retransmitted via
+     `pendingRetransmit` on loss; without that, a dropped RESET_STREAM
+     would leave peer waiting on bytes we won't send.
+  3. **Auto-RESET sweeper (the actual recovery path).** Per-stream
+     `SendBuffer.lastDrainNanos` records the last time bytes left the
+     buffer (or the 0→non-zero transition that started a fresh batch).
+     The sender loop's priority 4b scan resets any stream with
+     `queuedBytes > 0 && now - lastDrainNanos > 2 s` — discards the
+     queue, transitions to `RESET_SENT`, emits RESET_STREAM. quic-go
+     on the peer responds to RESET_STREAM by releasing the per-stream
+     flow-control budget, which lets connection-level MAX_DATA grow
+     again. Build-119 capture confirmed: `send_credit` goes from `0`
+     to `12+ MB` within milliseconds of the sweeper firing on the
+     stuck download streams, and the upload phase then runs normally.
+
+  Why not the simpler "close all streams that look stuck on
+  `sendBuffer.closed=true`": with the cap, bridges park *inside*
+  `write()` (waiting on `notFull`) and **never reach `output.close()`**.
+  The earlier build-118 sweeper checked `sb.closed` and silently never
+  fired. `lastDrainNanos` is the only signal that catches "wedged
+  with bytes" regardless of bridge-thread state.
 
   Diagnostic counters surfaced in the 5-second `stats:` line:
-  `db_sent` (DATA_BLOCKED frames sent), `md_recv` (MAX_DATA frames
-  received), `stall_reconnects` (times the self-heal fired). A run
-  where `db_sent` climbs but `md_recv` stays flat is exactly the
-  quic-go behavior described above.
+  - `db_sent` — DATA_BLOCKED frames we sent (climbing = our send
+    side is credit-blocked)
+  - `md_recv` — MAX_DATA frames the peer sent us (flat while
+    `db_sent` climbs = the quic-go behavior described above)
+  - `send_buf_queued` — total bytes parked in per-stream SendBuffers
+    across all streams (should drop sharply after each `auto-reset
+    stuck stream` event)
+  - `flow.send_credit` — connection-level send credit remaining (0
+    while peer's MAX_DATA is pinned)
+
+  Auto-RESET events are emitted via `logStat` so they land in the
+  exportable agent.log:
+  `auto-reset stuck stream id=X finalSize=Y discarded=ZB idle=Wms`.
 
 - **Wi-Fi-return uplink binding must precede `socket.connect`.** When
   the user has wifi_return enabled, the in-house QUIC UDP uplink socket
@@ -451,6 +516,15 @@ get re-discovered.**
   `ConnectionFlowControl.shouldAdvertiseMaxData`). Higher =
   refresh sooner = less HoL wait on the receive direction at the
   cost of more control-frame overhead.
+- **QUIC SendBuffer cap** is the per-stream `Stream.SendBuffer`
+  ceiling (64 / 128 / 256 KB for LOW / MID / HIGH). Bridge threads
+  block on `notFull.await()` once the cap is hit; the auto-RESET
+  sweeper kicks in 2 s later if `lastDrainNanos` doesn't progress.
+  Sized small (kwik-style — 50 KB is kwik's default) to keep the
+  total stuck-bytes-after-credit-pin scenario bounded and to give
+  the upstream TCP target proper backpressure when peer's MAX_DATA
+  freezes. See the "Bounded SendBuffer + auto-RESET" note in the
+  native-QUIC invariants for the full design.
 - **TCP SO_RCVBUF / SO_SNDBUF** lives in a 1.5–4 MiB safe zone,
   bounded by two symmetric field-test regressions and a follow-up
   bisection:

@@ -149,6 +149,42 @@
 - `reconnect backoff` — экспоненциальный откат при разрыве (250 мс → 10 с).
 - `uplink AUTH denied (control closed before reply)` — ключ/UUID не приняты
   сервером, проверить настройки.
+- `auto-reset stuck stream id=X finalSize=Y discarded=ZB idle=Wms` —
+  сработал sweeper застрявших QUIC-стримов (см. §2.4 ниже). Нормально
+  что появляется пачкой после окончания speedtest-download. Если идёт
+  непрерывно во время обычной работы — повод заглянуть в `stats:` и
+  понять что peer не успевает отдавать MAX_DATA.
+
+### 2.2.1. Строка `stats:` (раз в 5 сек, только NATIVE+QUIC)
+
+Когда транспорт — QUIC, in-house стек каждые 5 секунд пишет
+структурированную метрику. Пример:
+
+```
+stats: datagrams=30245 stream_frames=2620 new_server_streams=120
+       decrypt_fails=0 db_sent=15 md_recv=82
+       accept_queue=0 streams_map=145 send_buf_queued=393216
+       cc.in_flight=540 cc.cwnd=14633274 flow.send_credit=12440162
+       1rtt[sent_pn=237620 acked_pn=237618 recv_pn=29830
+            outstanding=2 pto_backoff=0]
+```
+
+Полезное при диагностике низкого upload / стопов:
+
+| Поле | Что значит | Аномалия |
+| --- | --- | --- |
+| `db_sent` | Сколько DATA_BLOCKED фреймов мы отправили пиру | Растёт = наш TX упёрся в peer's MAX_DATA |
+| `md_recv` | Сколько MAX_DATA фреймов peer нам прислал | Залип на одном значении надолго = peer не даёт расти TX-окну (типично после download speedtest) |
+| `flow.send_credit` | Сколько байт ещё разрешено отправить пиру | `0` надолго = TX заморожен; после `auto-reset stuck stream` должен восстановиться |
+| `send_buf_queued` | Сколько байт в SendBuffer'ах всех стримов суммарно | Большая стабильная цифра (десятки MB) при `send_credit=0` = классическая build-99 ситуация, ждём auto-reset |
+| `cc.in_flight` / `cc.cwnd` | Brutal CC: байт в полёте / cwnd | `in_flight ≈ cwnd` = насыщаем CC; `in_flight=0` при `workRemains=true` = нечего отправлять (credit-pin) |
+| `decrypt_fails` | Сколько раз AEAD расшифровка провалилась | Растёт = пропустили key update или подмена пакетов; build-92 паттерн |
+| `pto_backoff` | Экспонента PTO retry | `> 3` = потеря большого количества пакетов, проблема пути |
+
+Здоровый паттерн: `db_sent`, `decrypt_fails`, `pto_backoff` остаются
+нулевыми или почти нулевыми, `md_recv` равномерно растёт под нагрузкой,
+`send_buf_queued` маленький (< 1 MB) или сбрасывается auto-reset'ом
+в течение пары секунд после большого download.
 
 ### 2.3. Сохранить логи (кнопка `SAVE`)
 Жмёте `SAVE` в шапке `LOGS` → формируется файл
@@ -291,16 +327,28 @@ target-дайлам прокси):
 
 **Что крутится пресетом** (под капотом — для тех кто читает логи):
 
-| Пресет | Brutal CC | UDP буфер QUIC | Refresh окна FC | TCP SO_*BUF | TCP bridge буфер |
-| --- | --- | --- | --- | --- | --- |
-| 100 | 100 Мбит/с | 4 MiB | 25% consumed | 1.5 MiB | 64 KiB |
-| 500 | 500 Мбит/с | 16 MiB | 40% consumed | 2 MiB | 128 KiB |
-| 1000 | 1 Гбит/с | 32 MiB | 50% consumed | 4 MiB | 256 KiB |
+| Пресет | Brutal CC | UDP буфер QUIC | Refresh окна FC | QUIC SendBuf cap | TCP SO_*BUF | TCP bridge буфер |
+| --- | --- | --- | --- | --- | --- | --- |
+| 100 | 100 Мбит/с | 4 MiB | 25% consumed | 64 KiB | 1.5 MiB | 64 KiB |
+| 500 | 500 Мбит/с | 16 MiB | 40% consumed | 128 KiB | 2 MiB | 128 KiB |
+| 1000 | 1 Гбит/с | 32 MiB | 50% consumed | 256 KiB | 4 MiB | 256 KiB |
 
 QUIC-окна flow-control (`initialMaxData=160 MiB`,
 `initialMaxStreamData=16 MiB`) **остаются неизменными во всех
 пресетах** — production-validated значения, занижение ломало
 uploads через прокси-сервер (build-93 incident).
+
+**QUIC SendBuffer cap** (новое в build 120+) — потолок на per-stream
+буфер исходящих байт. Bridge-нить блокируется на `notFull` когда
+буфер заполнен, что даёт backpressure target-сокету по TCP вместо
+бесконтрольного локального накопления. Это та самая kwik-style
+обратная связь — без неё build-99 видел 78 MB застрявших байт по
+300 стримам после download speedtest и upload-фаза стартовать не
+могла. Пара 64/128/256 KiB подобрана так же как `tcp_bridge_buf`:
+большое для пропускной способности, маленькое для быстрого
+освобождения памяти после окончания туннеля. Подробно — в
+ARCHITECTURE.md секция "Bounded SendBuffer + auto-RESET stuck
+streams".
 
 **TCP `SO_*BUF` ограничен safe zone 1.5-4 MiB** — границы
 установлены полевыми тестами:

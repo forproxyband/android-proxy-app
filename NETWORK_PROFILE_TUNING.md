@@ -385,13 +385,13 @@ to BDP at the profile's target rate × 100 ms RTT, with
 `window_headroom_ratio` chosen for FC update frequency).
 QUIC validation is a follow-up.
 
-## Final values (code state on 2026-05-28)
+## Final values (code state on 2026-05-29)
 
-| Profile | TCP SO_*BUF | TCP bridge | Brutal CC | UDP buf | FC headroom |
-|---|---|---|---|---|---|
-| LOW_100 (default) | 1.5 MiB | 64 KiB | 100 Mbps | 4 MiB | 0.75 |
-| MID_500 | 2 MiB | 128 KiB | 500 Mbps | 16 MiB | 0.60 |
-| HIGH_1000 | 4 MiB | 256 KiB | 1 Gbps | 32 MiB | 0.50 |
+| Profile | TCP SO_*BUF | TCP bridge | Brutal CC | UDP buf | FC headroom | QUIC SendBuf cap |
+|---|---|---|---|---|---|---|
+| LOW_100 (default) | 1.5 MiB | 64 KiB | 100 Mbps | 4 MiB | 0.75 | 64 KiB |
+| MID_500 | 2 MiB | 128 KiB | 500 Mbps | 16 MiB | 0.60 | 128 KiB |
+| HIGH_1000 | 4 MiB | 256 KiB | 1 Gbps | 32 MiB | 0.50 | 256 KiB |
 
 Default `LOW_100` picked because most mobile/Wi-Fi uplinks fall
 below 100 Mbps in practice, and the smaller kernel queue bounds
@@ -400,6 +400,24 @@ gigabit channel through the proxy → 331/299 Mbps) demonstrates
 that multi-flow workloads still saturate fast links at LOW_100,
 so users on faster networks aren't penalised by the safe default.
 
+### New on 2026-05-29: QUIC SendBuf cap
+
+Added in build 120 alongside the QUIC duplex / upload fix series
+(see ARCHITECTURE.md "Bounded SendBuffer + auto-RESET stuck
+streams" — also tracked here in the new "QUIC validation
+2026-05-29" section). Caps per-stream userspace SendBuffer at
+the chosen size; bridge threads block on `notFull.await()`
+once the cap is hit. Values track the TCP `bridge_buffer_bytes`
+column intentionally — they describe the same conceptual unit
+(per-stream userspace flush size) at the QUIC layer.
+
+The cap value matters for the credit-pin recovery scenario:
+larger cap = more stuck bytes per stream when peer's MAX_DATA
+freezes (build-119 with 4 MiB cap showed 78 MB queued across
+300 streams = unrecoverable). Picked to mirror kwik's 50 KB
+default and tracked the TCP bridge buffer sizing for
+consistency.
+
 ## Open questions
 
 These are gaps in the current test data. Each one is a follow-
@@ -407,12 +425,33 @@ up test someone should run before assuming they know the
 answer:
 
 ### a. QUIC transport under each profile
-TCP was negotiated on every test. To validate the
-`brutalTargetMbps` / `udpSocketBufBytes` / `windowUpdateHeadroomRatio`
-fields, force QUIC selection (start intent extra
-`quic_impl=native`, or delete `.proxyagent_transport` from
-filesDir between runs) and re-run the matrix. Same Pixel/
-Samsung pair would give symmetry with the existing data.
+
+**Partially resolved on 2026-05-29** (Samsung q7q, HIGH_1000) —
+the QUIC validation surfaced three independent regressions and
+fixes are now in code. See the
+[QUIC validation 2026-05-29](#quic-validation-2026-05-29)
+section below for the run-by-run capture. Headline:
+
+- `flow.send_credit` pinning at 0 after download speedtest
+  (proxy-server-go MAX_DATA quirk) was fixed via auto-RESET
+  stuck-stream sweeper + RESET_STREAM emission.
+- 70 ACK/s capped peer's CUBIC growth — dropped to 350 ACK/s
+  by lowering `IMMEDIATE_ACK_THRESHOLD` from 10 to 2.
+- 4 MiB SendBuffer cap allowed 78 MB of stuck bytes after
+  download → tightened to 64/128/256 KB per profile, matching
+  kwik's design.
+
+Result on a healthy path (Euronet Hlobyne, RTT 84 ms): QUIC
+upload reached 63 Mbps (vs 0 Mbps before, vs 260 Mbps for TCP).
+On a degraded path (ZasNet Oleksandriya through proxy in same
+region): QUIC ≈ 7 Mbps both directions — confirmed as
+peer-side / path-side asymmetry, not agent stack (TCP on the
+same path also limited).
+
+The QUIC matrix per profile (validate `brutalTargetMbps` /
+`udpSocketBufBytes` / `windowUpdateHeadroomRatio` / new
+`sendBufferMaxBytes`) is still incomplete — only HIGH_1000 was
+actively exercised. LOW_100 and MID_500 need their own runs.
 
 ### b. Cellular link behaviour
 All tests on Wi-Fi to a local router. Cellular adds:
@@ -464,6 +503,51 @@ Raw `agent.log` exports and speedtest screenshots from Tests
 `proxy-agent-YYYYMMDD-HHMMSS.log`). They should be moved into
 `docs/test-logs/2026-05-28/` so the raw data is preserved
 alongside this report.
+
+## QUIC validation 2026-05-29
+
+The original 2026-05-28 matrix exercised TCP only because the
+sticky-transport cache happened to negotiate TCP every run.
+On 2026-05-29 a separate test series **forced QUIC**
+(`.proxyagent_transport` deleted between runs) on Samsung q7q,
+HIGH_1000 profile. The series uncovered three independent
+regressions; fixes are now in code (builds 117 → 120).
+
+### Symptom progression
+
+Each row corresponds to one test/build cycle. The user ran
+Speedtest.net Multi-Connection from a separate test client
+through the proxy.
+
+| Build | Profile | Server | Public IP | DL Mbps | UL Mbps | Disconnect between DL→UL? | Notes |
+|---|---|---|---|---|---|---|---|
+| 1.0.115 | HIGH_1000 | OPTINET Poltava | 188.239.123.47 (ZasNet) | 176.83 | 4.85 | Yes, 5 s | Original build-97 self-heal firing; symptom was 5 Mbps UL identical to a *different* failure mode the user remembered from earlier (TCP `SO_*BUF=12 MiB` outside safe zone). Misidentified at first as same bug — but on ZasNet, TCP also saw ≈5 Mbps UL, suggesting path limit. |
+| 1.0.116 | HIGH_1000 | OPTINET Poltava | 188.239.123.47 | 179.29 | **0** | No (we removed self-heal) | "rxIdle gate" added to suppress disconnect — broke the recovery mechanism. quic-go's MAX_DATA pinned at 0 for 60+ seconds, upload stuck at 0 Mbps. **Revert candidate.** |
+| 1.0.117 | HIGH_1000 | OPTINET Poltava | 188.239.123.47 | 195.79 | **0** | No | rxIdle gate removed but bounded SendBuffer (4 MiB) and STOP_SENDING handler added. peer never sent STOP_SENDING → handler never fired → still 0 Mbps UL. Confirmed peer behaviour from log: `md_recv=119` stayed flat for 60+s, `send_buf_queued` accumulated 78 MB across 300 streams. |
+| 1.0.118 | HIGH_1000 | OPTINET Poltava | 188.239.123.47 | 195.79 | **0** | No | Added auto-RESET sweeper but trigger was `sendBuffer.closed && queuedBytes > 0`. Bridge threads were parked *inside* `write()` at the cap, never reached `close()` → sweeper missed them entirely. |
+| 1.0.119 | HIGH_1000 | OPTINET Poltava | 188.239.123.47 | 126.00 | **7.72** | No | **First working build.** Sweeper trigger switched to `lastDrainNanos` (catches parked-bridge case). 22 streams auto-reset 2 s after download, `send_credit` jumped from 0 to 12.5 MB, upload phase ran at ~7 Mbps. Path-limited (same as TCP on this uplink). |
+| 1.0.120 | HIGH_1000 | OPTINET Poltava | 188.239.123.47 | 132.31 | 7.70 | No | `IMMEDIATE_ACK_THRESHOLD` dropped from 10 to 2 (≈350 ACK/s instead of 70). No measurable change on this path — confirms the 7 Mbps cap was the path, not our ACK rate. |
+| 1.0.120 | HIGH_1000 | Euronet Hlobyne | 195.64.231.232 (Vizit-net) | 45.33 | **63.39** | No | **Healthy path validation.** Upload ABOVE download — definitively shows the agent stack supports much higher upload than the ZasNet path allows. Path-limited tests like the first six rows above were peer/path issues, not agent issues. |
+
+### Code state after this series (matches "Final values" §388):
+
+- `sendBufferMaxBytes` per profile (64/128/256 KB)
+- `IMMEDIATE_ACK_THRESHOLD = 2` (was 10)
+- Real `ack_delay` reported in ACK frames (was always 0)
+- STOP_SENDING handler emits matching RESET_STREAM (was ignored)
+- RESET_STREAM frame handled (forces EOF on recv buffer)
+- Auto-RESET sweeper triggers on `lastDrainNanos` idle > 2 s
+- Build-97 stall self-heal **removed entirely** — the bounded
+  buffer + sweeper handles the same scenario without disconnects
+- New stats line columns: `send_buf_queued`, `auto-reset` events
+  via `logStat` (appear in exportable agent.log)
+
+### Open: matrix completion for LOW_100 / MID_500
+
+Only HIGH_1000 was exercised in this series. LOW_100 and
+MID_500 should be run through the same QUIC matrix to confirm
+the auto-RESET 2 s timeout doesn't false-positive at lower
+target rates (where drain cadence is naturally slower).
 
 ## Cross-references
 
