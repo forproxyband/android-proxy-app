@@ -127,11 +127,13 @@ jobs:
           # `bytes` is forwarded into E2EConfig.payloadBytes via the
           # AndroidJUnitRunner argument plumbing. The testserverHost
           # default of "10.0.2.2" already points emulator → host.
-          script: |
-            ./gradlew :app:connectedDebugAndroidTest \
-              -Pe2e=true \
-              -Pandroid.testInstrumentationRunnerArguments.bytes=${{ inputs.payload-bytes }} \
-              --no-daemon --stacktrace
+          #
+          # IMPORTANT: keep the script on one line. android-emulator-runner
+          # hands the value to `sh -c` without interpreting YAML literal
+          # blocks specially, so backslash-newline continuations are
+          # passed through as a literal `\` argument and gradle reads it
+          # as a task name ("Task '\' not found").
+          script: ./gradlew :app:connectedDebugAndroidTest -Pe2e=true -Pandroid.testInstrumentationRunnerArguments.bytes=${{ inputs.payload-bytes }} --no-daemon --stacktrace
 
       # ── Cleanup + artifacts ──────────────────────────────────────────
       - name: Stop testserver
