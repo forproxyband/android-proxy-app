@@ -35,9 +35,11 @@ const (
 // process supports at most one connected agent at a time — adequate for
 // CI, simpler than a multi-tenant table.
 type Hub struct {
-	bindAddr string
-	echoPort int
-	authKey  string // empty = accept any
+	bindAddr   string
+	echoPort   int
+	sinkPort   int
+	sourcePort int
+	authKey    string // empty = accept any
 
 	mu sync.Mutex
 
@@ -72,12 +74,14 @@ type pendingResult struct {
 	fail string
 }
 
-func newHub(bind string, echoPort int, authKey string) *Hub {
+func newHub(bind string, echoPort, sinkPort, sourcePort int, authKey string) *Hub {
 	return &Hub{
-		bindAddr: bind,
-		echoPort: echoPort,
-		authKey:  authKey,
-		pending:  make(map[string]chan pendingResult),
+		bindAddr:   bind,
+		echoPort:   echoPort,
+		sinkPort:   sinkPort,
+		sourcePort: sourcePort,
+		authKey:    authKey,
+		pending:    make(map[string]chan pendingResult),
 	}
 }
 
@@ -128,17 +132,19 @@ func main() {
 		// port (startTcp + startQuic in NativeProxyAgent.kt both use
 		// creds.port). Defaulting both flags to 17080 matches that — TCP
 		// and UDP are independent sockets, no conflict.
-		tcpPort  = flag.Int("tcp-port", 17080, "TCP uplink port")
-		quicPort = flag.Int("quic-port", 17080, "UDP/QUIC uplink port")
-		echoPort = flag.Int("echo-port", 17082, "internal TCP echo target port")
-		apiPort  = flag.Int("api-port", 17083, "HTTP test API port")
-		authKey  = flag.String("auth-key", "e2e", `expected client AUTH "key" field; empty = accept any`)
+		tcpPort    = flag.Int("tcp-port", 17080, "TCP uplink port")
+		quicPort   = flag.Int("quic-port", 17080, "UDP/QUIC uplink port")
+		echoPort   = flag.Int("echo-port", 17082, "internal TCP echo target (full-duplex)")
+		sinkPort   = flag.Int("sink-port", 17084, "internal TCP sink target (reads + discards; used by upload tests)")
+		sourcePort = flag.Int("source-port", 17085, "internal TCP source target (streams random bytes; used by download tests)")
+		apiPort    = flag.Int("api-port", 17083, "HTTP test API port")
+		authKey    = flag.String("auth-key", "e2e", `expected client AUTH "key" field; empty = accept any`)
 	)
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	hub := newHub(*bindAddr, *echoPort, *authKey)
+	hub := newHub(*bindAddr, *echoPort, *sinkPort, *sourcePort, *authKey)
 
 	tlsCfg, err := buildTLSConfig()
 	if err != nil {
@@ -152,14 +158,16 @@ func main() {
 	// on context cancel (any listener's failure is logged but does not bring
 	// the whole process down — CI artifacts pick up logs for diagnosis).
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(6)
 	go func() { defer wg.Done(); runEcho(ctx, hub, *echoPort) }()
+	go func() { defer wg.Done(); runSink(ctx, hub, *sinkPort) }()
+	go func() { defer wg.Done(); runSource(ctx, hub, *sourcePort) }()
 	go func() { defer wg.Done(); runTCP(ctx, hub, *tcpPort) }()
 	go func() { defer wg.Done(); runQUIC(ctx, hub, *quicPort, tlsCfg) }()
 	go func() { defer wg.Done(); runAPI(ctx, hub, *apiPort) }()
 
-	log.Printf("testserver up: bind=%s tcp=%d quic=%d echo=%d api=%d auth-key=%q",
-		*bindAddr, *tcpPort, *quicPort, *echoPort, *apiPort, *authKey)
+	log.Printf("testserver up: bind=%s tcp=%d quic=%d echo=%d sink=%d source=%d api=%d auth-key=%q",
+		*bindAddr, *tcpPort, *quicPort, *echoPort, *sinkPort, *sourcePort, *apiPort, *authKey)
 
 	<-ctx.Done()
 	log.Println("shutdown signal received")

@@ -21,7 +21,9 @@ loopback-to-host mapping.
 |------------------|---------|-------------------------------------------------------|
 | `--tcp-port`     | 17080   | TCP uplink: TUNL handshake + control + data sockets   |
 | `--quic-port`    | 17080   | UDP/QUIC uplink: TLS1.3 + ALPN `proxy-tunnel/1`       |
-| `--echo-port`    | 17082   | Internal TCP echo target — tunnels dial here          |
+| `--echo-port`    | 17082   | TCP echo target — full-duplex (default for `mode=echo`)|
+| `--sink-port`    | 17084   | TCP sink target — reads + discards (for `mode=upload`)|
+| `--source-port`  | 17085   | TCP source target — streams random bytes (`mode=download`)|
 | `--api-port`     | 17083   | HTTP test API (`POST /tests/...`)                     |
 | `--auth-key`     | `e2e`   | Expected `key` in client's AUTH JSON. Empty = accept  |
 
@@ -30,13 +32,34 @@ registrators listen (`startTcp` and `startQuic` in NativeProxyAgent.kt
 both pass `creds.port`). TCP and UDP are independent sockets, no
 conflict.
 
+The sink + source ports exist specifically to catch direction-specific
+hangs that a full-duplex echo would mask (e.g. QUIC upload stalls
+while download works — a real production bug history). `mode=upload`
+routes the agent's target dial to the sink so no reverse traffic
+refreshes flow-control credit; `mode=download` routes it to the
+source so the agent only reads from the target socket.
+
 ## Test API
 
-`POST /tests/tunnel-roundtrip?bytes=N&transport=tcp|quic` — opens one tunnel
-from server → client, pushes N random bytes through it, expects them back
-verbatim from the agent (which TCP-bridges them into the echo target). On
-success returns `{"ok":true,"bytes":N,"hashSent":"...","hashRecv":"..."}`,
-otherwise `{"ok":false,"error":"..."}`.
+`POST /tests/tunnel-roundtrip?bytes=N&transport=tcp|quic&mode=echo|upload|download&target-host=...&target-port=...`
+— opens one tunnel from server → client and runs one of three I/O
+patterns through it:
+
+- `mode=echo` (default) — pushes N bytes, expects them back verbatim
+  via the echo target. Tests byte parity in both directions.
+- `mode=upload` — writes N bytes into the sink target, no return read.
+  Catches upload-side stalls in isolation.
+- `mode=download` — reads N bytes from the source target, no write.
+  Catches download-side stalls in isolation.
+
+Returns `{"ok":bool,"bytes":N,"sent_bytes":S,"recv_bytes":R,"mode":...,"hash_sent":...,"hash_recv":...}`.
+`target-host`/`target-port` override the routing — used by error-path
+tests (e.g. unreachable port → OPEN_FAIL).
+
+`POST /tests/tunnel-roundtrip-concurrent?count=K&bytes=N&transport=...&mode=...`
+— same scenario but fan-out across K tunnels in parallel. Returns
+per-tunnel breakdown + aggregate throughput metrics (`wall_ms`,
+`agg_mbps`, `agg_mbps_duplex`).
 
 `GET /healthz` — `200 ok` once both TCP + QUIC accept loops are live.
 

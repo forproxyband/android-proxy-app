@@ -76,10 +76,14 @@ object E2EConfig {
 
     /** Standard Config — direct registrator only, no balancer probing,
      *  short timeouts so tests don't hang. quicFactory toggles QUIC
-     *  capability; pass null for TCP-only behaviour. */
+     *  capability; pass null for TCP-only behaviour. `tcpWarmPool`
+     *  defaults to 4 (enough for single-tunnel tests); throughput /
+     *  concurrent tests bump it so the agent never runs out of pre-
+     *  dialed sockets under load. */
     fun configFor(
         workDir: File,
         quicFactory: com.proxyagent.app.nativeagent.QuicTransport.Factory? = null,
+        tcpWarmPool: Int = 4,
     ): NativeProxyAgent.Config = NativeProxyAgent.Config(
         registratorHost = testserverHost,
         registratorPort = testserverPort,
@@ -92,8 +96,42 @@ object E2EConfig {
         enableHeartbeat = false, // noisy, irrelevant to round-trip
         quicTransportFactory = quicFactory,
         quicDialTimeoutMs = 4000,
-        tcpWarmPoolSize = 4, // smaller pool = fewer test sockets to track
+        tcpWarmPoolSize = tcpWarmPool,
     )
+
+    /** Pretty-prints the throughput-API response into a banner block in
+     *  the instrumentation log — easy to grep in GitHub Actions output.
+     *  Format kept deliberately ASCII-only / single column. */
+    fun printThroughputBanner(label: String, resp: org.json.JSONObject) {
+        val ok = resp.optBoolean("ok")
+        val succ = resp.optInt("succeeded")
+        val total = resp.optInt("total")
+        val wallMs = resp.optLong("wall_ms")
+        val bytesPer = resp.optInt("bytes")
+        val aggBytes = resp.optInt("agg_bytes")
+        val mbps = resp.optDouble("agg_mbps")
+        val mbpsDup = resp.optDouble("agg_mbps_duplex")
+        println("============================================================")
+        println("THROUGHPUT [$label]")
+        println("  status      : ok=$ok  $succ/$total tunnels succeeded")
+        println("  per-tunnel  : ${bytesPer / 1024} KiB")
+        println("  total bytes : ${aggBytes / 1024} KiB  (one-way)")
+        println("  wall time   : ${wallMs} ms")
+        println("  one-way Mbps: ${"%.2f".format(mbps)}")
+        println("  duplex Mbps : ${"%.2f".format(mbpsDup)}  (counts return path)")
+        // Per-tunnel breakdown — helps spot a single stragger that drags
+        // the aggregate down (the classic HoL or pool-starvation symptom).
+        val arr = resp.optJSONArray("results") ?: return
+        println("  per-tunnel  :")
+        for (i in 0 until arr.length()) {
+            val r = arr.getJSONObject(i)
+            println("    [${r.optInt("index")}] ok=${r.optBoolean("ok")} " +
+                "${r.optInt("bytes") / 1024} KiB in ${r.optLong("duration_ms")} ms " +
+                "(${"%.2f".format(r.optDouble("mbps"))} Mbps)" +
+                (if (r.has("error")) " err=${r.optString("error")}" else ""))
+        }
+        println("============================================================")
+    }
 
     fun newNativeQuicFactory(): NativeQuicTransport.Factory =
         NativeQuicTransport.Factory()
