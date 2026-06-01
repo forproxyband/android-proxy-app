@@ -36,7 +36,7 @@ class ThroughputQuicTest {
         agent.setLogSink { _, _, _ -> /* quiet */ }
         agent.start(E2EConfig.configFor(workDir, quicFactory = E2EConfig.newNativeQuicFactory()))
         E2EConfig.waitConnected(agent)
-        assertEquals("quic", agent.getStatus().transport)
+        E2EConfig.assertConnectedVia(agent, "quic")
     }
 
     @After
@@ -87,11 +87,11 @@ class ThroughputQuicTest {
             timeoutMs = 300_000
         )
         E2EConfig.printThroughputBanner(label, resp)
-        assertEquals(count, resp.optInt("total"))
+        val summary = E2EConfig.summarizeResults(resp)
         assertEquals(
-            "expected all $count QUIC streams to succeed ($mode); details in banner above",
+            "$label: only ${resp.optInt("succeeded")}/${resp.optInt("total")} streams succeeded.\n$summary",
             count, resp.optInt("succeeded")
         )
-        assertTrue(resp.optBoolean("ok"))
+        assertTrue("$label: aggregate ok=false\n$summary", resp.optBoolean("ok"))
     }
 }

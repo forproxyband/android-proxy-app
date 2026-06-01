@@ -39,7 +39,7 @@ class ConcurrentTunnelsTest {
         }
         agent.start(E2EConfig.configFor(workDir, quicFactory = E2EConfig.newNativeQuicFactory()))
         E2EConfig.waitConnected(agent)
-        assertEquals("quic", agent.getStatus().transport)
+        E2EConfig.assertConnectedVia(agent, "quic")
     }
 
     @After
@@ -59,11 +59,11 @@ class ConcurrentTunnelsTest {
             "/tests/tunnel-roundtrip-concurrent?count=$count&bytes=$bytesPer&transport=quic",
             timeoutMs = 180_000
         )
-        assertEquals(count, resp.getInt("total"))
+        val summary = E2EConfig.summarizeResults(resp)
+        assertEquals(count, resp.optInt("total"))
         assertEquals(
-            "expected all $count tunnels to succeed, got ${resp.getInt("succeeded")}; details: ${resp.optJSONArray("results")}",
-            count,
-            resp.getInt("succeeded")
+            "only ${resp.optInt("succeeded")}/${resp.optInt("total")} tunnels succeeded.\n$summary",
+            count, resp.optInt("succeeded")
         )
         assertTrue(resp.optBoolean("ok"))
     }

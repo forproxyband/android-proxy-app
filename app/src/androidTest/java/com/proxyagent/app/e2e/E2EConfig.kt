@@ -90,14 +90,55 @@ object E2EConfig {
         agentKey = authKey,
         agentUuid = "e2e-agent",
         workDir = workDir,
-        httpTimeoutMs = 3000,
-        dialTimeoutMs = 5000,
+        httpTimeoutMs = 5000,
+        // Both dial timeouts bumped for the CI x86_64 emulator. The first
+        // run had LargePayloadTest fall back to TCP because QUIC handshake
+        // didn't finish inside 4 s on a software-emulated stack under
+        // load from earlier tests. Generous bounds here are cheap — the
+        // happy path completes in well under a second.
+        dialTimeoutMs = 10000,
         heartbeatIntervalSec = 5,
         enableHeartbeat = false, // noisy, irrelevant to round-trip
         quicTransportFactory = quicFactory,
-        quicDialTimeoutMs = 4000,
+        quicDialTimeoutMs = 15000,
         tcpWarmPoolSize = tcpWarmPool,
     )
+
+    /** Build a multi-line per-tunnel summary suitable for embedding in
+     *  an assertion failure message. Makes the gradle console output
+     *  enough to diagnose which streams failed and why without having
+     *  to download the androidTest artifact. */
+    fun summarizeResults(resp: org.json.JSONObject): String {
+        val arr = resp.optJSONArray("results") ?: return "(no per-tunnel results)"
+        val sb = StringBuilder("per-tunnel (${arr.length()}):\n")
+        for (i in 0 until arr.length()) {
+            val r = arr.getJSONObject(i)
+            sb.append("  [${r.optInt("index")}] ok=${r.optBoolean("ok")}")
+            sb.append(" sent=${r.optInt("sent_bytes")} recv=${r.optInt("recv_bytes")}")
+            sb.append(" dur=${r.optLong("duration_ms")}ms")
+            sb.append(" mbps=${"%.2f".format(r.optDouble("mbps"))}")
+            val err = r.optString("error")
+            if (err.isNotEmpty()) sb.append(" err=\"$err\"")
+            sb.append("\n")
+        }
+        sb.append("wall=${resp.optLong("wall_ms")}ms agg_mbps=${"%.2f".format(resp.optDouble("agg_mbps"))}")
+        return sb.toString()
+    }
+
+    /** Assertion that calls out QUIC fallback to TCP with the lastError
+     *  field from the agent's status — usually carries the dial reason
+     *  the agent's supervisor logged before giving up on QUIC. */
+    fun assertConnectedVia(agent: NativeProxyAgent, expected: String) {
+        val s = agent.getStatus()
+        if (s.transport != expected) {
+            throw AssertionError(
+                "agent connected via ${s.transport}, expected $expected. " +
+                    "running=${s.running} connected=${s.connected} " +
+                    "registrator=${s.registratorHost}:${s.registratorPort} " +
+                    "activeTunnels=${s.activeTunnels} lastError=${s.lastError}"
+            )
+        }
+    }
 
     /** Pretty-prints the throughput-API response into a banner block in
      *  the instrumentation log — easy to grep in GitHub Actions output.

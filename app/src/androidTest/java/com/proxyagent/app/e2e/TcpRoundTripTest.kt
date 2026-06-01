@@ -42,7 +42,7 @@ class TcpRoundTripTest {
         }
         agent.start(E2EConfig.configFor(workDir, quicFactory = null))
         E2EConfig.waitConnected(agent)
-        assertEquals("tcp", agent.getStatus().transport)
+        E2EConfig.assertConnectedVia(agent, "tcp")
     }
 
     @After

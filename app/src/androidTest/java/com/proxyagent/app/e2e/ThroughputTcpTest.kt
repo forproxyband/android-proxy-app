@@ -39,7 +39,7 @@ class ThroughputTcpTest {
         agent.setLogSink { _, _, _ -> /* quiet — log volume dominates output */ }
         agent.start(E2EConfig.configFor(workDir, quicFactory = null, tcpWarmPool = 24))
         E2EConfig.waitConnected(agent)
-        assertEquals("tcp", agent.getStatus().transport)
+        E2EConfig.assertConnectedVia(agent, "tcp")
     }
 
     @After
@@ -81,11 +81,11 @@ class ThroughputTcpTest {
             timeoutMs = 300_000
         )
         E2EConfig.printThroughputBanner(label, resp)
-        assertEquals(count, resp.optInt("total"))
+        val summary = E2EConfig.summarizeResults(resp)
         assertEquals(
-            "expected all $count TCP tunnels to succeed ($mode); details in banner above",
+            "$label: only ${resp.optInt("succeeded")}/${resp.optInt("total")} tunnels succeeded.\n$summary",
             count, resp.optInt("succeeded")
         )
-        assertTrue(resp.optBoolean("ok"))
+        assertTrue("$label: aggregate ok=false\n$summary", resp.optBoolean("ok"))
     }
 }

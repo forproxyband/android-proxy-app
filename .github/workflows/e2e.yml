@@ -3,18 +3,15 @@ name: E2E
 # Manual only — emulator boot + cross-ABI build is ~10–15 min, far too
 # expensive for every PR. Trigger from the Actions UI or via gh CLI:
 #   gh workflow run E2E.yml
+#
+# No inputs by design: api-level and payload size match the production
+# server's configuration. Round-trip payload sizes are baked into the
+# tests (single-tunnel = 64 KiB via E2EConfig.payloadBytes; throughput
+# tests fix their own 4 MiB × 16-stream profile, matching the speedtest
+# pattern). To override per-run during local debugging use:
+#   ./gradlew connectedDebugAndroidTest -Pe2e=true -Pe2eBytes=<n>
 on:
   workflow_dispatch:
-    inputs:
-      api-level:
-        description: "Android API level (emulator)"
-        type: choice
-        default: "30"
-        options: ["28", "30", "33", "34"]
-      payload-bytes:
-        description: "Round-trip payload size (bytes)"
-        type: string
-        default: "65536"
 
 jobs:
   e2e:
@@ -117,23 +114,28 @@ jobs:
       - name: Run connectedAndroidTest on emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: ${{ inputs.api-level }}
+          # API 30 (Android 11): wide x86_64 system-image availability,
+          # works with NDK r26d toolchain, well-tested by the emulator-
+          # runner action. Pinned — production fleet is API 23+ but we
+          # only need one level high enough to exercise the agent code.
+          api-level: 30
           target: google_apis
           arch: x86_64
           profile: pixel_6
           force-avd-creation: false
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          # Knobs flow into the test runner via app/build.gradle.kts
-          # → testInstrumentationRunnerArguments (config-caching compatible).
-          # Override only `bytes` from workflow_dispatch input.
+          # Test runner arguments (payload size, host, port, auth key)
+          # are wired into app/build.gradle.kts via
+          # testInstrumentationRunnerArguments — config-caching compatible.
+          # Defaults match E2EConfig.kt and the testserver flags.
           #
           # IMPORTANT: keep the script on one line. android-emulator-runner
           # hands the value to `sh -c` without interpreting YAML literal
           # blocks specially, so backslash-newline continuations are
           # passed through as a literal `\` argument and gradle reads it
           # as a task name ("Task '\' not found").
-          script: ./gradlew :app:connectedDebugAndroidTest -Pe2e=true -Pe2eBytes=${{ inputs.payload-bytes }} --no-daemon --stacktrace
+          script: ./gradlew :app:connectedDebugAndroidTest -Pe2e=true --no-daemon --stacktrace
 
       # ── Cleanup + artifacts ──────────────────────────────────────────
       - name: Stop testserver

@@ -36,7 +36,7 @@ class LargePayloadTest {
         }
         agent.start(E2EConfig.configFor(workDir, quicFactory = E2EConfig.newNativeQuicFactory()))
         E2EConfig.waitConnected(agent)
-        assertEquals("quic", agent.getStatus().transport)
+        E2EConfig.assertConnectedVia(agent, "quic")
     }
 
     @After
