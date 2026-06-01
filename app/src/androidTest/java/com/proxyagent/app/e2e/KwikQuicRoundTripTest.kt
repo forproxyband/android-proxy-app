@@ -34,7 +34,7 @@ class KwikQuicRoundTripTest {
         }
         agent.start(E2EConfig.configFor(workDir, quicFactory = E2EConfig.newKwikFactory()))
         E2EConfig.waitConnected(agent)
-        E2EConfig.assertConnectedVia(agent, "quic")
+        E2EConfig.assertConnectedVia(agent, "quic", workDir, "KwikQuicTransport.Factory")
     }
 
     @After

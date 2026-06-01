@@ -68,10 +68,29 @@ object E2EConfig {
 
     /** Force the transport order by pre-seeding the agent's transport-cache
      *  file. `chooseTransportOrder()` reads it before each redial — when
-     *  set to "quic" with a registered factory, QUIC is tried first. */
+     *  set to "quic" with a registered factory, QUIC is tried first.
+     *
+     *  Verifies its own write by reading back: a CI run showed an
+     *  intermittent failure where the agent ignored the cache and went
+     *  TCP-first; we need to know if seedTransportCache succeeded or not. */
     fun seedTransportCache(workDir: File, transport: String) {
         require(transport == "tcp" || transport == "quic")
-        File(workDir, ".proxyagent_transport").writeText("$transport\n")
+        require(workDir.exists() && workDir.isDirectory) {
+            "workDir does not exist: ${workDir.absolutePath}"
+        }
+        val file = File(workDir, ".proxyagent_transport")
+        file.writeText("$transport\n")
+        val readback = try {
+            file.readText().trim()
+        } catch (e: Throwable) {
+            throw IllegalStateException(
+                "seedTransportCache wrote then readback failed: ${file.absolutePath}", e
+            )
+        }
+        check(readback == transport) {
+            "seedTransportCache readback mismatch at ${file.absolutePath}: " +
+                "wrote \"$transport\" got \"$readback\""
+        }
     }
 
     /** Standard Config — direct registrator only, no balancer probing,
@@ -104,38 +123,53 @@ object E2EConfig {
         tcpWarmPoolSize = tcpWarmPool,
     )
 
-    /** Build a multi-line per-tunnel summary suitable for embedding in
-     *  an assertion failure message. Makes the gradle console output
-     *  enough to diagnose which streams failed and why without having
-     *  to download the androidTest artifact. */
+    /** Single-line per-tunnel summary for embedding in assertion failures.
+     *  Gradle console truncates multi-line assertion messages, so each
+     *  per-tunnel entry is joined with " | " — the summary stays one
+     *  long line that the runner prints in full. */
     fun summarizeResults(resp: org.json.JSONObject): String {
         val arr = resp.optJSONArray("results") ?: return "(no per-tunnel results)"
-        val sb = StringBuilder("per-tunnel (${arr.length()}):\n")
-        for (i in 0 until arr.length()) {
+        val pieces = (0 until arr.length()).map { i ->
             val r = arr.getJSONObject(i)
-            sb.append("  [${r.optInt("index")}] ok=${r.optBoolean("ok")}")
-            sb.append(" sent=${r.optInt("sent_bytes")} recv=${r.optInt("recv_bytes")}")
-            sb.append(" dur=${r.optLong("duration_ms")}ms")
-            sb.append(" mbps=${"%.2f".format(r.optDouble("mbps"))}")
             val err = r.optString("error")
-            if (err.isNotEmpty()) sb.append(" err=\"$err\"")
-            sb.append("\n")
+            val errPart = if (err.isNotEmpty()) " err=\"$err\"" else ""
+            "[${r.optInt("index")}] ok=${r.optBoolean("ok")} " +
+                "sent=${r.optInt("sent_bytes")} recv=${r.optInt("recv_bytes")} " +
+                "dur=${r.optLong("duration_ms")}ms" + errPart
         }
-        sb.append("wall=${resp.optLong("wall_ms")}ms agg_mbps=${"%.2f".format(resp.optDouble("agg_mbps"))}")
-        return sb.toString()
+        return "wall=${resp.optLong("wall_ms")}ms agg_mbps=${"%.2f".format(resp.optDouble("agg_mbps"))} " +
+            "| ${pieces.joinToString(" | ")}"
     }
 
     /** Assertion that calls out QUIC fallback to TCP with the lastError
      *  field from the agent's status — usually carries the dial reason
-     *  the agent's supervisor logged before giving up on QUIC. */
-    fun assertConnectedVia(agent: NativeProxyAgent, expected: String) {
+     *  the agent's supervisor logged before giving up on QUIC. Optional
+     *  workDir lets the message report the cache file contents — useful
+     *  when `lastError=null` (means QUIC was never tried, i.e. cache
+     *  hint missed). */
+    fun assertConnectedVia(
+        agent: NativeProxyAgent,
+        expected: String,
+        workDir: File? = null,
+        factoryClass: String? = null,
+    ) {
         val s = agent.getStatus()
         if (s.transport != expected) {
+            val cacheInfo = workDir?.let { wd ->
+                val cf = File(wd, ".proxyagent_transport")
+                if (cf.exists()) {
+                    "cache=\"" + (try { cf.readText().trim() } catch (e: Throwable) { "<read err: ${e.message}>" }) + "\""
+                } else {
+                    "cache=missing(at ${cf.absolutePath})"
+                }
+            } ?: "cache=?"
+            val factInfo = factoryClass?.let { "factory=$it" } ?: "factory=?"
             throw AssertionError(
                 "agent connected via ${s.transport}, expected $expected. " +
                     "running=${s.running} connected=${s.connected} " +
                     "registrator=${s.registratorHost}:${s.registratorPort} " +
-                    "activeTunnels=${s.activeTunnels} lastError=${s.lastError}"
+                    "activeTunnels=${s.activeTunnels} lastError=${s.lastError} " +
+                    "$cacheInfo $factInfo"
             )
         }
     }

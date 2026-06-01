@@ -36,7 +36,7 @@ class ThroughputQuicTest {
         agent.setLogSink { _, _, _ -> /* quiet */ }
         agent.start(E2EConfig.configFor(workDir, quicFactory = E2EConfig.newNativeQuicFactory()))
         E2EConfig.waitConnected(agent)
-        E2EConfig.assertConnectedVia(agent, "quic")
+        E2EConfig.assertConnectedVia(agent, "quic", workDir, "NativeQuicTransport.Factory")
     }
 
     @After
