@@ -36,7 +36,7 @@ class ThroughputTcpTest {
     fun setUp() {
         workDir = E2EConfig.newWorkDir()
         agent = NativeProxyAgent()
-        agent.setLogSink { _, _, _ -> /* quiet — log volume dominates output */ }
+        agent.setLogSink(E2EConfig.newLogSink("ThroughputTcpTest"))
         agent.start(E2EConfig.configFor(workDir, quicFactory = null, tcpWarmPool = 24))
         E2EConfig.waitConnected(agent)
         E2EConfig.assertConnectedVia(agent, "tcp")

@@ -33,7 +33,7 @@ class ThroughputQuicTest {
         workDir = E2EConfig.newWorkDir()
         E2EConfig.seedTransportCache(workDir, "quic")
         agent = NativeProxyAgent()
-        agent.setLogSink { _, _, _ -> /* quiet */ }
+        agent.setLogSink(E2EConfig.newLogSink("ThroughputQuicTest"))
         agent.start(E2EConfig.configFor(workDir, quicFactory = E2EConfig.newNativeQuicFactory()))
         E2EConfig.waitConnected(agent)
         E2EConfig.assertConnectedVia(agent, "quic", workDir, "NativeQuicTransport.Factory")

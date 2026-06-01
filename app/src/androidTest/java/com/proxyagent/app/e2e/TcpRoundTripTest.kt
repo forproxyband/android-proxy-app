@@ -36,10 +36,7 @@ class TcpRoundTripTest {
     fun setUp() {
         workDir = E2EConfig.newWorkDir()
         agent = NativeProxyAgent()
-        agent.setLogSink { level, msg, fields ->
-            // Surface agent logs in instrumentation output for postmortem.
-            println("[agent $level] $msg ${fields.entries.joinToString { "${it.key}=${it.value}" }}")
-        }
+        agent.setLogSink(E2EConfig.newLogSink("TcpRoundTripTest"))
         agent.start(E2EConfig.configFor(workDir, quicFactory = null))
         E2EConfig.waitConnected(agent)
         E2EConfig.assertConnectedVia(agent, "tcp")

@@ -214,6 +214,32 @@ object E2EConfig {
     fun newKwikFactory(): KwikQuicTransport.Factory =
         KwikQuicTransport.Factory()
 
+    /** LogSink that routes the agent's log records into android.util.Log
+     *  under a fixed tag. logcat captures everything across tests, the
+     *  workflow dumps the buffer as an artifact at the end — so the
+     *  agent's "uplink: transport dial failed" warnings (which never
+     *  reach the test assertion because the supervisor swallows them
+     *  when a later transport succeeds) are still recoverable.
+     *
+     *  Tag is short on purpose: `adb logcat -s ProxyAgentE2E:V` filters
+     *  out the noise from system services. */
+    fun newLogSink(testName: String): NativeProxyAgent.LogSink {
+        return NativeProxyAgent.LogSink { level, msg, fields ->
+            val tail = if (fields.isEmpty()) "" else
+                " " + fields.entries.joinToString(" ") { "${it.key}=${it.value}" }
+            val line = "[$testName] $msg$tail"
+            when (level.uppercase()) {
+                "ERROR" -> android.util.Log.e(LOGCAT_TAG, line)
+                "WARN", "WARNING" -> android.util.Log.w(LOGCAT_TAG, line)
+                "INFO" -> android.util.Log.i(LOGCAT_TAG, line)
+                "DEBUG" -> android.util.Log.d(LOGCAT_TAG, line)
+                else -> android.util.Log.v(LOGCAT_TAG, line)
+            }
+        }
+    }
+
+    const val LOGCAT_TAG = "ProxyAgentE2E"
+
     /** Blocks until `agent.getStatus().connected == true` or the timeout
      *  fires. Polls every 100 ms — cheap because reads are off a
      *  @Volatile snapshot. */

@@ -130,12 +130,20 @@ jobs:
           # testInstrumentationRunnerArguments — config-caching compatible.
           # Defaults match E2EConfig.kt and the testserver flags.
           #
+          # We run gradle, then dump logcat regardless of gradle's outcome
+          # so we can see what the agent's supervisor logged even when an
+          # assertion swallowed the underlying error (e.g. QUIC dial
+          # failure hidden by a TCP fallback). Both the full buffer and
+          # a filtered slice (just the ProxyAgentE2E tag — that's where
+          # E2EConfig.newLogSink writes the agent's log records) are
+          # captured so we can grep without skimming a 100k-line dump.
+          #
           # IMPORTANT: keep the script on one line. android-emulator-runner
           # hands the value to `sh -c` without interpreting YAML literal
           # blocks specially, so backslash-newline continuations are
           # passed through as a literal `\` argument and gradle reads it
-          # as a task name ("Task '\' not found").
-          script: ./gradlew :app:connectedDebugAndroidTest -Pe2e=true --no-daemon --stacktrace
+          # as a task name ("Task '\' not found"). Use `;` to chain.
+          script: ./gradlew :app:connectedDebugAndroidTest -Pe2e=true --no-daemon --stacktrace; GRADLE_EXIT=$?; adb logcat -d > "$GITHUB_WORKSPACE/logcat-full.txt" 2>&1 || true; adb logcat -d -s ProxyAgentE2E:V > "$GITHUB_WORKSPACE/logcat-agent.txt" 2>&1 || true; exit $GRADLE_EXIT
 
       # ── Cleanup + artifacts ──────────────────────────────────────────
       - name: Stop testserver
@@ -161,4 +169,14 @@ jobs:
           path: |
             app/build/reports/androidTests/**
             app/build/outputs/androidTest-results/**
+          if-no-files-found: warn
+
+      - name: Upload logcat (emulator)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logcat-${{ github.run_number }}
+          path: |
+            logcat-full.txt
+            logcat-agent.txt
           if-no-files-found: warn

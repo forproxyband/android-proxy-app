@@ -33,9 +33,7 @@ class TcpOpenFailTest {
     fun setUp() {
         workDir = E2EConfig.newWorkDir()
         agent = NativeProxyAgent()
-        agent.setLogSink { level, msg, fields ->
-            println("[agent $level] $msg ${fields.entries.joinToString { "${it.key}=${it.value}" }}")
-        }
+        agent.setLogSink(E2EConfig.newLogSink("TcpOpenFailTest"))
         agent.start(E2EConfig.configFor(workDir, quicFactory = null))
         E2EConfig.waitConnected(agent)
     }

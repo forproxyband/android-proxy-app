@@ -29,9 +29,7 @@ class KwikQuicRoundTripTest {
         workDir = E2EConfig.newWorkDir()
         E2EConfig.seedTransportCache(workDir, "quic")
         agent = NativeProxyAgent()
-        agent.setLogSink { level, msg, fields ->
-            println("[agent $level] $msg ${fields.entries.joinToString { "${it.key}=${it.value}" }}")
-        }
+        agent.setLogSink(E2EConfig.newLogSink("KwikQuicRoundTripTest"))
         agent.start(E2EConfig.configFor(workDir, quicFactory = E2EConfig.newKwikFactory()))
         E2EConfig.waitConnected(agent)
         E2EConfig.assertConnectedVia(agent, "quic", workDir, "KwikQuicTransport.Factory")
