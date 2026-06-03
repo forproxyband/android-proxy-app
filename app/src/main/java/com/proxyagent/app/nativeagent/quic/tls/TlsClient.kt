@@ -137,8 +137,29 @@ internal class TlsClient(
      * messages; we re-assemble across calls.
      */
     fun processCryptoData(level: Level, data: ByteArray): HandshakeStep {
-        check(state != State.DONE && state != State.FAILED) {
-            "TlsClient in terminal state $state, cannot process data"
+        // RFC 9001 §4.1.3 + RFC 9000 §17.2.2.1: legitimately late CRYPTO
+        // frames at the Initial / Handshake level after our TLS state
+        // machine has already moved to DONE are retransmits the server
+        // sent before our ACKs reached it. The packet's other frames
+        // (NEW_CONNECTION_ID, NEW_TOKEN, ACK, etc.) are still processed
+        // and the containing packet is still ACKed by the QUIC layer —
+        // it's the CRYPTO payload alone we must silently drop here.
+        //
+        // For APPLICATION-level CRYPTO (NewSessionTicket, post-handshake
+        // auth in TLS 1.3) we also no-op: this client doesn't resume
+        // sessions, so there's nothing to do with the bytes either way.
+        //
+        // FAILED stays a hard skip because a failed TLS state machine
+        // must not be coerced into reprocessing input.
+        //
+        // Pre-fix this method `check`ed and threw IllegalStateException,
+        // which propagated out of `processLongPacket` in the recv loop
+        // and stalled the rest of the connection — the e2e tests caught
+        // this by way of QUIC handshake-timeout fallback to TCP under
+        // moderate loopback-burst retransmits (see
+        // logcat-...-ConcurrentTunnelsTest, run #6).
+        if (state == State.DONE || state == State.FAILED) {
+            return HandshakeStep()
         }
         val buf = rxBuffers.getOrPut(level) { ByteBuffer.allocate(64 * 1024).order(ByteOrder.BIG_ENDIAN) }
         // Compact if we'd overflow, growing if needed.
