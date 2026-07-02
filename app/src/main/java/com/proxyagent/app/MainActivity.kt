@@ -93,6 +93,10 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var pendingAction: String? = null
     private var pendingActionDeadlineMs: Long = 0L
     private var netCallback: ConnectivityManager.NetworkCallback? = null
+    // Held only for the duration of a split-mode manual rotation: binds :main
+    // to a cellular Network so IpCycle's public-IP probes egress cellular even
+    // while Wi-Fi is the system default. Released in unbindMainFromCellular.
+    private var cycleCellularCallback: ConnectivityManager.NetworkCallback? = null
 
     private val importLauncher: ActivityResultLauncher<Array<String>> =
         registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -235,6 +239,10 @@ class MainActivity : AppCompatActivity() {
             netCallback?.let { cm.unregisterNetworkCallback(it) }
         } catch (_: Throwable) {}
         netCallback = null
+        // Release a cellular bind if a manual rotation is still in flight when
+        // the activity is torn down — otherwise the callback + process bind
+        // would outlive the UI.
+        unbindMainFromCellular { }
         super.onDestroy()
     }
 
@@ -984,8 +992,14 @@ class MainActivity : AppCompatActivity() {
     private fun cycleMobileIp() {
         if (cyclingIp) return
         val transport = currentTransport()
-        if (transport == "WIFI") {
-            Toast.makeText(this, "Disable WiFi to cycle mobile IP", Toast.LENGTH_LONG).show()
+        if (!canCycleMobileIp(transport)) {
+            // On Wi-Fi with split mode on but no cellular link to rotate vs.
+            // plain Wi-Fi (rotating cellular wouldn't change the exit IP).
+            val msg = if (transport == "WIFI" && isSplitModeEnabled())
+                "No mobile network to rotate — check the SIM / mobile data"
+            else
+                "Disable WiFi to cycle mobile IP"
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
             return
         }
 
@@ -1012,10 +1026,25 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
+                // Split mode (Wi-Fi default + cellular exit): pin :main's
+                // sockets to cellular so the public-IP probes below don't
+                // measure the Wi-Fi IP. Done after stopping :proxy so its own
+                // cellular requestNetwork is gone and ours holds the radio up.
+                if (transport == "WIFI" && isSplitModeEnabled()) {
+                    stage = "binding cellular"
+                    bindMainToCellular { msg -> Log.i("IpCycle", msg) }
+                }
+
                 stage = "cycling network"
                 runOnUiThread { tvStatus.text = "CYCLING NETWORK…"; tvStatus.setTextColor(0xFFFFAA00.toInt()) }
 
-                val baselineIp = publicIp
+                // In split mode publicIp is the Wi-Fi IP (fetched over the
+                // default route), so comparing it against the post-cycle
+                // cellular IP would always read as "changed". Baseline off the
+                // cellular exit instead so the result reflects the mobile IP.
+                val baselineIp = if (transport == "WIFI" && isSplitModeEnabled())
+                    cellularExitIp().ifEmpty { publicIp }
+                else publicIp
                 // Read from the cross-process file so manual ↻ and the
                 // REBOOT auto-cycle behave identically — same source of
                 // truth, no chance of the two paths drifting if SharedPrefs
@@ -1095,6 +1124,9 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(this, "Cycle failed at $stage: ${e.message}", Toast.LENGTH_LONG).show()
                 }
             } finally {
+                // Always release the cellular bind (no-op if we never took it),
+                // otherwise :main stays pinned to cellular after the rotation.
+                unbindMainFromCellular { msg -> Log.i("IpCycle", msg) }
                 cyclingIp = false
                 runOnUiThread {
                     btnCycleIp.text = originalLabel
@@ -1366,6 +1398,102 @@ class MainActivity : AppCompatActivity() {
                 else -> "OTHER"
             }
         } catch (_: Throwable) { "?" }
+    }
+
+    // Split mode = Wi-Fi return relay. When on, the proxy binds its target
+    // dials to cellular (mobile exit IP) while the agent↔registrator uplink
+    // rides Wi-Fi. See IpCycle.CycleConfig.wifiReturn / ProxyService relay.
+    private fun isSplitModeEnabled(): Boolean =
+        getSharedPreferences("cfg", 0).getBoolean("wifi_return", false)
+
+    // Is a cellular network present alongside the system default? Unlike
+    // currentTransport(), which only inspects the single default network
+    // (Wi-Fi when connected), this scans every held Network — so we can
+    // tell there is a mobile link to rotate even while Wi-Fi is the default,
+    // which is exactly the split-mode situation.
+    private fun hasCellularNetwork(): Boolean = try {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        cm.allNetworks.any { n ->
+            cm.getNetworkCapabilities(n)?.let { caps ->
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) &&
+                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            } == true
+        }
+    } catch (_: Throwable) { false }
+
+    // Whether the ↻ (cycle mobile IP) button should be usable given the
+    // current default transport. Rotation flips the cellular radio, so it
+    // only helps when the proxy's exit actually rides cellular:
+    //   - cellular / ethernet / none → always meaningful
+    //   - Wi-Fi  → normally pointless (traffic egresses Wi-Fi), EXCEPT in
+    //     split mode, where target dials still ride cellular. Allow it there
+    //     as long as a cellular network is actually present to rotate.
+    //   - VPN    → routing is opaque; never allow.
+    private fun canCycleMobileIp(transport: String): Boolean = when (transport) {
+        "VPN" -> false
+        "WIFI" -> isSplitModeEnabled() && hasCellularNetwork()
+        else -> true
+    }
+
+    // Binds the :main process to a requested cellular Network for the duration
+    // of a split-mode manual rotation. Without this, IpCycle (which runs in
+    // :main, and — unlike :proxy — is not process-bound to cellular) would
+    // measure the public IP over the system default route, which stays Wi-Fi
+    // in split mode. The callback re-binds on every onAvailable so we follow
+    // the fresh cellular Network that appears after the airplane-mode toggle;
+    // onLost deliberately does NOT unbind (mirrors ProxyService) so probes
+    // fail closed instead of silently leaking to Wi-Fi mid-cycle.
+    //
+    // Blocks up to 10s for the first cellular Network. Returns false on
+    // timeout / error — the caller proceeds unbound (degraded: may measure
+    // the Wi-Fi IP), which is no worse than the pre-fix behaviour.
+    private fun bindMainToCellular(log: (String) -> Unit): Boolean {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return false
+        val req = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        val latch = java.util.concurrent.CountDownLatch(1)
+        val ref = arrayOf<Network?>(null)
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                ref[0] = network
+                try {
+                    cm.bindProcessToNetwork(network)
+                    log("cycle: bound :main to cellular=$network")
+                } catch (t: Throwable) {
+                    log("cycle: bindProcessToNetwork failed: ${t.message}")
+                }
+                latch.countDown()
+            }
+        }
+        return try {
+            cm.requestNetwork(req, cb)
+            cycleCellularCallback = cb
+            val ok = latch.await(10, java.util.concurrent.TimeUnit.SECONDS)
+            if (!ok || ref[0] == null) {
+                log("cycle: cellular requestNetwork timed out — measuring on default route")
+                unbindMainFromCellular(log)
+                false
+            } else true
+        } catch (t: Throwable) {
+            log("cycle: requestNetwork(CELLULAR) failed: ${t.message}")
+            unbindMainFromCellular(log)
+            false
+        }
+    }
+
+    private fun unbindMainFromCellular(log: (String) -> Unit) {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        cycleCellularCallback?.let { cb ->
+            try { cm?.unregisterNetworkCallback(cb) } catch (_: Throwable) {}
+        }
+        cycleCellularCallback = null
+        try {
+            cm?.bindProcessToNetwork(null)
+            log("cycle: :main unbound from cellular (default routing restored)")
+        } catch (_: Throwable) {}
     }
 
     private fun buildDeviceInfoHeader(): String {
@@ -1699,7 +1827,7 @@ class MainActivity : AppCompatActivity() {
 
         val transport = currentTransport()
         val cycleEnabled = !cyclingIp && pendingAction == null &&
-            transport != "WIFI" && transport != "VPN"
+            canCycleMobileIp(transport)
         btnCycleIp.isEnabled = cycleEnabled
         btnCycleIp.alpha = if (cycleEnabled) 1f else 0.4f
 
@@ -1733,8 +1861,21 @@ class MainActivity : AppCompatActivity() {
             tvStatus.setTextColor(color)
         }
 
-        val wan = publicIp.ifEmpty { "fetching…" }
-        tvNetwork.text = "$wan  ·  $transport"
+        // In split mode the proxy exits through cellular while Wi-Fi is the
+        // default route, so publicIp (fetched over the default route) is the
+        // Wi-Fi IP and the raw transport says "WIFI" — both misleading for a
+        // proxy whose identity is the mobile exit. When the relay is actually
+        // up (field 8 = wifi / wifi_fallback), show the cellular exit IP and
+        // label it accordingly instead.
+        val splitActive = wifiReturnStatus == "wifi" || wifiReturnStatus == "wifi_fallback"
+        val displayIp = if (splitActive) cellularExitIp().ifEmpty { publicIp } else publicIp
+        val wan = displayIp.ifEmpty { "fetching…" }
+        val transportLabel = when (wifiReturnStatus) {
+            "wifi" -> "CELLULAR · Wi-Fi return"
+            "wifi_fallback" -> "CELLULAR · Wi-Fi return (fallback)"
+            else -> transport
+        }
+        tvNetwork.text = "$wan  ·  $transportLabel"
 
         if (pendingAction != "stop" && connStatus == "CONNECTED" && registrator.isNotEmpty()) {
             try {
@@ -1991,6 +2132,18 @@ class MainActivity : AppCompatActivity() {
             sb.append("  ↑ uplink: $wifiIp (Wi-Fi)")
         }
         return sb.toString()
+    }
+
+    // The mobile exit IP — what targets actually see — for split mode, where
+    // the proxy egresses through cellular even though Wi-Fi is the default
+    // route. Prefers the last self-test's public_ip_cell, falling back to the
+    // durable nat_ip file (written on every cycle + proxy connect). Same
+    // ordering as formatTwoIpBlock so the top line and the detail view agree.
+    // Empty when neither source is populated yet.
+    private fun cellularExitIp(): String {
+        val fromJson = readWifiInfoJson()?.optString("public_ip_cell", "").orEmpty()
+        if (fromJson.isNotEmpty()) return fromJson
+        return readFile("nat_ip").trim()
     }
 
     private fun readWifiInfoJson(): org.json.JSONObject? {
