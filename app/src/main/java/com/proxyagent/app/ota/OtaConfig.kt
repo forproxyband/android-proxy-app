@@ -16,6 +16,7 @@ object OtaConfig {
     private const val PREFS = "cfg"
     private const val KEY_CHANNEL = "ota_channel"
     private const val KEY_LAST_CHECK = "ota_last_check_ms"
+    private const val KEY_AUTO_UPDATE = "ota_auto_update"
 
     val baseUrl: String get() = BuildConfig.OTA_BASE_URL.trimEnd('/')
     val appId: String get() = BuildConfig.OTA_APP_ID
@@ -64,4 +65,12 @@ object OtaConfig {
     /** Epoch-ms of the last successful check, or 0 if never. */
     fun lastCheckMs(ctx: Context): Long =
         ctx.getSharedPreferences(PREFS, 0).getLong(KEY_LAST_CHECK, 0L)
+
+    /** Whether the background worker should silently install updates (needs root). */
+    fun autoUpdate(ctx: Context): Boolean =
+        ctx.getSharedPreferences(PREFS, 0).getBoolean(KEY_AUTO_UPDATE, false)
+
+    fun setAutoUpdate(ctx: Context, enabled: Boolean) {
+        ctx.getSharedPreferences(PREFS, 0).edit().putBoolean(KEY_AUTO_UPDATE, enabled).apply()
+    }
 }

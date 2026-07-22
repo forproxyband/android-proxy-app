@@ -86,6 +86,17 @@
         android:backgroundTint="#16213e"
         android:layout_marginBottom="8dp" />
 
+    <!-- Enabling runs a non-destructive root self-test (see
+         UpdatesActivity.verifyRootThenEnable); reverts if root is absent. -->
+    <CheckBox
+        android:id="@+id/cbAutoUpdate"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Auto-update in background (requires root)"
+        android:textColor="#dddddd"
+        android:textSize="13sp"
+        android:layout_marginBottom="8dp" />
+
     <!-- Reveals the older-versions list for manual downgrade (save-to-Downloads). -->
     <Button
         android:id="@+id/btnDowngrade"

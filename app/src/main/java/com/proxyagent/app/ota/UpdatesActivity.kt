@@ -10,6 +10,7 @@ import android.view.ViewGroup
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.Spinner
@@ -28,8 +29,13 @@ import java.util.Locale
 // ────────────────────────────────────────────────────────────────────────
 // Updates screen. Focus: install the SELECTED CHANNEL's actual (current)
 // version — one primary button. Manual re-check + "last checked" line above.
-// Downgrade is a separate, collapsed-by-default section (older versions), and
-// since Android can't downgrade in place it only saves the APK to Downloads.
+// Downgrade is a separate, collapsed-by-default section (older versions).
+//
+// Install path adapts to root (probed per reload): with root, everything
+// (upgrade / reinstall / downgrade) installs silently via `pm install -r -d`;
+// without root, an upgrade uses the system installer and a downgrade is saved
+// to Downloads (Android can't downgrade in place). A background auto-update
+// toggle (root only) is exposed here and honoured by OtaUpdateWorker.
 //
 // Channels are dynamic (populated from the manifest at runtime). Network +
 // crypto run on plain background threads; UI updated via runOnUiThread.
@@ -44,6 +50,7 @@ class UpdatesActivity : AppCompatActivity() {
     private lateinit var btnInstall: Button
     private lateinit var btnCheck: Button
     private lateinit var btnDowngrade: Button
+    private lateinit var cbAutoUpdate: CheckBox
     private lateinit var svDowngrade: View
     private lateinit var llDowngrade: LinearLayout
 
@@ -51,12 +58,19 @@ class UpdatesActivity : AppCompatActivity() {
     private var channels: List<OtaChannel> = OtaChannel.KNOWN
     private var currentRelease: CurrentRelease? = null
     private var downgradeExpanded = false
+    // Set from a background root probe on each reload; drives silent install
+    // (root handles both upgrade and downgrade with `pm install -r -d`).
+    @Volatile private var rootAvailable = false
+    // Guards the auto-update checkbox listener during programmatic state changes,
+    // and while a root self-test is in flight.
+    private var suppressAutoUpdateListener = false
+    @Volatile private var autoUpdateTesting = false
 
     private var suppressSpinner = false
     @Volatile private var busy = false
     private var progressDialog: AlertDialog? = null
 
-    private enum class InstallAction { INSTALL, SAVE_TO_DOWNLOADS }
+    private enum class InstallAction { ROOT_INSTALL, SYSTEM_INSTALL, SAVE_TO_DOWNLOADS }
 
     private var pendingSave: Pair<HistoryEntry, String?>? = null
     private val storagePermLauncher =
@@ -82,6 +96,7 @@ class UpdatesActivity : AppCompatActivity() {
         btnInstall = findViewById(R.id.btnInstall)
         btnCheck = findViewById(R.id.btnCheck)
         btnDowngrade = findViewById(R.id.btnDowngrade)
+        cbAutoUpdate = findViewById(R.id.cbAutoUpdate)
         svDowngrade = findViewById(R.id.svDowngrade)
         llDowngrade = findViewById(R.id.llDowngrade)
 
@@ -108,6 +123,7 @@ class UpdatesActivity : AppCompatActivity() {
 
         btnCheck.setOnClickListener { reload() }
         btnDowngrade.setOnClickListener { toggleDowngrade() }
+        bindAutoUpdateCheckbox()
 
         reload()
     }
@@ -136,6 +152,7 @@ class UpdatesActivity : AppCompatActivity() {
             tvLastCheck.text = ""
             btnInstall.visibility = View.GONE
             btnDowngrade.visibility = View.GONE
+            cbAutoUpdate.visibility = View.GONE
             svDowngrade.visibility = View.GONE
             btnCheck.isEnabled = false
             spChannel.isEnabled = false
@@ -157,12 +174,14 @@ class UpdatesActivity : AppCompatActivity() {
                 error = t.message ?: t.javaClass.simpleName
             }
             if (error == null) OtaConfig.recordCheck(this)
+            val root = RootInstaller.isRootAvailable()
             val current = OtaManifest.findChannel(releases, channel)
             val status = OtaManifest.statusFor(current, OtaManager.installedBuild())
             val discovered = OtaManifest.discoverChannels(releases, channel)
             runOnUiThread {
                 busy = false
                 if (isFinishing || isDestroyed) return@runOnUiThread
+                rootAvailable = root
                 btnCheck.isEnabled = true
                 if (error != null) {
                     setStatus("Check failed: $error", "#FF4444")
@@ -172,10 +191,58 @@ class UpdatesActivity : AppCompatActivity() {
                 currentRelease = current
                 renderStatus(status)
                 renderLastCheck()
+                bindAutoUpdateCheckbox()
                 renderInstallButton(current)
                 renderDowngrade(history, current)
             }
         }.apply { isDaemon = true; name = "OtaReload"; start() }
+    }
+
+    // Auto-update checkbox is always offered. Enabling it runs a non-destructive
+    // root self-test (`su -c id`, no install); if root is absent the toggle is
+    // reverted and the user is told it can't be enabled. Disabling needs no test.
+    private fun bindAutoUpdateCheckbox() {
+        cbAutoUpdate.visibility = View.VISIBLE
+        setAutoUpdateChecked(OtaConfig.autoUpdate(this))
+        cbAutoUpdate.setOnCheckedChangeListener { _, checked ->
+            if (suppressAutoUpdateListener) return@setOnCheckedChangeListener
+            if (checked) verifyRootThenEnable() else OtaConfig.setAutoUpdate(this, false)
+        }
+    }
+
+    /** Set the checkbox state without firing the listener. */
+    private fun setAutoUpdateChecked(value: Boolean) {
+        suppressAutoUpdateListener = true
+        cbAutoUpdate.isChecked = value
+        suppressAutoUpdateListener = false
+    }
+
+    // Non-destructive root check (`su -c id`) — NO reinstall. On success, enable
+    // auto-update; on failure, revert the checkbox and explain.
+    private fun verifyRootThenEnable() {
+        if (autoUpdateTesting) return
+        autoUpdateTesting = true
+        cbAutoUpdate.isEnabled = false
+        Toast.makeText(this, "Checking root access…", Toast.LENGTH_SHORT).show()
+        Thread {
+            val root = RootInstaller.isRootAvailable()
+            runOnUiThread {
+                autoUpdateTesting = false
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                cbAutoUpdate.isEnabled = true
+                rootAvailable = root
+                if (root) {
+                    OtaConfig.setAutoUpdate(this, true)
+                    Toast.makeText(this, "Auto-update enabled", Toast.LENGTH_SHORT).show()
+                } else {
+                    OtaConfig.setAutoUpdate(this, false)
+                    setAutoUpdateChecked(false)
+                    Toast.makeText(
+                        this, "Can't enable: no root access on this device.", Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+        }.apply { isDaemon = true; name = "OtaRootSelfTest"; start() }
     }
 
     private fun renderStatus(status: UpdateStatus) {
@@ -208,9 +275,9 @@ class UpdatesActivity : AppCompatActivity() {
         }
     }
 
-    // Primary button installs the channel's actual (current) version. When that
-    // version is older than what's installed (a published rollback) it routes
-    // through the save-to-Downloads path, since Android can't downgrade in place.
+    // Primary button installs the channel's actual (current) version. If that
+    // version is older than installed (a published rollback), it's treated as a
+    // downgrade (root: silent; no root: save-to-Downloads).
     private fun renderInstallButton(current: CurrentRelease?) {
         if (current == null) {
             btnInstall.visibility = View.GONE
@@ -225,8 +292,7 @@ class UpdatesActivity : AppCompatActivity() {
         }
         btnInstall.setOnClickListener {
             val entry = HistoryEntry("current", current.version, current.build, current.fileName)
-            if (current.build < installed) confirmDowngrade(entry, current.sha256)
-            else confirmInstall(entry, current.sha256)
+            confirmInstall(entry, current.sha256, isDowngrade = current.build < installed)
         }
     }
 
@@ -273,37 +339,63 @@ class UpdatesActivity : AppCompatActivity() {
             textSize = 13f
         }
         val btn = Button(this).apply {
-            text = "To Downloads"
+            text = if (rootAvailable) "Install" else "To Downloads"
             textSize = 11f
             minWidth = 0
             minimumWidth = 0
             setPadding(dp(12), 0, dp(12), 0)
             setTextColor(0xFFFFCC66.toInt())
             setBackgroundColor(0xFF16213e.toInt())
-            setOnClickListener { confirmDowngrade(entry, null) }
+            setOnClickListener { confirmInstall(entry, null, isDowngrade = true) }
         }
         row.addView(label)
         row.addView(btn)
         return row
     }
 
-    // Install / reinstall (build >= installed). In-place install via the installer.
-    private fun confirmInstall(entry: HistoryEntry, sha: String?) {
+    // Single confirm for install / reinstall / downgrade. The messaging and the
+    // action adapt to root availability: with root, everything (incl. downgrade)
+    // installs silently via `pm install -r -d`; without root, an upgrade goes
+    // through the system installer and a downgrade is saved to Downloads.
+    private fun confirmInstall(entry: HistoryEntry, sha: String?, isDowngrade: Boolean) {
         if (busy) return
+        val installed = OtaManager.installedBuild()
         val sb = StringBuilder()
         sb.append("Version ${entry.version} (build ${entry.build}).\n\n")
         if (sha == null) {
-            sb.append("Note: this build is not the channel's current release, so its ")
-            sb.append("integrity hash isn't published — only the APK signature is verified.\n\n")
+            sb.append("Not the channel's current release — integrity hash isn't published; ")
+            sb.append("only the APK signature is verified.\n\n")
         }
-        sb.append("Download, decrypt and install now?")
+        if (isDowngrade) {
+            if (rootAvailable) {
+                sb.append("Older than the installed build ($installed); root installs it directly.\n\n")
+            } else {
+                sb.append("Older than the installed build ($installed). Android can't downgrade ")
+                sb.append("in place, so the APK will be saved to Downloads — uninstall the app, ")
+                sb.append("then install it manually.\n\n")
+            }
+        }
+        sb.append(if (rootAvailable) "Install now (silent, root)?" else "Proceed?")
 
+        val positive = when {
+            rootAvailable -> "Install"
+            isDowngrade -> "Save to Downloads"
+            else -> "Install"
+        }
         AlertDialog.Builder(this)
-            .setTitle("Install ${entry.version}?")
+            .setTitle(if (isDowngrade) "Downgrade to ${entry.version}" else "Install ${entry.version}?")
             .setMessage(sb.toString())
             .setNegativeButton("Cancel", null)
-            .setPositiveButton("Install") { _, _ -> ensurePermissionThenInstall(entry, sha) }
+            .setPositiveButton(positive) { _, _ -> startInstall(entry, sha, isDowngrade) }
             .show()
+    }
+
+    private fun startInstall(entry: HistoryEntry, sha: String?, isDowngrade: Boolean) {
+        when {
+            rootAvailable -> perform(entry, sha, InstallAction.ROOT_INSTALL)
+            isDowngrade -> startSaveToDownloads(entry, sha)
+            else -> ensurePermissionThenInstall(entry, sha)
+        }
     }
 
     private fun ensurePermissionThenInstall(entry: HistoryEntry, sha: String?) {
@@ -319,31 +411,7 @@ class UpdatesActivity : AppCompatActivity() {
                 .show()
             return
         }
-        perform(entry, sha, InstallAction.INSTALL)
-    }
-
-    // Downgrade (build < installed). Android refuses in-place downgrade, so we
-    // save the decrypted APK to Downloads for a manual uninstall+install.
-    private fun confirmDowngrade(entry: HistoryEntry, sha: String?) {
-        if (busy) return
-        val installed = OtaManager.installedBuild()
-        val sb = StringBuilder()
-        sb.append("Automatic downgrade is not possible — Android refuses to install ")
-        sb.append("build ${entry.build} over the newer installed build ($installed) ")
-        sb.append("(\"App not installed\").\n\n")
-        if (sha == null) {
-            sb.append("Its integrity hash isn't published (not the channel's current), so only ")
-            sb.append("the APK signature is verified.\n\n")
-        }
-        sb.append("Instead, the APK will be downloaded, decrypted and saved to your Downloads ")
-        sb.append("folder. To apply it: uninstall Proxy Agent, then open the saved file and install it.")
-
-        AlertDialog.Builder(this)
-            .setTitle("Downgrade to ${entry.version}")
-            .setMessage(sb.toString())
-            .setNegativeButton("Cancel", null)
-            .setPositiveButton("Save to Downloads") { _, _ -> startSaveToDownloads(entry, sha) }
-            .show()
+        perform(entry, sha, InstallAction.SYSTEM_INSTALL)
     }
 
     private fun startSaveToDownloads(entry: HistoryEntry, sha: String?) {
@@ -393,6 +461,7 @@ class UpdatesActivity : AppCompatActivity() {
         Thread {
             var apk: File? = null
             var savedLocation: String? = null
+            var rootInstalled: Boolean? = null
             var error: String? = null
             try {
                 apk = OtaManager.prepare(this, entry.fileName, sha) { phase, soFar, total ->
@@ -416,19 +485,31 @@ class UpdatesActivity : AppCompatActivity() {
                         }
                     }
                 }
-                if (action == InstallAction.SAVE_TO_DOWNLOADS && apk != null) {
-                    runOnUiThread {
-                        if (!isFinishing && !isDestroyed) progressText.text = "Saving to Downloads…"
+                if (apk != null) when (action) {
+                    InstallAction.ROOT_INSTALL -> {
+                        runOnUiThread {
+                            if (!isFinishing && !isDestroyed) progressText.text = "Installing (root)…"
+                        }
+                        // Replaces this app → our process is killed at commit; the
+                        // return value may never be observed (that's fine).
+                        rootInstalled = RootInstaller.installSilently(apk!!)
                     }
-                    savedLocation = OtaExport.saveToDownloads(
-                        this, apk!!, OtaExport.downloadsFileName(entry.version, entry.build),
-                    )
+                    InstallAction.SAVE_TO_DOWNLOADS -> {
+                        runOnUiThread {
+                            if (!isFinishing && !isDestroyed) progressText.text = "Saving to Downloads…"
+                        }
+                        savedLocation = OtaExport.saveToDownloads(
+                            this, apk!!, OtaExport.downloadsFileName(entry.version, entry.build),
+                        )
+                    }
+                    InstallAction.SYSTEM_INSTALL -> Unit // launched on the UI thread below
                 }
             } catch (t: Throwable) {
                 error = t.message ?: t.javaClass.simpleName
             }
             val readyApk = apk
             val location = savedLocation
+            val rootOk = rootInstalled
             runOnUiThread {
                 busy = false
                 dialog.dismiss()
@@ -439,7 +520,13 @@ class UpdatesActivity : AppCompatActivity() {
                     return@runOnUiThread
                 }
                 when (action) {
-                    InstallAction.INSTALL -> try {
+                    InstallAction.ROOT_INSTALL -> Toast.makeText(
+                        this,
+                        if (rootOk == true) "Installed ${entry.version}"
+                        else "Root install failed — check su/Magisk grant",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                    InstallAction.SYSTEM_INSTALL -> try {
                         ApkInstaller.install(this, readyApk)
                     } catch (t: Throwable) {
                         Toast.makeText(this, "Install failed: ${t.message}", Toast.LENGTH_LONG).show()

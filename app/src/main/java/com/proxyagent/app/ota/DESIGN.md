@@ -61,7 +61,8 @@ Read this before moving logic between files.
 | `OtaClient.kt` | `HttpURLConnection` GETs: manifests (uncached) and build download (Range-resume, 404 handling). No auth. |
 | `OtaManager.kt` | Orchestration: `check` / `history` / `currentRelease` / `prepare` (download → decrypt → verify → installable APK). Blocking; call off the main thread. |
 | `ApkInstaller.kt` | FileProvider URI + system installer intent; "install unknown apps" grant flow. |
-| `OtaExport.kt` | Saves a prepared APK to the public Downloads folder (downgrade path): MediaStore on API 29+, legacy dir + `WRITE_EXTERNAL_STORAGE` on 23-28. |
+| `OtaExport.kt` | Saves a prepared APK to the public Downloads folder (no-root downgrade path): MediaStore on API 29+, legacy dir + `WRITE_EXTERNAL_STORAGE` on 23-28. |
+| `RootInstaller.kt` | Silent install on rooted devices via `su -c "pm install -r -d -S <size>"` (APK streamed over stdin). Enables background auto-update and direct downgrades. |
 | `UpdatesActivity.kt` | UI: channel picker (dynamic Spinner), status + "last checked" line, a primary **Install** button (the channel's current version), manual **Check**, and a collapsible **Downgrade** section listing older versions (each → save to Downloads). Progress dialog for the download. |
 | `OtaUpdateWorker.kt` | Background periodic check → "update available" notification (dedup by build). |
 | `OtaScheduler.kt` | Enqueues the periodic worker; `runOnceNow` test trigger. |
@@ -147,13 +148,26 @@ notification). They never download.
 4. `ApkInstaller.install` → system installer via a FileProvider `content://`
    URI. `PackageReplacedReceiver` restarts `ProxyService` after replacement.
 
-**Downgrade** (selected build < installed `versionCode`) takes a different
-path: Android refuses an in-place downgrade (`INSTALL_FAILED_VERSION_DOWNGRADE`),
-so instead of installing, the decrypted+verified APK is saved to the public
-**Downloads** folder (`OtaExport` — MediaStore on API 29+, legacy dir +
-`WRITE_EXTERNAL_STORAGE` on 23-28). The user then uninstalls the app and
-installs the saved file manually. No API lets a non-privileged app bypass the
-downgrade block.
+**Root (silent) path.** The install path is probed for root on each reload
+(and in the worker). When `su` grants root, install/reinstall/downgrade all go
+through `RootInstaller` — `pm install -r -d` — with **no user prompt**, and the
+`-d` flag makes downgrades work directly. This is the path used on the
+(rooted) target fleet.
+
+**No-root downgrade** (selected build < installed `versionCode`): Android
+refuses an in-place downgrade (`INSTALL_FAILED_VERSION_DOWNGRADE`), so instead
+of installing, the decrypted+verified APK is saved to the public **Downloads**
+folder (`OtaExport` — MediaStore on API 29+, legacy dir + `WRITE_EXTERNAL_STORAGE`
+on 23-28). The user uninstalls the app and installs the saved file manually.
+No API lets a non-privileged (non-root) app bypass the downgrade block.
+
+**Background auto-update.** When the `ota_auto_update` toggle (Updates screen)
+is on AND root is available, `OtaUpdateWorker` downloads → decrypts → verifies →
+`RootInstaller.installSilently` — a fully unattended update in the background.
+Without root (or toggle off) the worker only posts the "update available"
+notification. Installing our own update replaces the app and kills the worker
+process at commit; `PackageReplacedReceiver` restarts the service. On failure
+the worker falls back to the notification.
 
 ## Integrity & security
 
@@ -180,19 +194,29 @@ downgrade block.
   `ACTION_MANAGE_UNKNOWN_APP_SOURCES`).
 - `POST_NOTIFICATIONS` (already present, requested in `MainActivity`) — the
   background update notification (Android 13+).
-- `WRITE_EXTERNAL_STORAGE` (`maxSdkVersion=28`) — only the downgrade
+- `WRITE_EXTERNAL_STORAGE` (`maxSdkVersion=28`) — only the no-root downgrade
   "save to Downloads" path on API 23-28; API 29+ uses MediaStore, no grant.
 - FileProvider: authority `${applicationId}.fileprovider`, path
   `cache-path name="ota" path="ota/"` in `res/xml/filepaths.xml`.
+- Root (`su`) — optional; only for the silent-install / auto-update path.
+  Not an Android permission — the su manager (Magisk) grants it.
 
-## Background scheduling
+## Background scheduling & auto-update
 
 `OtaScheduler.schedule` (called from `MainActivity.onCreate`) enqueues a
 unique periodic `OtaUpdateWorker` (6 h, requires network,
 `ExistingPeriodicWorkPolicy.UPDATE`). WorkManager auto-initializes via its
 default `androidx.startup` provider — no custom `Configuration`, no manifest
-change. The worker only checks + notifies (deduped by build), never
-downloads.
+change.
+
+The `ota_auto_update` toggle is always shown on the Updates screen. Enabling it
+runs a **non-destructive root self-test** (`su -c id` — no install); if root is
+absent the toggle reverts and the user is told it can't be enabled. Disabling
+needs no test. The worker's behaviour:
+- **off (default):** check + "update available" notification (deduped by build).
+- **on + root available:** download → decrypt → verify →
+  `RootInstaller.installSilently` — a fully unattended background update. On
+  failure it falls back to the notification.
 
 **Test trigger:** long-press the main-screen widget →
 `OtaScheduler.runOnceNow` runs the worker immediately with `force=true`
@@ -236,6 +260,9 @@ manifests. The client picks it up on the next check.
   survives to a later attempt.
 - Dormant channels (history but no current release) are not
   auto-discovered (no channel index in the contract).
-- Downgrades cannot happen in place (Android refuses a lower `versionCode`).
-  The Downgrade action saves the APK to Downloads for a manual
-  uninstall-then-install; nothing bypasses the block for a non-privileged app.
+- Downgrades: on **rooted** devices `pm install -r -d` performs them silently.
+  Without root, Android refuses an in-place downgrade — the action saves the
+  APK to Downloads for a manual uninstall+install; nothing bypasses the block
+  for a non-privileged app.
+- Auto-update is root-only. On non-rooted devices no API allows unattended
+  install, so the worker can only notify.

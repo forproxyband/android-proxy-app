@@ -29,6 +29,21 @@ class OtaUpdateWorker(
             val force = inputData.getBoolean(KEY_FORCE, false)
 
             if (status is UpdateStatus.Available) {
+                // Auto-update: silently install in the background when enabled and
+                // root is available. Installing our own update replaces the app and
+                // kills this process at commit — PackageReplacedReceiver restarts the
+                // service; if the install fails we fall through to a notification.
+                if (OtaConfig.autoUpdate(ctx) && RootInstaller.isRootAvailable()) {
+                    val apk = runCatching {
+                        OtaManager.prepare(ctx, status.release.fileName, status.release.sha256)
+                    }.getOrNull()
+                    if (apk != null && RootInstaller.installSilently(apk)) {
+                        OtaNotifications.cancel(ctx)
+                        prefs.edit().remove(KEY_NOTIFIED_BUILD).apply()
+                        return Result.success()
+                    }
+                    // else: install failed — notify so the user can act manually.
+                }
                 if (force || status.release.build != lastNotified) {
                     OtaNotifications.showUpdateAvailable(ctx, status.release)
                     prefs.edit().putLong(KEY_NOTIFIED_BUILD, status.release.build).apply()

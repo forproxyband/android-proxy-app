@@ -130,6 +130,7 @@ Backed by the dialog at `MainActivity.kt:278-408` (XML
 | `ota_channel` | string | `stable` | OTA update channel the app tracks. See [OTA self-update](#ota-self-update). |
 | `ota_notified_build` | long | — | Dedup marker: last build number the background worker raised an "update available" notification for. |
 | `ota_last_check_ms` | long | — | Epoch-ms of the last successful update check (widget / worker / Updates screen). Shown as "Last checked …" on the Updates screen. |
+| `ota_auto_update` | bool | false | When on AND root is available, the background worker silently installs updates (`pm install -r -d`) instead of just notifying. Enabling the toggle runs a non-destructive root self-test (`su -c id`) and reverts if root is absent. |
 
 ## OTA self-update
 
@@ -137,8 +138,10 @@ The app updates itself over the air from the CRM's distribution bucket:
 poll a JSON manifest → compare versions → download an encrypted build from
 Cloudflare R2 → Blowfish-decrypt → verify SHA-256 → hand to the system
 installer. Surfaced by a widget on the main screen and a dedicated
-`UpdatesActivity` (channel picker + version list + downgrade), plus a
-periodic `WorkManager` check that notifies. Config lives in
+`UpdatesActivity` (channel picker + install current version + collapsible
+downgrade), plus a periodic `WorkManager` check that notifies — or, on rooted
+devices with the auto-update toggle on, silently installs in the background
+(`su -c pm install -r -d`). Config lives in
 `app/build.gradle.kts` (`OTA_*` `buildConfigField`s). `release` and `debug`
 are **separate CRM apps** — each with its own app id, Blowfish key and APK
 signature — so a build only self-updates from its own app; `debug` ships blank
