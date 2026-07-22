@@ -81,6 +81,15 @@
             android:exported="false"
             android:parentActivityName=".MainActivity" />
 
+        <!-- Connection settings (host/port/key, engine, QR onboarding, IP-rotation
+             fallbacks, Wi-Fi return). Reached from the ⚙ button and the
+             "not configured" prompt. -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:theme="@style/Theme.AndroidProxyApp.Settings"
+            android:parentActivityName=".MainActivity" />
+
         <!-- Portrait-locked CaptureActivity for ZXing embedded scanner.
              Default CaptureActivity is sensorLandscape; on portrait phones it
              shows the "rotate device" overlay instead of the camera preview.

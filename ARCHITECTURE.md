@@ -110,8 +110,11 @@ Priority order — first match wins:
 
 ## Settings (SharedPreferences `cfg`)
 
-Backed by the dialog at `MainActivity.kt:278-408` (XML
-`res/layout/dialog_settings.xml`):
+Backed by `SettingsActivity` (opened from the ⚙ button and the "not
+configured" prompt; XML `res/layout/activity_settings.xml`, which `<include>`s
+the form in `res/layout/dialog_settings.xml`). It owns the connection form,
+QR onboarding, import/export, and the Wi-Fi-return preflight — all formerly a
+modal in `MainActivity`:
 
 | Key | Type | Default | Used for |
 | --- | --- | --- | --- |
@@ -884,7 +887,7 @@ hook (`triggerAutoIpCycle`) is reachable from either.
 
 `maybeStartWifiRelay` requires the NATIVE in-process engine because
 `ConnectivityManager.bindProcessToNetwork(cellular)` does not survive
-`fork+exec` into the BINARY subprocess. The settings dialog
+`fork+exec` into the BINARY subprocess. `SettingsActivity`
 auto-disables `rbEngineBinary` when the Wi-Fi-return checkbox is on
 and clamps `engine="native"` on save if the user somehow lands with
 `wifi_return=true && engine=binary` (e.g. stale dialog state or
@@ -1507,8 +1510,8 @@ no-op on empty values.
 
 ### Hard gate — refuseDueToCachedSplitFail
 
-The checkbox in the settings dialog won't stay on if the device can't
-actually split traffic. Three rejection paths in `MainActivity`:
+The checkbox in `SettingsActivity` won't stay on if the device can't
+actually split traffic. Three rejection paths in `SettingsActivity`:
 
 1. **Cached fail**. Before running preflight,
    `refuseDueToCachedSplitFail` reads `wifi_info.json` and rejects the
@@ -1536,8 +1539,8 @@ grudge.
 
 ### Preflight — `MobileDataAlwaysOnCheck`
 
-When the user ticks `cbWifiReturn` in the settings dialog,
-`MainActivity.runMobileDataAlwaysOnPreflight` fires an async probe
+When the user ticks `cbWifiReturn` in `SettingsActivity`,
+`SettingsActivity.runMobileDataAlwaysOnPreflight` fires an async probe
 (`Thread`, ~5s budget) that determines whether the device will keep
 cellular attached alongside Wi-Fi. Without that, the relay is
 basically useless: every time Wi-Fi connects, the OS would release the

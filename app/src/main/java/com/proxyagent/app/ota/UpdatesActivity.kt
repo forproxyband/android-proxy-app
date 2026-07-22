@@ -57,6 +57,9 @@ class UpdatesActivity : AppCompatActivity() {
     private var selectedChannel: OtaChannel = OtaChannel.STABLE
     private var channels: List<OtaChannel> = OtaChannel.KNOWN
     private var currentRelease: CurrentRelease? = null
+    // All-channels current-versions from the last successful reload — lets the
+    // channel-switch guard judge the target channel without a fresh fetch.
+    private var lastReleases: List<CurrentRelease> = emptyList()
     private var downgradeExpanded = false
     // Set from a background root probe on each reload; drives silent install
     // (root handles both upgrade and downgrade with `pm install -r -d`).
@@ -111,12 +114,7 @@ class UpdatesActivity : AppCompatActivity() {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
                 if (suppressSpinner) return
                 val ch = channels.getOrNull(position) ?: return
-                if (ch != selectedChannel) {
-                    selectedChannel = ch
-                    OtaConfig.setChannel(this@UpdatesActivity, ch)
-                    downgradeExpanded = false
-                    reload()
-                }
+                if (ch != selectedChannel) maybeSwitchChannel(ch)
             }
 
             override fun onNothingSelected(parent: AdapterView<*>?) {}
@@ -144,6 +142,48 @@ class UpdatesActivity : AppCompatActivity() {
         spChannel.adapter = adapter
         if (list.isNotEmpty()) spChannel.setSelection(idx)
         spChannel.post { suppressSpinner = false }
+    }
+
+    /** Move the spinner selection to [ch] without firing the listener. */
+    private fun selectSpinner(ch: OtaChannel) {
+        val idx = channels.indexOf(ch)
+        if (idx < 0) return
+        suppressSpinner = true
+        spChannel.setSelection(idx)
+        spChannel.post { suppressSpinner = false }
+    }
+
+    // Guard: switching to a channel whose current version is OLDER than the
+    // installed build strands the user on a channel they can only downgrade
+    // from. Warn (and offer to revert) before committing the switch. Builds do
+    // legitimately move between channels, so we warn rather than hard-block.
+    private fun maybeSwitchChannel(ch: OtaChannel) {
+        val target = OtaManifest.findChannel(lastReleases, ch)
+        val installed = OtaManager.installedBuild()
+        if (target != null && target.build < installed) {
+            val how = if (rootAvailable) "a downgrade (root)."
+            else "a downgrade — which needs root, or a manual reinstall via Downloads."
+            AlertDialog.Builder(this)
+                .setTitle("Switch to ${ch.label}?")
+                .setMessage(
+                    "The ${ch.label} channel's current version is ${target.version} " +
+                        "(build ${target.build}) — OLDER than your installed build ($installed).\n\n" +
+                        "On this channel the only available action would be $how\n\nSwitch anyway?"
+                )
+                .setNegativeButton("Cancel") { _, _ -> selectSpinner(selectedChannel) }
+                .setOnCancelListener { selectSpinner(selectedChannel) }
+                .setPositiveButton("Switch anyway") { _, _ -> commitChannel(ch) }
+                .show()
+        } else {
+            commitChannel(ch)
+        }
+    }
+
+    private fun commitChannel(ch: OtaChannel) {
+        selectedChannel = ch
+        OtaConfig.setChannel(this, ch)
+        downgradeExpanded = false
+        reload()
     }
 
     private fun reload() {
@@ -188,6 +228,7 @@ class UpdatesActivity : AppCompatActivity() {
                     setStatus("Check failed: $error", "#FF4444")
                     return@runOnUiThread
                 }
+                lastReleases = releases
                 rebuildSpinner(discovered)
                 currentRelease = current
                 renderStatus(status)
@@ -253,11 +294,23 @@ class UpdatesActivity : AppCompatActivity() {
                     "Update available: ${status.release.version} (build ${status.release.build})",
                     "#FFCC66",
                 )
-            is UpdateStatus.UpToDate ->
-                setStatus(
-                    "You're on the latest: ${status.release.version} (build ${status.release.build})",
-                    "#88ffaa",
-                )
+            is UpdateStatus.UpToDate -> {
+                val installed = OtaManager.installedBuild()
+                if (status.release.build < installed) {
+                    // Installed build is ahead of this channel's current (e.g. after
+                    // switching down from a further-ahead channel).
+                    setStatus(
+                        "Installed build ($installed) is newer than this channel's current " +
+                            "(${status.release.version}). Only a downgrade is available here.",
+                        "#FFCC66",
+                    )
+                } else {
+                    setStatus(
+                        "You're on the latest: ${status.release.version} (build ${status.release.build})",
+                        "#88ffaa",
+                    )
+                }
+            }
             UpdateStatus.NoRelease ->
                 setStatus("No release published in this channel.", "#888888")
         }
@@ -289,7 +342,7 @@ class UpdatesActivity : AppCompatActivity() {
         btnInstall.text = when {
             current.build > installed -> "INSTALL ${current.version}"
             current.build == installed -> "REINSTALL ${current.version}"
-            else -> "INSTALL ${current.version} (older)"
+            else -> "DOWNGRADE TO ${current.version}"
         }
         btnInstall.setOnClickListener {
             val entry = HistoryEntry("current", current.version, current.build, current.fileName)

@@ -10,4 +10,23 @@
         <item name="android:statusBarColor">#0f0f23</item>
         <item name="android:navigationBarColor">#0f0f23</item>
     </style>
+
+    <!-- Always-dark variant for SettingsActivity. The settings form reuses
+         default-colored input widgets (EditText / Spinner / RadioButton /
+         CheckBox) plus gray labels tuned for the app's dark #1a1a2e surface.
+         A non-DayNight (dark) base keeps default widget text LIGHT, so the
+         screen stays readable and visually consistent with the rest of the
+         app in both system light and dark modes — unlike the DayNight base,
+         which would render dark-on-dark inputs in system light mode. -->
+    <style name="Theme.AndroidProxyApp.Settings" parent="Theme.MaterialComponents.NoActionBar">
+        <item name="colorPrimary">#e94560</item>
+        <item name="colorPrimaryVariant">#c81d4e</item>
+        <item name="colorOnPrimary">#ffffff</item>
+        <item name="colorSecondary">#0f3460</item>
+        <item name="colorSecondaryVariant">#16213e</item>
+        <item name="colorOnSecondary">#ffffff</item>
+        <item name="android:windowBackground">#1a1a2e</item>
+        <item name="android:statusBarColor">#0f0f23</item>
+        <item name="android:navigationBarColor">#0f0f23</item>
+    </style>
 </resources>

@@ -121,6 +121,15 @@ channel that has history but **no** current release cannot be
 auto-discovered — it appears once it gets a current release, or if it is a
 baseline name. Surfacing "dormant" channels would need a contract change.
 
+**Switch guard.** Switching to a channel whose current build is *older* than
+the installed build (e.g. you were on beta ahead of stable) would strand the
+user on a channel they can only downgrade from. `maybeSwitchChannel` detects
+this (using the cached all-channels manifest) and warns with a "Switch anyway /
+Cancel" dialog, reverting the spinner on cancel. Builds legitimately migrate
+between channels, so it's a warning, not a hard block. When such a channel is
+selected, the primary button reads **DOWNGRADE TO x** and routes through the
+downgrade path (root-silent if available, else save-to-Downloads).
+
 ## Update flow
 
 **Check** (widget on launch/resume, manual button, or background worker):
