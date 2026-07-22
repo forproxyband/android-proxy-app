@@ -19,6 +19,18 @@
             android:gravity="center_vertical"
             android:layout_marginBottom="12dp">
             <TextView
+                android:id="@+id/btnBack"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="←"
+                android:textColor="#e94560"
+                android:textSize="24sp"
+                android:textStyle="bold"
+                android:paddingEnd="14dp"
+                android:clickable="true"
+                android:focusable="true"
+                android:contentDescription="Back" />
+            <TextView
                 android:layout_width="0dp"
                 android:layout_weight="1"
                 android:layout_height="wrap_content"

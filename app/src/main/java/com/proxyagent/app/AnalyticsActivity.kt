@@ -55,6 +55,7 @@ class AnalyticsActivity : AppCompatActivity() {
         setContentView(R.layout.activity_analytics)
         title = "Analytics"
 
+        findViewById<TextView>(R.id.btnBack).setOnClickListener { finish() }
         rgPeriod = findViewById(R.id.rgPeriod)
         spFilterType = findViewById(R.id.spFilterType)
         spFilterValue = findViewById(R.id.spFilterValue)

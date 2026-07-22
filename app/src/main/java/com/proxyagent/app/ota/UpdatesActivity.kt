@@ -89,6 +89,7 @@ class UpdatesActivity : AppCompatActivity() {
         setContentView(R.layout.activity_updates)
         title = "Updates"
 
+        findViewById<TextView>(R.id.btnBack).setOnClickListener { finish() }
         tvInstalled = findViewById(R.id.tvInstalled)
         spChannel = findViewById(R.id.spChannel)
         tvStatus = findViewById(R.id.tvStatus)
