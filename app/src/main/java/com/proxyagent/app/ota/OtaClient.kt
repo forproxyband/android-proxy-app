@@ -99,6 +99,12 @@ object OtaClient {
     }
 
     private fun open(url: String): HttpURLConnection {
+        // OTA fetches carry the encryption key's ciphertext + install payloads;
+        // refuse plaintext transport outright (defense-in-depth vs a misconfigured
+        // base URL or a downgrade attempt), regardless of app-wide cleartext policy.
+        if (!url.startsWith("https://", ignoreCase = true)) {
+            throw IOException("refusing non-HTTPS OTA URL: $url")
+        }
         val conn = URL(url).openConnection() as HttpURLConnection
         conn.connectTimeout = CONNECT_TIMEOUT_MS
         conn.instanceFollowRedirects = true

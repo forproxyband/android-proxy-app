@@ -125,4 +125,23 @@ class OtaManifestTest {
             """[{"status":"old","version":"1","build":"1","fileName":"../../evil"}]"""
         ).isEmpty())
     }
+
+    @Test fun fileNameIsTrimmedBeforeValidation() {
+        val json = """[{"channel":"stable","currentVersion":"1","currentBuild":"1",
+            "fileName":" 6a60fe20bfa97b595b84d642 ","SHA256":"x"}]""".trimIndent()
+        val list = OtaManifest.parseCurrentVersions(json)
+        assertEquals(1, list.size)
+        assertEquals("6a60fe20bfa97b595b84d642", list[0].fileName)
+    }
+
+    @Test fun historyEntryWithMissingOrBadBuildIsDropped() {
+        val json = """[
+            {"status":"current","version":"1.0.40","fileName":"6a60fe20bfa97b595b84d642","build":"40"},
+            {"status":"old","version":"1.0.41","fileName":"6a610527bfa97b595b84d656"},
+            {"status":"old","version":"1.0.42","fileName":"6a610557bfa97b595b84d657","build":"x"}
+        ]""".trimIndent()
+        val h = OtaManifest.parseHistory(json)
+        assertEquals(1, h.size)
+        assertEquals(40L, h[0].build)
+    }
 }

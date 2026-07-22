@@ -22,8 +22,10 @@ object OtaNotifications {
     private const val CHANNEL_ID = "ota_updates"
     private const val NOTIF_ID = 4711
 
-    fun showUpdateAvailable(ctx: Context, release: CurrentRelease) {
-        if (!canPost(ctx)) return
+    /** Returns true if the notification was actually posted (false if the OS
+     *  suppressed it — e.g. POST_NOTIFICATIONS not granted on API 33+). */
+    fun showUpdateAvailable(ctx: Context, release: CurrentRelease): Boolean {
+        if (!canPost(ctx)) return false
         ensureChannel(ctx)
 
         val intent = Intent(ctx, UpdatesActivity::class.java)
@@ -42,6 +44,7 @@ object OtaNotifications {
             .build()
 
         NotificationManagerCompat.from(ctx).notify(NOTIF_ID, n)
+        return true
     }
 
     fun cancel(ctx: Context) {

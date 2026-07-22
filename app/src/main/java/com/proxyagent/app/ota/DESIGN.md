@@ -228,9 +228,10 @@ needs no test. The worker's behaviour:
   failure it falls back to the notification.
 
 **Test trigger:** long-press the main-screen widget →
-`OtaScheduler.runOnceNow` runs the worker immediately with `force=true`
-(bypasses the notification dedup), so you don't wait for the 6 h / 15 min
-minimum interval.
+`OtaScheduler.runOnceNow` enqueues a unique one-time worker with `force=true`
+(bypass notify dedup) and `notify_only=true` — it only checks + notifies and
+never silently reinstalls, so it's a safe notification test even when
+auto-update is enabled. Avoids the 6 h / 15 min interval wait.
 
 ## Caching
 
@@ -264,9 +265,12 @@ manifests. The client picks it up on the next check.
 
 ## Known limitations
 
-- Range-resume in `OtaClient` is correct but currently inert: `prepare`
-  deletes the partial `.enc` on every exit, so a partial download never
-  survives to a later attempt.
+- Range-resume in `OtaClient` is intentionally inert: `prepare` stages each
+  download into a fresh unique `.part` temp and atomically renames to the final
+  `<fileName>.apk` only on full success (so a mid-decrypt kill can't leave a
+  poisoned cache), and `pruneStaleBuilds` keeps only the current build's files.
+  A killed download re-downloads from scratch rather than resuming — acceptable
+  for the build sizes involved.
 - Dormant channels (history but no current release) are not
   auto-discovered (no channel index in the contract).
 - Downgrades: on **rooted** devices `pm install -r -d` performs them silently.

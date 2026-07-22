@@ -25,32 +25,48 @@ class OtaUpdateWorker(
             OtaConfig.recordCheck(ctx)
             val prefs = ctx.getSharedPreferences("cfg", 0)
             val lastNotified = prefs.getLong(KEY_NOTIFIED_BUILD, -1L)
-            // Manual test runs force a notification even if already shown for this build.
+            val lastAutoInstalled = prefs.getLong(KEY_AUTOINSTALLED_BUILD, -1L)
+            // `force` bypasses notify dedup. `notifyOnly` = the manual long-press
+            // test trigger: it must only check + notify, never silently reinstall.
             val force = inputData.getBoolean(KEY_FORCE, false)
+            val notifyOnly = inputData.getBoolean(KEY_NOTIFY_ONLY, false)
 
             if (status is UpdateStatus.Available) {
-                // Auto-update: silently install in the background when enabled and
-                // root is available. Installing our own update replaces the app and
-                // kills this process at commit — PackageReplacedReceiver restarts the
-                // service; if the install fails we fall through to a notification.
-                if (OtaConfig.autoUpdate(ctx) && RootInstaller.isRootAvailable()) {
+                val build = status.release.build
+                // Auto-update: silently install when enabled, root is available,
+                // this isn't the notify-only trigger, and we haven't ALREADY tried
+                // this exact build. The last guard breaks a reinstall loop when the
+                // CRM `build` label doesn't match the APK's real versionCode (the
+                // installed build never advances, so it would look "available"
+                // forever and reinstall every run).
+                if (OtaConfig.autoUpdate(ctx) && !notifyOnly &&
+                    build != lastAutoInstalled && RootInstaller.isRootAvailable()) {
+                    // Record the attempt BEFORE installing: the commit kills this
+                    // process, so post-install code may never run.
+                    prefs.edit().putLong(KEY_AUTOINSTALLED_BUILD, build).apply()
                     val apk = runCatching {
                         OtaManager.prepare(ctx, status.release.fileName, status.release.sha256)
                     }.getOrNull()
-                    if (apk != null && RootInstaller.installSilently(apk)) {
+                    if (apk != null && RootInstaller.installSilently(apk, allowDowngrade = false)) {
                         OtaNotifications.cancel(ctx)
                         prefs.edit().remove(KEY_NOTIFIED_BUILD).apply()
                         return Result.success()
                     }
-                    // else: install failed — notify so the user can act manually.
+                    // else: install failed or already-attempted this build (likely a
+                    // build/versionCode mismatch) — fall through to notify.
                 }
-                if (force || status.release.build != lastNotified) {
-                    OtaNotifications.showUpdateAvailable(ctx, status.release)
-                    prefs.edit().putLong(KEY_NOTIFIED_BUILD, status.release.build).apply()
+                if (force || build != lastNotified) {
+                    // Only mark as notified if the notification actually posted —
+                    // otherwise (POST_NOTIFICATIONS denied) we'd suppress the update
+                    // silently AND record it as already shown.
+                    if (OtaNotifications.showUpdateAvailable(ctx, status.release)) {
+                        prefs.edit().putLong(KEY_NOTIFIED_BUILD, build).apply()
+                    }
                 }
             } else {
-                // Up to date / no release: clear dedupe marker + any stale notice.
-                prefs.edit().remove(KEY_NOTIFIED_BUILD).apply()
+                // Up to date / no release: reset both markers so a future
+                // (re)published build is handled fresh.
+                prefs.edit().remove(KEY_NOTIFIED_BUILD).remove(KEY_AUTOINSTALLED_BUILD).apply()
                 OtaNotifications.cancel(ctx)
             }
             Result.success()
@@ -62,6 +78,8 @@ class OtaUpdateWorker(
 
     companion object {
         const val KEY_FORCE = "force"
+        const val KEY_NOTIFY_ONLY = "notify_only"
         private const val KEY_NOTIFIED_BUILD = "ota_notified_build"
+        private const val KEY_AUTOINSTALLED_BUILD = "ota_autoinstalled_build"
     }
 }

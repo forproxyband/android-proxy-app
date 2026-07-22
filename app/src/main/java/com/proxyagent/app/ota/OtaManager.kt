@@ -83,10 +83,11 @@ object OtaManager {
             throw IntegrityException("invalid build fileName: $fileName")
         }
         val dir = otaDir(ctx)
-        val enc = File(dir, "$fileName.enc")
         val apk = File(dir, "$fileName.apk")
 
-        // Reuse a cached, still-valid APK.
+        // Reuse a cached, complete APK. The atomic publish below guarantees a
+        // file with the FINAL name is always complete, so this magic/hash check
+        // can't be fooled by a partial file left behind by a mid-decrypt kill.
         if (apk.isFile && apk.length() > 0) {
             val ok = if (expectedSha256 != null)
                 OtaCrypto.sha256Hex(apk).equals(expectedSha256, ignoreCase = true)
@@ -94,14 +95,22 @@ object OtaManager {
             if (ok) return apk
             apk.delete()
         }
+        pruneStaleBuilds(dir, fileName)
 
+        // Unique temp names so a concurrent prepare() of the same build (e.g. the
+        // background worker and the UI at once) can't clobber each other's
+        // in-progress files. Fresh names also mean no stale full ".enc" survives
+        // to trigger a 416 on the (unused) Range path.
+        val stamp = System.nanoTime()
+        val enc = File(dir, "$fileName.enc.$stamp.part")
+        val apkTmp = File(dir, "$fileName.apk.$stamp.part")
         try {
             OtaClient.download(OtaConfig.buildUrl(fileName), enc) { soFar, total ->
                 progress?.onPhase(Phase.DOWNLOAD, soFar, total)
             }
 
             val encLen = enc.length()
-            val gotSha = OtaCrypto.decryptAndHash(enc, apk, OtaConfig.encryptionKey) { written ->
+            val gotSha = OtaCrypto.decryptAndHash(enc, apkTmp, OtaConfig.encryptionKey) { written ->
                 progress?.onPhase(Phase.VERIFY, written, encLen)
             }
 
@@ -110,15 +119,33 @@ object OtaManager {
                     "SHA-256 mismatch for $fileName (got $gotSha, expected $expectedSha256)"
                 )
             }
-            if (!isApk(apk)) {
+            if (!isApk(apkTmp)) {
                 throw IntegrityException("decrypted $fileName is not a valid APK")
+            }
+            // Atomic publish: a partial temp never acquires the final name, so a
+            // process kill mid-decrypt cannot poison the cache.
+            apk.delete()
+            if (!apkTmp.renameTo(apk)) {
+                apkTmp.inputStream().use { i -> apk.outputStream().use { o -> i.copyTo(o) } }
             }
             return apk
         } catch (t: Throwable) {
-            apk.delete()
+            apkTmp.delete()
             throw t
         } finally {
-            enc.delete()   // encrypted blob is never needed once decrypted
+            enc.delete()      // encrypted blob is never needed once decrypted
+            apkTmp.delete()   // no-op after a successful rename
+        }
+    }
+
+    /**
+     * Delete cached files for OTHER builds (and stray temp parts) to bound cache
+     * growth, keeping this build's artifacts. Temp parts are prefixed by the
+     * fileName, so an in-flight download of the SAME build is never evicted.
+     */
+    private fun pruneStaleBuilds(dir: File, keepFileName: String) {
+        dir.listFiles()?.forEach { f ->
+            if (!f.name.startsWith(keepFileName)) runCatching { f.delete() }
         }
     }
 

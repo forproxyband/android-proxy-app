@@ -26,7 +26,7 @@ object OtaManifest {
             val channel = o.string("channel") ?: continue
             val version = o.string("currentVersion") ?: continue
             val build = o.string("currentBuild")?.trim()?.toLongOrNull() ?: continue
-            val fileName = o.string("fileName")?.takeIf { isValidFileName(it) } ?: continue
+            val fileName = o.string("fileName")?.trim()?.takeIf { isValidFileName(it) } ?: continue
             // Key is exactly "SHA256" (upper-case) per contract.
             val sha256 = o.string("SHA256") ?: continue
             out.add(
@@ -49,8 +49,10 @@ object OtaManifest {
         for (item in MiniJson.parseArray(json).items()) {
             val o = item.asObject() ?: continue
             val version = o.string("version") ?: continue
-            val fileName = o.string("fileName")?.takeIf { isValidFileName(it) } ?: continue
-            val build = o.string("build")?.trim()?.toLongOrNull() ?: 0L
+            val fileName = o.string("fileName")?.trim()?.takeIf { isValidFileName(it) } ?: continue
+            // Skip (don't default to 0): a build=0 entry would surface as a bogus
+            // "downgrade to build 0" candidate in the UI.
+            val build = o.string("build")?.trim()?.toLongOrNull() ?: continue
             out.add(
                 HistoryEntry(
                     status = o.string("status") ?: "old",

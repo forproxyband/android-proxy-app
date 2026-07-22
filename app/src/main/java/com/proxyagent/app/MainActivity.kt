@@ -314,7 +314,7 @@ class MainActivity : AppCompatActivity() {
         }
         otaWidget.visibility = View.VISIBLE
         val channel = OtaConfig.channel(this)
-        tvOtaChannel.text = "⟳ ${channel.id}"
+        tvOtaChannel.text = "⟳ ${channel.label}"
 
         if (otaChecking) return
         val now = System.currentTimeMillis()

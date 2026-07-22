@@ -28,7 +28,8 @@ object OtaConfig {
      * type (release vs debug are separate CRM apps); a build whose CRM app
      * isn't registered yet ships blank values, and OTA is disabled for it.
      */
-    fun isConfigured(): Boolean = appId.isNotBlank() && baseUrl.isNotBlank()
+    fun isConfigured(): Boolean =
+        appId.isNotBlank() && baseUrl.isNotBlank() && encryptionKey.isNotBlank()
 
     /** Directory segment for this app+platform in R2. */
     private fun dir(): String = "$baseUrl/updates/app/$appId/$platform"

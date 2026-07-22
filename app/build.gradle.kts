@@ -52,7 +52,7 @@ android {
         // ("зашивается в клиент"), so shipping it in BuildConfig is by design.
         //   Manifest path: <OTA_BASE_URL>/updates/app/<OTA_APP_ID>/<OTA_PLATFORM>/current-versions.json
         buildConfigField("String", "OTA_BASE_URL",
-            "\"${System.getenv("OTA_BASE_URL") ?: "https://cdn.home-stash.house"}\"")
+            "\"${System.getenv("OTA_BASE_URL")?.takeUnless { it.isBlank() } ?: "https://cdn.home-stash.house"}\"")
         buildConfigField("String", "OTA_PLATFORM", "\"android\"")
         buildConfigField("String", "OTA_DEFAULT_CHANNEL", "\"stable\"")
 
@@ -148,9 +148,9 @@ android {
             }
             // OTA coordinates for the RELEASE CRM app (release-signed builds).
             buildConfigField("String", "OTA_APP_ID",
-                "\"${System.getenv("OTA_APP_ID_RELEASE") ?: "6a5f3fc7a679645d83a1a08e"}\"")
+                "\"${System.getenv("OTA_APP_ID_RELEASE")?.takeUnless { it.isBlank() } ?: "6a5f3fc7a679645d83a1a08e"}\"")
             buildConfigField("String", "OTA_ENCRYPTION_KEY",
-                "\"${System.getenv("OTA_ENCRYPTION_KEY_RELEASE") ?: "fCZMilU141ibKg1NbxrXX3Hx"}\"")
+                "\"${System.getenv("OTA_ENCRYPTION_KEY_RELEASE")?.takeUnless { it.isBlank() } ?: "fCZMilU141ibKg1NbxrXX3Hx"}\"")
         }
         debug {
             // OTA coordinates for the DEBUG CRM app (debug-signed builds). Its

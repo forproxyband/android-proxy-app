@@ -3,6 +3,7 @@ package com.proxyagent.app.ota
 import android.content.Context
 import androidx.work.Constraints
 import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
@@ -19,6 +20,7 @@ import java.util.concurrent.TimeUnit
 object OtaScheduler {
 
     private const val WORK_NAME = "ota-update-check"
+    private const val WORK_NAME_ONCE = "ota-update-check-once"
     private const val INTERVAL_HOURS = 6L
 
     fun schedule(ctx: Context) {
@@ -51,9 +53,20 @@ object OtaScheduler {
                     .setRequiredNetworkType(NetworkType.CONNECTED)
                     .build()
             )
-            .setInputData(workDataOf(OtaUpdateWorker.KEY_FORCE to true))
+            // notify_only: the long-press test triggers a check + notification,
+            // never a silent reinstall. force: bypass the notify dedup marker.
+            .setInputData(
+                workDataOf(
+                    OtaUpdateWorker.KEY_FORCE to true,
+                    OtaUpdateWorker.KEY_NOTIFY_ONLY to true,
+                )
+            )
             .build()
-        WorkManager.getInstance(ctx).enqueue(request)
+        // Unique + KEEP: rapid long-presses don't spawn concurrent workers that
+        // would race on the OTA cache / duplicate notifications.
+        WorkManager.getInstance(ctx).enqueueUniqueWork(
+            WORK_NAME_ONCE, ExistingWorkPolicy.KEEP, request,
+        )
     }
 }
 

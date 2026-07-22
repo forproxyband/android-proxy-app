@@ -71,6 +71,7 @@ class UpdatesActivity : AppCompatActivity() {
 
     private var suppressSpinner = false
     @Volatile private var busy = false
+    @Volatile private var installCancelled = false
     private var progressDialog: AlertDialog? = null
 
     private enum class InstallAction { ROOT_INSTALL, SYSTEM_INSTALL, SAVE_TO_DOWNLOADS }
@@ -222,6 +223,14 @@ class UpdatesActivity : AppCompatActivity() {
             runOnUiThread {
                 busy = false
                 if (isFinishing || isDestroyed) return@runOnUiThread
+                // If the user switched channel while this check was in flight, the
+                // switch was swallowed by the busy-guard — discard these stale
+                // results and re-fetch for the now-selected channel so the status,
+                // version list and INSTALL button all match the spinner.
+                if (channel != selectedChannel) {
+                    reload()
+                    return@runOnUiThread
+                }
                 rootAvailable = root
                 btnCheck.isEnabled = true
                 if (error != null) {
@@ -486,6 +495,7 @@ class UpdatesActivity : AppCompatActivity() {
     private fun perform(entry: HistoryEntry, sha: String?, action: InstallAction) {
         if (busy) return
         busy = true
+        installCancelled = false
 
         val progressText = TextView(this).apply {
             text = "Starting…"
@@ -508,6 +518,7 @@ class UpdatesActivity : AppCompatActivity() {
             .setTitle(title)
             .setView(container)
             .setCancelable(false)
+            .setNegativeButton("Cancel") { _, _ -> installCancelled = true }
             .create()
         dialog.show()
         progressDialog = dialog
@@ -519,6 +530,9 @@ class UpdatesActivity : AppCompatActivity() {
             var error: String? = null
             try {
                 apk = OtaManager.prepare(this, entry.fileName, sha) { phase, soFar, total ->
+                    // Runs on the background thread — abort the download/verify
+                    // promptly when the user taps Cancel.
+                    if (installCancelled) throw java.util.concurrent.CancellationException("cancelled")
                     runOnUiThread {
                         if (isFinishing || isDestroyed) return@runOnUiThread
                         when (phase) {
@@ -545,8 +559,9 @@ class UpdatesActivity : AppCompatActivity() {
                             if (!isFinishing && !isDestroyed) progressText.text = "Installing (root)…"
                         }
                         // Replaces this app → our process is killed at commit; the
-                        // return value may never be observed (that's fine).
-                        rootInstalled = RootInstaller.installSilently(apk!!)
+                        // return value may never be observed (that's fine). Manual
+                        // action allows downgrade (-d); auto-update never does.
+                        rootInstalled = RootInstaller.installSilently(apk!!, allowDowngrade = true)
                     }
                     InstallAction.SAVE_TO_DOWNLOADS -> {
                         runOnUiThread {
@@ -570,7 +585,9 @@ class UpdatesActivity : AppCompatActivity() {
                 progressDialog = null
                 if (isFinishing || isDestroyed) return@runOnUiThread
                 if (error != null || readyApk == null) {
-                    Toast.makeText(this, "Failed: ${error ?: "unknown error"}", Toast.LENGTH_LONG).show()
+                    val msg = if (installCancelled) "Cancelled"
+                    else "Failed: ${error ?: "unknown error"}"
+                    Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
                     return@runOnUiThread
                 }
                 when (action) {

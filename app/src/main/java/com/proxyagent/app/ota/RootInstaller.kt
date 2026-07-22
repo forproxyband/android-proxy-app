@@ -22,7 +22,10 @@ object RootInstaller {
         val reader = Thread {
             try { p.inputStream.bufferedReader().use { out.append(it.readText()) } } catch (_: Throwable) {}
         }.apply { isDaemon = true; start() }
-        val done = p.waitFor(8, TimeUnit.SECONDS)
+        // Generous timeout: the FIRST call pops the su-manager (Magisk) grant
+        // dialog and blocks until the user taps allow — 8s was too short and
+        // spuriously reported "no root" while the prompt was still up.
+        val done = p.waitFor(30, TimeUnit.SECONDS)
         if (!done) { p.destroy(); false }
         else { try { reader.join(1000) } catch (_: InterruptedException) {}; p.exitValue() == 0 && out.contains("uid=0") }
     } catch (_: Throwable) {
@@ -30,14 +33,17 @@ object RootInstaller {
     }
 
     /**
-     * Install [apk] silently as root. `-r` keeps data, `-d` allows a version
-     * downgrade. Returns true on "Success". Blocking — call off the main thread.
-     * Note: installing an update to THIS package kills our process at commit,
-     * so a caller may never observe the return value — that's expected.
+     * Install [apk] silently as root. `-r` keeps data; `-d` (only when
+     * [allowDowngrade]) permits a version-code downgrade. Auto-update passes
+     * false so it can never be tricked into a rollback; the manual downgrade
+     * action passes true. Returns true on "Success". Blocking — call off the
+     * main thread. Note: updating THIS package kills our process at commit, so
+     * a caller may never observe the return value — that's expected.
      */
-    fun installSilently(apk: File): Boolean = try {
+    fun installSilently(apk: File, allowDowngrade: Boolean = false): Boolean = try {
         val size = apk.length()
-        val p = ProcessBuilder("su", "-c", "pm install -r -d -S $size")
+        val flags = if (allowDowngrade) "-r -d" else "-r"
+        val p = ProcessBuilder("su", "-c", "pm install $flags -S $size")
             .redirectErrorStream(true)
             .start()
         val out = StringBuilder()
