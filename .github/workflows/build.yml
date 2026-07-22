@@ -86,8 +86,11 @@ jobs:
       # work between debug and release where it can, so doing both in one
       # task graph also lets Gradle reuse intermediates that would
       # otherwise be re-checked.
-      - name: Build debug + release APK
-        run: ./gradlew :app:assembleDebug :app:assembleRelease --no-daemon --build-cache --stacktrace
+      - name: Build debug + release APK + run unit tests
+        # testDebugUnitTest covers the OTA manifest-parse / Blowfish-decrypt /
+        # version-compare logic (app/src/test). Folded into the same Gradle
+        # invocation so it shares one JVM + task graph with the assemble tasks.
+        run: ./gradlew :app:assembleDebug :app:assembleRelease :app:testDebugUnitTest --no-daemon --build-cache --stacktrace
 
       # Sanity check: the built APK's manifest must declare the minSdk we
       # set in app/build.gradle.kts (currently 23 = Android 6.0). Catches

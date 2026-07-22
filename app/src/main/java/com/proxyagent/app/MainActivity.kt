@@ -49,6 +49,11 @@ import com.google.zxing.RGBLuminanceSource
 import com.google.zxing.common.HybridBinarizer
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
+import com.proxyagent.app.ota.OtaConfig
+import com.proxyagent.app.ota.OtaManager
+import com.proxyagent.app.ota.OtaScheduler
+import com.proxyagent.app.ota.UpdateStatus
+import com.proxyagent.app.ota.UpdatesActivity
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -77,6 +82,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var logsHeader: View
     private lateinit var tvLogsChevron: TextView
     private lateinit var btnSaveLog: Button
+    private lateinit var otaWidget: View
+    private lateinit var tvOtaChannel: TextView
+    private lateinit var tvOtaStatus: TextView
+    @Volatile private var otaChecking = false
+    private var lastOtaCheckMs = 0L
 
     private val handler = Handler(Looper.getMainLooper())
     private val refresher = object : Runnable {
@@ -166,6 +176,25 @@ class MainActivity : AppCompatActivity() {
 
         findViewById<TextView>(R.id.tvVersion).text =
             "v${BuildConfig.VERSION_NAME}  build ${BuildConfig.VERSION_CODE}"
+
+        otaWidget = findViewById(R.id.otaWidget)
+        tvOtaChannel = findViewById(R.id.tvOtaChannel)
+        tvOtaStatus = findViewById(R.id.tvOtaStatus)
+        otaWidget.setOnClickListener {
+            startActivity(Intent(this, UpdatesActivity::class.java))
+        }
+        // Long-press = run the background check now (test aid: fires the
+        // update-available notification without waiting for the periodic run).
+        otaWidget.setOnLongClickListener {
+            try {
+                OtaScheduler.runOnceNow(this)
+                Toast.makeText(this, "Update check triggered", Toast.LENGTH_SHORT).show()
+            } catch (_: Throwable) {}
+            true
+        }
+        refreshOtaWidget(force = true)
+        // Periodic background update check (posts a notification when one lands).
+        try { OtaScheduler.schedule(this) } catch (_: Throwable) {}
 
         val prefs = getSharedPreferences("cfg", 0)
 
@@ -311,6 +340,7 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         refresh()
         updateBatteryButton()
+        refreshOtaWidget(force = false)
         handler.removeCallbacks(refresher)
         handler.postDelayed(refresher, 3000)
     }
@@ -318,6 +348,54 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         handler.removeCallbacks(refresher)
         super.onPause()
+    }
+
+    // Update the main-screen OTA widget: always refresh the tracked-channel
+    // label, and (throttled to once a minute unless forced) check the manifest
+    // in the background. Never downloads — that only happens from UpdatesActivity.
+    private fun refreshOtaWidget(force: Boolean) {
+        val channel = OtaConfig.channel(this)
+        tvOtaChannel.text = "⟳ ${channel.id}"
+
+        if (otaChecking) return
+        val now = System.currentTimeMillis()
+        if (!force && now - lastOtaCheckMs < 60_000L) return
+        otaChecking = true
+        lastOtaCheckMs = now
+        tvOtaStatus.text = "checking…"
+        tvOtaStatus.setTextColor(0xFF888888.toInt())
+
+        Thread {
+            var status: UpdateStatus? = null
+            var failed = false
+            try {
+                status = OtaManager.check(this, channel)
+            } catch (_: Throwable) {
+                failed = true
+            }
+            val s = status
+            runOnUiThread {
+                otaChecking = false
+                when {
+                    failed || s == null -> {
+                        tvOtaStatus.text = "update check failed"
+                        tvOtaStatus.setTextColor(0xFF888888.toInt())
+                    }
+                    s is UpdateStatus.Available -> {
+                        tvOtaStatus.text = "Update available: ${s.release.version}"
+                        tvOtaStatus.setTextColor(0xFFFFCC66.toInt())
+                    }
+                    s is UpdateStatus.UpToDate -> {
+                        tvOtaStatus.text = "Version up to date"
+                        tvOtaStatus.setTextColor(0xFF88ffaa.toInt())
+                    }
+                    else -> {
+                        tvOtaStatus.text = "no release in channel"
+                        tvOtaStatus.setTextColor(0xFF888888.toInt())
+                    }
+                }
+            }
+        }.apply { isDaemon = true; name = "OtaWidgetCheck"; start() }
     }
 
     private fun showSettingsDialog() {

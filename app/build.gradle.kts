@@ -43,6 +43,22 @@ android {
         versionCode = appVersionCode
         versionName = appVersionName
 
+        // ── OTA updates (com.proxyagent.app.ota) ──────────────────────────
+        // Coordinates for the CRM OTA channel (see OTA_UPDATES_PLAN.md).
+        // The R2 bucket is public and read-only; the Blowfish key is meant
+        // to be embedded in the client per the CRM contract ("зашивается в
+        // клиент"), so shipping these in BuildConfig is by design. Overridable
+        // via env for staging/rotation without touching source.
+        //   Manifest path: <OTA_BASE_URL>/updates/app/<OTA_APP_ID>/<OTA_PLATFORM>/current-versions.json
+        buildConfigField("String", "OTA_BASE_URL",
+            "\"${System.getenv("OTA_BASE_URL") ?: "https://cdn.home-stash.house"}\"")
+        buildConfigField("String", "OTA_APP_ID",
+            "\"${System.getenv("OTA_APP_ID") ?: "6a5f3fc7a679645d83a1a08e"}\"")
+        buildConfigField("String", "OTA_ENCRYPTION_KEY",
+            "\"${System.getenv("OTA_ENCRYPTION_KEY") ?: "fCZMilU141ibKg1NbxrXX3Hx"}\"")
+        buildConfigField("String", "OTA_PLATFORM", "\"android\"")
+        buildConfigField("String", "OTA_DEFAULT_CHANNEL", "\"stable\"")
+
         // ABI filter for native libs. Matches the pre-built
         // libproxyagent.so under app/src/main/jniLibs/<abi>/ so our
         // CMake-built libagentsplice.so and the Go binary cover the
@@ -229,6 +245,8 @@ dependencies {
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     // Swipeable status panel: status / 24h-traffic / 24h-connections.
     implementation("androidx.viewpager2:viewpager2:1.1.0")
+    // WorkManager: periodic background OTA update check (com.proxyagent.app.ota.OtaUpdateWorker).
+    implementation("androidx.work:work-runtime-ktx:2.10.0")
     // QUIC client used by the NATIVE engine (com.proxyagent.app.nativeagent.*).
     // Pure-Java QUIC v1 implementation; uses java.time.Duration so core library
     // desugaring is enabled in compileOptions below to make it usable on
@@ -262,4 +280,10 @@ dependencies {
     androidTestImplementation("androidx.test:rules:1.6.1")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("junit:junit:4.13.2")
+
+    // ── Local JVM unit tests (app/src/test) ────────────────────────────
+    // OTA manifest parsing, Blowfish/SHA-256 crypto and version-compare
+    // logic are pure JVM (no Android framework) and run under
+    // `./gradlew testDebugUnitTest` in CI.
+    testImplementation("junit:junit:4.13.2")
 }

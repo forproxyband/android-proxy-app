@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
     <files-path name="logs" path="exports/" />
+    <!-- Downloaded+decrypted OTA APKs live in cacheDir/ota/ and are handed
+         to the system installer via a content:// URI. See
+         com.proxyagent.app.ota.ApkInstaller / OtaManager. -->
+    <cache-path name="ota" path="ota/" />
 </paths>

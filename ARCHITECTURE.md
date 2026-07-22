@@ -127,6 +127,22 @@ Backed by the dialog at `MainActivity.kt:278-408` (XML
 | `wifi_return` | bool | false | Route the agent↔registrator uplink over Wi-Fi via a loopback relay; target dials still ride cellular. Modem mode only — auto-clamped to false on save when `mode="balancer"`. See "Wi-Fi return relay" below. |
 | `wifi_return_method` | string | `"local_relay"` | Slot for future methods (SO_MARK, VpnService split tunnel). No UI yet — only `local_relay` is implemented; anything else falls back to direct dial with a log line. |
 | `network_profile` | string | `"LOW_100"` | Network optimization preset — `"LOW_100"` / `"MID_500"` / `"HIGH_1000"`. Scales TCP socket / bridge buffers AND QUIC Brutal CC target / UDP socket buffer / flow-control refresh cadence to match the expected link ceiling. Default `LOW_100` matches the common-case mobile/Wi-Fi link (≤100 Mbps) and bounds bufferbloat tighter; field tests show it still delivers full multi-flow throughput on gigabit links through parallel target dials. NATIVE engine only; BINARY ignores it (`libproxyagent.so` has no env hooks for these values — logged as a WARN at runBinaryEngine start). Applies on the next stop/start; changing it mid-session shows a Toast and waits for a manual restart. See [NetworkProfile-driven tuning](#networkprofile-driven-tuning). |
+| `ota_channel` | string | `stable` | OTA update channel the app tracks. See [OTA self-update](#ota-self-update). |
+| `ota_notified_build` | long | — | Dedup marker: last build number the background worker raised an "update available" notification for. |
+
+## OTA self-update
+
+The app updates itself over the air from the CRM's distribution bucket:
+poll a JSON manifest → compare versions → download an encrypted build from
+Cloudflare R2 → Blowfish-decrypt → verify SHA-256 → hand to the system
+installer. Surfaced by a widget on the main screen and a dedicated
+`UpdatesActivity` (channel picker + version list + downgrade), plus a
+periodic `WorkManager` check that notifies. Config lives in
+`app/build.gradle.kts` (`OTA_*` `buildConfigField`s).
+
+Full design, the manifest contract, the `build == versionCode` rule,
+dynamic channels, integrity/security, and the publish flow are documented
+in [`app/src/main/java/com/proxyagent/app/ota/DESIGN.md`](app/src/main/java/com/proxyagent/app/ota/DESIGN.md).
 
 ## Agent engines
 
