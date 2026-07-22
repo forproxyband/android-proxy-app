@@ -51,6 +51,7 @@ Read this before moving logic between files.
 | `OtaClient.kt` | `HttpURLConnection` GETs: manifests (uncached) and build download (Range-resume, 404 handling). No auth. |
 | `OtaManager.kt` | Orchestration: `check` / `history` / `currentRelease` / `prepare` (download → decrypt → verify → installable APK). Blocking; call off the main thread. |
 | `ApkInstaller.kt` | FileProvider URI + system installer intent; "install unknown apps" grant flow. |
+| `OtaExport.kt` | Saves a prepared APK to the public Downloads folder (downgrade path): MediaStore on API 29+, legacy dir + `WRITE_EXTERNAL_STORAGE` on 23-28. |
 | `UpdatesActivity.kt` | UI: channel picker (dynamic Spinner), status, version list, install/downgrade, progress dialog. |
 | `OtaUpdateWorker.kt` | Background periodic check → "update available" notification (dedup by build). |
 | `OtaScheduler.kt` | Enqueues the periodic worker; `runOnceNow` test trigger. |
@@ -136,6 +137,14 @@ notification). They never download.
 4. `ApkInstaller.install` → system installer via a FileProvider `content://`
    URI. `PackageReplacedReceiver` restarts `ProxyService` after replacement.
 
+**Downgrade** (selected build < installed `versionCode`) takes a different
+path: Android refuses an in-place downgrade (`INSTALL_FAILED_VERSION_DOWNGRADE`),
+so instead of installing, the decrypted+verified APK is saved to the public
+**Downloads** folder (`OtaExport` — MediaStore on API 29+, legacy dir +
+`WRITE_EXTERNAL_STORAGE` on 23-28). The user then uninstalls the app and
+installs the saved file manually. No API lets a non-privileged app bypass the
+downgrade block.
+
 ## Integrity & security
 
 - **Encryption:** `Blowfish/ECB/PKCS5Padding`, key = UTF-8 bytes of
@@ -161,6 +170,8 @@ notification). They never download.
   `ACTION_MANAGE_UNKNOWN_APP_SOURCES`).
 - `POST_NOTIFICATIONS` (already present, requested in `MainActivity`) — the
   background update notification (Android 13+).
+- `WRITE_EXTERNAL_STORAGE` (`maxSdkVersion=28`) — only the downgrade
+  "save to Downloads" path on API 23-28; API 29+ uses MediaStore, no grant.
 - FileProvider: authority `${applicationId}.fileprovider`, path
   `cache-path name="ota" path="ota/"` in `res/xml/filepaths.xml`.
 
@@ -215,5 +226,6 @@ manifests. The client picks it up on the next check.
   survives to a later attempt.
 - Dormant channels (history but no current release) are not
   auto-discovered (no channel index in the contract).
-- Downgrades are best-effort: Android refuses a lower `versionCode` without
-  an uninstall; the UI warns but cannot override this.
+- Downgrades cannot happen in place (Android refuses a lower `versionCode`).
+  The Downgrade action saves the APK to Downloads for a manual
+  uninstall-then-install; nothing bypasses the block for a non-privileged app.

@@ -1,5 +1,7 @@
 package com.proxyagent.app.ota
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.view.Gravity
 import android.view.View
@@ -12,6 +14,7 @@ import android.widget.ProgressBar
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
@@ -47,6 +50,20 @@ class UpdatesActivity : AppCompatActivity() {
     // Progress dialog for an in-flight install; dismissed in onDestroy so a
     // rotation / backgrounding mid-download doesn't leak its window.
     private var progressDialog: AlertDialog? = null
+
+    private enum class InstallAction { INSTALL, SAVE_TO_DOWNLOADS }
+
+    // Held while a legacy (API<29) WRITE_EXTERNAL_STORAGE request is in flight.
+    private var pendingSave: Pair<HistoryEntry, String?>? = null
+    private val storagePermLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            val p = pendingSave
+            pendingSave = null
+            when {
+                granted && p != null -> perform(p.first, p.second, InstallAction.SAVE_TO_DOWNLOADS)
+                !granted -> Toast.makeText(this, "Storage permission denied", Toast.LENGTH_SHORT).show()
+            }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -214,7 +231,10 @@ class UpdatesActivity : AppCompatActivity() {
             setPadding(dp(12), 0, dp(12), 0)
             setTextColor(0xFFe94560.toInt())
             setBackgroundColor(0xFF16213e.toInt())
-            setOnClickListener { confirmInstall(entry, sha) }
+            setOnClickListener {
+                if (entry.build < installed) confirmDowngrade(entry, sha)
+                else confirmInstall(entry, sha)
+            }
         }
 
         row.addView(label)
@@ -222,18 +242,14 @@ class UpdatesActivity : AppCompatActivity() {
         return row
     }
 
+    // Install / reinstall (build >= installed). In-place upgrade via the installer.
     private fun confirmInstall(entry: HistoryEntry, sha: String?) {
         if (busy) return
-        val installed = OtaManager.installedBuild()
         val sb = StringBuilder()
         sb.append("Version ${entry.version} (build ${entry.build}).\n\n")
         if (sha == null) {
             sb.append("Note: this build is not the channel's current release, so its ")
             sb.append("integrity hash isn't published — only the APK signature is verified.\n\n")
-        }
-        if (entry.build < installed) {
-            sb.append("This is OLDER than the installed build ($installed). Android may refuse ")
-            sb.append("the downgrade unless the app is uninstalled first.\n\n")
         }
         sb.append("Download, decrypt and install now?")
 
@@ -258,10 +274,49 @@ class UpdatesActivity : AppCompatActivity() {
                 .show()
             return
         }
-        downloadAndInstall(entry, sha)
+        perform(entry, sha, InstallAction.INSTALL)
     }
 
-    private fun downloadAndInstall(entry: HistoryEntry, sha: String?) {
+    // Downgrade (build < installed). Android refuses an in-place downgrade, so
+    // we save the decrypted APK to Downloads for a manual uninstall+install.
+    private fun confirmDowngrade(entry: HistoryEntry, sha: String?) {
+        if (busy) return
+        val installed = OtaManager.installedBuild()
+        val sb = StringBuilder()
+        sb.append("Automatic downgrade is not possible — Android refuses to install ")
+        sb.append("build ${entry.build} over the newer installed build ($installed) ")
+        sb.append("(\"App not installed\").\n\n")
+        if (sha == null) {
+            sb.append("Its integrity hash isn't published (not the channel's current), so only ")
+            sb.append("the APK signature is verified.\n\n")
+        }
+        sb.append("Instead, the APK will be downloaded, decrypted and saved to your Downloads ")
+        sb.append("folder. To apply it: uninstall Proxy Agent, then open the saved file and install it.")
+
+        AlertDialog.Builder(this)
+            .setTitle("Downgrade to ${entry.version}")
+            .setMessage(sb.toString())
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Save to Downloads") { _, _ -> startSaveToDownloads(entry, sha) }
+            .show()
+    }
+
+    private fun startSaveToDownloads(entry: HistoryEntry, sha: String?) {
+        if (busy) return
+        if (OtaExport.needsLegacyStoragePermission() &&
+            checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingSave = entry to sha
+            storagePermLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            return
+        }
+        perform(entry, sha, InstallAction.SAVE_TO_DOWNLOADS)
+    }
+
+    // Shared pipeline: download → decrypt → verify (with progress), then either
+    // launch the installer or save the APK to Downloads.
+    private fun perform(entry: HistoryEntry, sha: String?, action: InstallAction) {
         if (busy) return
         busy = true
 
@@ -280,8 +335,10 @@ class UpdatesActivity : AppCompatActivity() {
             addView(progressText)
             addView(bar)
         }
+        val title = if (action == InstallAction.SAVE_TO_DOWNLOADS) "Preparing ${entry.version}"
+        else "Installing ${entry.version}"
         val dialog = AlertDialog.Builder(this)
-            .setTitle("Installing ${entry.version}")
+            .setTitle(title)
             .setView(container)
             .setCancelable(false)
             .create()
@@ -290,6 +347,7 @@ class UpdatesActivity : AppCompatActivity() {
 
         Thread {
             var apk: File? = null
+            var savedLocation: String? = null
             var error: String? = null
             try {
                 apk = OtaManager.prepare(this, entry.fileName, sha) { phase, soFar, total ->
@@ -313,26 +371,45 @@ class UpdatesActivity : AppCompatActivity() {
                         }
                     }
                 }
+                if (action == InstallAction.SAVE_TO_DOWNLOADS && apk != null) {
+                    runOnUiThread {
+                        if (!isFinishing && !isDestroyed) progressText.text = "Saving to Downloads…"
+                    }
+                    savedLocation = OtaExport.saveToDownloads(
+                        this, apk!!, OtaExport.downloadsFileName(entry.version, entry.build),
+                    )
+                }
             } catch (t: Throwable) {
                 error = t.message ?: t.javaClass.simpleName
             }
             val readyApk = apk
+            val location = savedLocation
             runOnUiThread {
                 busy = false
                 dialog.dismiss()
                 progressDialog = null
                 if (isFinishing || isDestroyed) return@runOnUiThread
                 if (error != null || readyApk == null) {
-                    Toast.makeText(this, "Update failed: ${error ?: "unknown error"}", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, "Failed: ${error ?: "unknown error"}", Toast.LENGTH_LONG).show()
                     return@runOnUiThread
                 }
-                try {
-                    ApkInstaller.install(this, readyApk)
-                } catch (t: Throwable) {
-                    Toast.makeText(this, "Install failed: ${t.message}", Toast.LENGTH_LONG).show()
+                when (action) {
+                    InstallAction.INSTALL -> try {
+                        ApkInstaller.install(this, readyApk)
+                    } catch (t: Throwable) {
+                        Toast.makeText(this, "Install failed: ${t.message}", Toast.LENGTH_LONG).show()
+                    }
+                    InstallAction.SAVE_TO_DOWNLOADS -> AlertDialog.Builder(this)
+                        .setTitle("Saved to Downloads")
+                        .setMessage(
+                            "Saved: $location\n\nTo downgrade: uninstall Proxy Agent, then open " +
+                                "this file (Files app / Downloads) and install it."
+                        )
+                        .setPositiveButton("OK", null)
+                        .show()
                 }
             }
-        }.apply { isDaemon = true; name = "OtaInstall"; start() }
+        }.apply { isDaemon = true; name = "OtaPerform"; start() }
     }
 
     private fun setStatus(text: String, colorHex: String) {

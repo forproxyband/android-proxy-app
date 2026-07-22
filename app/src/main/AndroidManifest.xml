@@ -39,6 +39,11 @@
          PackageManager.canRequestPackageInstalls + ACTION_MANAGE_UNKNOWN_APP_SOURCES).
          See com.proxyagent.app.ota.ApkInstaller. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- OTA downgrade path saves the decrypted APK to the public Downloads
+         folder for manual install. API 29+ uses MediaStore (no permission);
+         only API 23-28 needs this legacy write permission. -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
 
