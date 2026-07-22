@@ -15,11 +15,19 @@ object OtaConfig {
     /** SharedPreferences store shared across the app (see MainActivity). */
     private const val PREFS = "cfg"
     private const val KEY_CHANNEL = "ota_channel"
+    private const val KEY_LAST_CHECK = "ota_last_check_ms"
 
     val baseUrl: String get() = BuildConfig.OTA_BASE_URL.trimEnd('/')
     val appId: String get() = BuildConfig.OTA_APP_ID
     val platform: String get() = BuildConfig.OTA_PLATFORM
     val encryptionKey: String get() = BuildConfig.OTA_ENCRYPTION_KEY
+
+    /**
+     * Whether OTA is wired for this build type. The app id + key are per build
+     * type (release vs debug are separate CRM apps); a build whose CRM app
+     * isn't registered yet ships blank values, and OTA is disabled for it.
+     */
+    fun isConfigured(): Boolean = appId.isNotBlank() && baseUrl.isNotBlank()
 
     /** Directory segment for this app+platform in R2. */
     private fun dir(): String = "$baseUrl/updates/app/$appId/$platform"
@@ -45,4 +53,15 @@ object OtaConfig {
             .putString(KEY_CHANNEL, channel.id)
             .apply()
     }
+
+    /** Stamp "now" as the last successful update check (widget / worker / screen). */
+    fun recordCheck(ctx: Context) {
+        ctx.getSharedPreferences(PREFS, 0).edit()
+            .putLong(KEY_LAST_CHECK, System.currentTimeMillis())
+            .apply()
+    }
+
+    /** Epoch-ms of the last successful check, or 0 if never. */
+    fun lastCheckMs(ctx: Context): Long =
+        ctx.getSharedPreferences(PREFS, 0).getLong(KEY_LAST_CHECK, 0L)
 }

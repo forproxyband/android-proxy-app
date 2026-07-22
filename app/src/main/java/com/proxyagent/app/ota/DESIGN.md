@@ -19,15 +19,25 @@ describes **our client** and only restates the contract where needed.
 ## Configuration
 
 All coordinates come from `BuildConfig`, injected in `app/build.gradle.kts`
-`defaultConfig` (overridable via env for staging/rotation):
+(overridable via env for staging/rotation):
 
-| Field | Meaning |
-|---|---|
-| `OTA_BASE_URL` | Public R2 base URL |
-| `OTA_APP_ID` | This app's 24-hex ObjectId (its folder in R2) |
-| `OTA_ENCRYPTION_KEY` | Blowfish key (UTF-8 bytes, embedded in client by contract) |
-| `OTA_PLATFORM` | `android` |
-| `OTA_DEFAULT_CHANNEL` | Channel used until the user picks one (`stable`) |
+| Field | Scope | Meaning |
+|---|---|---|
+| `OTA_BASE_URL` | shared (`defaultConfig`) | Public R2 base URL |
+| `OTA_PLATFORM` | shared (`defaultConfig`) | `android` |
+| `OTA_DEFAULT_CHANNEL` | shared (`defaultConfig`) | Channel used until the user picks one (`stable`) |
+| `OTA_APP_ID` | **per build type** | This app's 24-hex ObjectId (its folder in R2) |
+| `OTA_ENCRYPTION_KEY` | **per build type** | Blowfish key (UTF-8 bytes, embedded in client by contract) |
+
+**Per-build-type apps.** `release` and `debug` are **separate CRM apps** —
+each has its own `OTA_APP_ID` + `OTA_ENCRYPTION_KEY` (set in `buildTypes {}`)
+**and its own APK signature** (release key vs debug key). A build must only
+ever be offered OTA APKs from *its own* CRM app: an update signed by a
+different key is rejected by Android (`App not installed`). Debug ships blank
+values until its CRM app is registered, and `OtaConfig.isConfigured()`
+(`appId` + `baseUrl` non-blank) then **disables OTA for that build** — the
+main-screen widget hides, the worker no-ops, and `UpdatesActivity` shows
+"OTA is not configured for this build."
 
 `OtaConfig` reads these plus the user-selected channel (stored in the shared
 `SharedPreferences("cfg")` under `ota_channel`) and builds every URL:
@@ -52,7 +62,7 @@ Read this before moving logic between files.
 | `OtaManager.kt` | Orchestration: `check` / `history` / `currentRelease` / `prepare` (download → decrypt → verify → installable APK). Blocking; call off the main thread. |
 | `ApkInstaller.kt` | FileProvider URI + system installer intent; "install unknown apps" grant flow. |
 | `OtaExport.kt` | Saves a prepared APK to the public Downloads folder (downgrade path): MediaStore on API 29+, legacy dir + `WRITE_EXTERNAL_STORAGE` on 23-28. |
-| `UpdatesActivity.kt` | UI: channel picker (dynamic Spinner), status, version list, install/downgrade, progress dialog. |
+| `UpdatesActivity.kt` | UI: channel picker (dynamic Spinner), status + "last checked" line, a primary **Install** button (the channel's current version), manual **Check**, and a collapsible **Downgrade** section listing older versions (each → save to Downloads). Progress dialog for the download. |
 | `OtaUpdateWorker.kt` | Background periodic check → "update available" notification (dedup by build). |
 | `OtaScheduler.kt` | Enqueues the periodic worker; `runOnceNow` test trigger. |
 | `OtaNotifications.kt` | The update-available notification + its channel. |

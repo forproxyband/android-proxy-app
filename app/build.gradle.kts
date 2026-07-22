@@ -44,18 +44,15 @@ android {
         versionName = appVersionName
 
         // ── OTA updates (com.proxyagent.app.ota) ──────────────────────────
-        // Coordinates for the CRM OTA channel (see OTA_UPDATES_PLAN.md).
-        // The R2 bucket is public and read-only; the Blowfish key is meant
-        // to be embedded in the client per the CRM contract ("зашивается в
-        // клиент"), so shipping these in BuildConfig is by design. Overridable
-        // via env for staging/rotation without touching source.
+        // Base URL / platform / default channel are SHARED across build types.
+        // The per-app id and Blowfish key are NOT: release and debug are
+        // separate CRM apps (each with its own key AND its own APK signature),
+        // so those two fields are set per build type in buildTypes {} below.
+        // The Blowfish key is embedded in the client by the CRM contract
+        // ("зашивается в клиент"), so shipping it in BuildConfig is by design.
         //   Manifest path: <OTA_BASE_URL>/updates/app/<OTA_APP_ID>/<OTA_PLATFORM>/current-versions.json
         buildConfigField("String", "OTA_BASE_URL",
             "\"${System.getenv("OTA_BASE_URL") ?: "https://cdn.home-stash.house"}\"")
-        buildConfigField("String", "OTA_APP_ID",
-            "\"${System.getenv("OTA_APP_ID") ?: "6a5f3fc7a679645d83a1a08e"}\"")
-        buildConfigField("String", "OTA_ENCRYPTION_KEY",
-            "\"${System.getenv("OTA_ENCRYPTION_KEY") ?: "fCZMilU141ibKg1NbxrXX3Hx"}\"")
         buildConfigField("String", "OTA_PLATFORM", "\"android\"")
         buildConfigField("String", "OTA_DEFAULT_CHANNEL", "\"stable\"")
 
@@ -149,6 +146,22 @@ android {
             ndk {
                 debugSymbolLevel = "none"
             }
+            // OTA coordinates for the RELEASE CRM app (release-signed builds).
+            buildConfigField("String", "OTA_APP_ID",
+                "\"${System.getenv("OTA_APP_ID_RELEASE") ?: "6a5f3fc7a679645d83a1a08e"}\"")
+            buildConfigField("String", "OTA_ENCRYPTION_KEY",
+                "\"${System.getenv("OTA_ENCRYPTION_KEY_RELEASE") ?: "fCZMilU141ibKg1NbxrXX3Hx"}\"")
+        }
+        debug {
+            // OTA coordinates for the DEBUG CRM app (debug-signed builds). Its
+            // CRM app is not registered yet — blank disables OTA for debug via
+            // OtaConfig.isConfigured(). Fill via env (or hard-code here) once
+            // the debug app's id + key exist. Debug OTA APKs MUST be
+            // debug-signed to match the installed debug build.
+            buildConfigField("String", "OTA_APP_ID",
+                "\"${System.getenv("OTA_APP_ID_DEBUG") ?: ""}\"")
+            buildConfigField("String", "OTA_ENCRYPTION_KEY",
+                "\"${System.getenv("OTA_ENCRYPTION_KEY_DEBUG") ?: ""}\"")
         }
     }
 

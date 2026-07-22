@@ -3,6 +3,7 @@ package com.proxyagent.app.ota
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.text.format.DateUtils
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -20,15 +21,18 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import com.proxyagent.app.R
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 // ────────────────────────────────────────────────────────────────────────
-// Updates screen: pick a channel, see whether the tracked version is current,
-// and install any published version — including rolling back to an older one.
+// Updates screen. Focus: install the SELECTED CHANNEL's actual (current)
+// version — one primary button. Manual re-check + "last checked" line above.
+// Downgrade is a separate, collapsed-by-default section (older versions), and
+// since Android can't downgrade in place it only saves the APK to Downloads.
 //
-// Channels are DYNAMIC: the selector is populated from the manifest at runtime
-// (baseline stable/beta/dev ∪ channels that currently have a release ∪ the
-// tracked one), so channels can be dropped or added CRM-side without a client
-// change. Network + crypto run on plain background threads (matching the app).
+// Channels are dynamic (populated from the manifest at runtime). Network +
+// crypto run on plain background threads; UI updated via runOnUiThread.
 // ────────────────────────────────────────────────────────────────────────
 
 class UpdatesActivity : AppCompatActivity() {
@@ -36,24 +40,24 @@ class UpdatesActivity : AppCompatActivity() {
     private lateinit var tvInstalled: TextView
     private lateinit var spChannel: Spinner
     private lateinit var tvStatus: TextView
+    private lateinit var tvLastCheck: TextView
+    private lateinit var btnInstall: Button
     private lateinit var btnCheck: Button
-    private lateinit var llVersions: LinearLayout
+    private lateinit var btnDowngrade: Button
+    private lateinit var svDowngrade: View
+    private lateinit var llDowngrade: LinearLayout
 
     private var selectedChannel: OtaChannel = OtaChannel.STABLE
     private var channels: List<OtaChannel> = OtaChannel.KNOWN
+    private var currentRelease: CurrentRelease? = null
+    private var downgradeExpanded = false
 
-    // Guards the spinner listener while we rebuild it programmatically.
     private var suppressSpinner = false
-
     @Volatile private var busy = false
-
-    // Progress dialog for an in-flight install; dismissed in onDestroy so a
-    // rotation / backgrounding mid-download doesn't leak its window.
     private var progressDialog: AlertDialog? = null
 
     private enum class InstallAction { INSTALL, SAVE_TO_DOWNLOADS }
 
-    // Held while a legacy (API<29) WRITE_EXTERNAL_STORAGE request is in flight.
     private var pendingSave: Pair<HistoryEntry, String?>? = null
     private val storagePermLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -74,14 +78,17 @@ class UpdatesActivity : AppCompatActivity() {
         tvInstalled = findViewById(R.id.tvInstalled)
         spChannel = findViewById(R.id.spChannel)
         tvStatus = findViewById(R.id.tvStatus)
+        tvLastCheck = findViewById(R.id.tvLastCheck)
+        btnInstall = findViewById(R.id.btnInstall)
         btnCheck = findViewById(R.id.btnCheck)
-        llVersions = findViewById(R.id.llVersions)
+        btnDowngrade = findViewById(R.id.btnDowngrade)
+        svDowngrade = findViewById(R.id.svDowngrade)
+        llDowngrade = findViewById(R.id.llDowngrade)
 
         tvInstalled.text =
             "Installed: v${OtaManager.installedVersionName()} (build ${OtaManager.installedBuild()})"
 
         selectedChannel = OtaConfig.channel(this)
-        // Seed the selector before the network answers (baseline ∪ tracked).
         rebuildSpinner(OtaManifest.discoverChannels(emptyList(), selectedChannel))
 
         spChannel.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
@@ -91,6 +98,7 @@ class UpdatesActivity : AppCompatActivity() {
                 if (ch != selectedChannel) {
                     selectedChannel = ch
                     OtaConfig.setChannel(this@UpdatesActivity, ch)
+                    downgradeExpanded = false
                     reload()
                 }
             }
@@ -99,6 +107,7 @@ class UpdatesActivity : AppCompatActivity() {
         }
 
         btnCheck.setOnClickListener { reload() }
+        btnDowngrade.setOnClickListener { toggleDowngrade() }
 
         reload()
     }
@@ -109,29 +118,32 @@ class UpdatesActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
-    /** Rebuild the channel spinner, preserving the current selection. */
     private fun rebuildSpinner(list: List<OtaChannel>) {
         channels = list
-        val labels = list.map { it.label }
-        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, labels)
+        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, list.map { it.label })
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         val idx = list.indexOf(selectedChannel).let { if (it >= 0) it else 0 }
         suppressSpinner = true
         spChannel.adapter = adapter
         if (list.isNotEmpty()) spChannel.setSelection(idx)
-        // Spinner.setSelection dispatches onItemSelected asynchronously; keep the
-        // guard up until that has drained so a programmatic rebuild never looks
-        // like a user pick (which would flip the tracked channel).
         spChannel.post { suppressSpinner = false }
     }
 
-    /** Fetch current-versions + history for the selected channel and render. */
     private fun reload() {
         if (busy) return
+        if (!OtaConfig.isConfigured()) {
+            setStatus("OTA is not configured for this build.", "#888888")
+            tvLastCheck.text = ""
+            btnInstall.visibility = View.GONE
+            btnDowngrade.visibility = View.GONE
+            svDowngrade.visibility = View.GONE
+            btnCheck.isEnabled = false
+            spChannel.isEnabled = false
+            return
+        }
         busy = true
         val channel = selectedChannel
         setStatus("Checking…", "#888888")
-        llVersions.removeAllViews()
         btnCheck.isEnabled = false
 
         Thread {
@@ -144,6 +156,7 @@ class UpdatesActivity : AppCompatActivity() {
             } catch (t: Throwable) {
                 error = t.message ?: t.javaClass.simpleName
             }
+            if (error == null) OtaConfig.recordCheck(this)
             val current = OtaManifest.findChannel(releases, channel)
             val status = OtaManifest.statusFor(current, OtaManager.installedBuild())
             val discovered = OtaManifest.discoverChannels(releases, channel)
@@ -156,8 +169,11 @@ class UpdatesActivity : AppCompatActivity() {
                     return@runOnUiThread
                 }
                 rebuildSpinner(discovered)
+                currentRelease = current
                 renderStatus(status)
-                renderVersions(history, current)
+                renderLastCheck()
+                renderInstallButton(current)
+                renderDowngrade(history, current)
             }
         }.apply { isDaemon = true; name = "OtaReload"; start() }
     }
@@ -179,70 +195,99 @@ class UpdatesActivity : AppCompatActivity() {
         }
     }
 
-    private fun renderVersions(history: List<HistoryEntry>, current: CurrentRelease?) {
-        llVersions.removeAllViews()
-        if (history.isEmpty()) {
-            val tv = TextView(this).apply {
-                text = "No versions published in this channel."
-                setTextColor(0xFF888888.toInt())
-                textSize = 13f
-                setPadding(dp(6), dp(10), dp(6), dp(10))
-            }
-            llVersions.addView(tv)
-            return
-        }
-        val installed = OtaManager.installedBuild()
-        for (entry in history) {
-            // Only the channel's current build has a published SHA-256.
-            val sha = if (current != null && entry.fileName == current.fileName) current.sha256 else null
-            llVersions.addView(versionRow(entry, sha, installed))
+    private fun renderLastCheck() {
+        val ts = OtaConfig.lastCheckMs(this)
+        tvLastCheck.text = if (ts <= 0L) {
+            "Last checked: never"
+        } else {
+            val now = System.currentTimeMillis()
+            val rel = if (now - ts < DateUtils.MINUTE_IN_MILLIS) "just now"
+            else DateUtils.getRelativeTimeSpanString(ts, now, DateUtils.MINUTE_IN_MILLIS).toString()
+            val abs = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date(ts))
+            "Last checked: $rel ($abs)"
         }
     }
 
-    private fun versionRow(entry: HistoryEntry, sha: String?, installed: Long): View {
+    // Primary button installs the channel's actual (current) version. When that
+    // version is older than what's installed (a published rollback) it routes
+    // through the save-to-Downloads path, since Android can't downgrade in place.
+    private fun renderInstallButton(current: CurrentRelease?) {
+        if (current == null) {
+            btnInstall.visibility = View.GONE
+            return
+        }
+        val installed = OtaManager.installedBuild()
+        btnInstall.visibility = View.VISIBLE
+        btnInstall.text = when {
+            current.build > installed -> "INSTALL ${current.version}"
+            current.build == installed -> "REINSTALL ${current.version}"
+            else -> "INSTALL ${current.version} (older)"
+        }
+        btnInstall.setOnClickListener {
+            val entry = HistoryEntry("current", current.version, current.build, current.fileName)
+            if (current.build < installed) confirmDowngrade(entry, current.sha256)
+            else confirmInstall(entry, current.sha256)
+        }
+    }
+
+    // Downgrade section: older-than-installed versions that are NOT the current
+    // one (that's the primary button). Collapsed by default; each entry only
+    // offers "save to Downloads" for a manual uninstall+install.
+    private fun renderDowngrade(history: List<HistoryEntry>, current: CurrentRelease?) {
+        val installed = OtaManager.installedBuild()
+        val candidates = history.filter {
+            it.build < installed && it.fileName != current?.fileName
+        }
+        llDowngrade.removeAllViews()
+        if (candidates.isEmpty()) {
+            btnDowngrade.visibility = View.GONE
+            svDowngrade.visibility = View.GONE
+            downgradeExpanded = false
+            return
+        }
+        btnDowngrade.visibility = View.VISIBLE
+        for (entry in candidates) llDowngrade.addView(downgradeRow(entry))
+        applyDowngradeExpanded()
+    }
+
+    private fun toggleDowngrade() {
+        downgradeExpanded = !downgradeExpanded
+        applyDowngradeExpanded()
+    }
+
+    private fun applyDowngradeExpanded() {
+        svDowngrade.visibility = if (downgradeExpanded) View.VISIBLE else View.GONE
+        btnDowngrade.text = if (downgradeExpanded) "DOWNGRADE ▲" else "DOWNGRADE ▼"
+    }
+
+    private fun downgradeRow(entry: HistoryEntry): View {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(6), dp(8), dp(6), dp(8))
         }
-
-        val marker = when {
-            entry.build == installed -> "  • installed"
-            entry.isCurrent -> "  • current"
-            else -> ""
-        }
         val label = TextView(this).apply {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            text = "${entry.version}  (build ${entry.build})$marker"
-            setTextColor(if (entry.build == installed) 0xFF88ffaa.toInt() else 0xFFdddddd.toInt())
+            text = "${entry.version}  (build ${entry.build})"
+            setTextColor(0xFFdddddd.toInt())
             textSize = 13f
         }
-
         val btn = Button(this).apply {
-            val down = entry.build < installed
-            text = when {
-                entry.build == installed -> "Reinstall"
-                down -> "Downgrade"
-                else -> "Install"
-            }
+            text = "To Downloads"
             textSize = 11f
             minWidth = 0
             minimumWidth = 0
             setPadding(dp(12), 0, dp(12), 0)
-            setTextColor(0xFFe94560.toInt())
+            setTextColor(0xFFFFCC66.toInt())
             setBackgroundColor(0xFF16213e.toInt())
-            setOnClickListener {
-                if (entry.build < installed) confirmDowngrade(entry, sha)
-                else confirmInstall(entry, sha)
-            }
+            setOnClickListener { confirmDowngrade(entry, null) }
         }
-
         row.addView(label)
         row.addView(btn)
         return row
     }
 
-    // Install / reinstall (build >= installed). In-place upgrade via the installer.
+    // Install / reinstall (build >= installed). In-place install via the installer.
     private fun confirmInstall(entry: HistoryEntry, sha: String?) {
         if (busy) return
         val sb = StringBuilder()
@@ -277,8 +322,8 @@ class UpdatesActivity : AppCompatActivity() {
         perform(entry, sha, InstallAction.INSTALL)
     }
 
-    // Downgrade (build < installed). Android refuses an in-place downgrade, so
-    // we save the decrypted APK to Downloads for a manual uninstall+install.
+    // Downgrade (build < installed). Android refuses in-place downgrade, so we
+    // save the decrypted APK to Downloads for a manual uninstall+install.
     private fun confirmDowngrade(entry: HistoryEntry, sha: String?) {
         if (busy) return
         val installed = OtaManager.installedBuild()
@@ -420,5 +465,5 @@ class UpdatesActivity : AppCompatActivity() {
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     private fun humanMb(bytes: Long): String =
-        String.format(java.util.Locale.US, "%.1f MB", bytes / (1024.0 * 1024.0))
+        String.format(Locale.US, "%.1f MB", bytes / (1024.0 * 1024.0))
 }

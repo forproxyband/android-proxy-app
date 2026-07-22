@@ -36,8 +36,6 @@
         android:textStyle="bold"
         android:layout_marginBottom="4dp" />
 
-    <!-- Channels are dynamic (discovered from the manifest); a Spinner scales
-         to any number of them, unlike a fixed radio row. -->
     <Spinner
         android:id="@+id/spChannel"
         android:layout_width="match_parent"
@@ -55,36 +53,63 @@
         android:textStyle="bold"
         android:padding="10dp"
         android:background="#16213e"
-        android:layout_marginBottom="10dp" />
+        android:layout_marginBottom="6dp" />
+
+    <TextView
+        android:id="@+id/tvLastCheck"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text=""
+        android:textColor="#888888"
+        android:textSize="11sp"
+        android:layout_marginBottom="14dp" />
+
+    <!-- Primary action: install the selected channel's actual (current) version. -->
+    <Button
+        android:id="@+id/btnInstall"
+        android:layout_width="match_parent"
+        android:layout_height="50dp"
+        android:text="INSTALL"
+        android:textSize="15sp"
+        android:textStyle="bold"
+        android:backgroundTint="#e94560"
+        android:layout_marginBottom="8dp" />
 
     <Button
         android:id="@+id/btnCheck"
         android:layout_width="match_parent"
-        android:layout_height="46dp"
+        android:layout_height="44dp"
         android:text="CHECK FOR UPDATES"
-        android:textSize="14sp"
+        android:textSize="13sp"
         android:textStyle="bold"
-        android:backgroundTint="#e94560"
-        android:layout_marginBottom="14dp" />
-
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="AVAILABLE VERSIONS"
         android:textColor="#e94560"
-        android:textSize="12sp"
+        android:backgroundTint="#16213e"
+        android:layout_marginBottom="8dp" />
+
+    <!-- Reveals the older-versions list for manual downgrade (save-to-Downloads). -->
+    <Button
+        android:id="@+id/btnDowngrade"
+        android:layout_width="match_parent"
+        android:layout_height="44dp"
+        android:text="DOWNGRADE ▼"
+        android:textSize="13sp"
         android:textStyle="bold"
-        android:layout_marginBottom="6dp" />
+        android:textColor="#FFCC66"
+        android:backgroundTint="#16213e"
+        android:layout_marginBottom="8dp"
+        android:visibility="gone" />
 
     <ScrollView
+        android:id="@+id/svDowngrade"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
         android:background="#0f0f23"
-        android:padding="6dp">
+        android:padding="6dp"
+        android:visibility="gone">
 
         <LinearLayout
-            android:id="@+id/llVersions"
+            android:id="@+id/llDowngrade"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical" />

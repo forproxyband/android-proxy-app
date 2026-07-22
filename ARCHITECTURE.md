@@ -129,6 +129,7 @@ Backed by the dialog at `MainActivity.kt:278-408` (XML
 | `network_profile` | string | `"LOW_100"` | Network optimization preset — `"LOW_100"` / `"MID_500"` / `"HIGH_1000"`. Scales TCP socket / bridge buffers AND QUIC Brutal CC target / UDP socket buffer / flow-control refresh cadence to match the expected link ceiling. Default `LOW_100` matches the common-case mobile/Wi-Fi link (≤100 Mbps) and bounds bufferbloat tighter; field tests show it still delivers full multi-flow throughput on gigabit links through parallel target dials. NATIVE engine only; BINARY ignores it (`libproxyagent.so` has no env hooks for these values — logged as a WARN at runBinaryEngine start). Applies on the next stop/start; changing it mid-session shows a Toast and waits for a manual restart. See [NetworkProfile-driven tuning](#networkprofile-driven-tuning). |
 | `ota_channel` | string | `stable` | OTA update channel the app tracks. See [OTA self-update](#ota-self-update). |
 | `ota_notified_build` | long | — | Dedup marker: last build number the background worker raised an "update available" notification for. |
+| `ota_last_check_ms` | long | — | Epoch-ms of the last successful update check (widget / worker / Updates screen). Shown as "Last checked …" on the Updates screen. |
 
 ## OTA self-update
 
@@ -138,7 +139,11 @@ Cloudflare R2 → Blowfish-decrypt → verify SHA-256 → hand to the system
 installer. Surfaced by a widget on the main screen and a dedicated
 `UpdatesActivity` (channel picker + version list + downgrade), plus a
 periodic `WorkManager` check that notifies. Config lives in
-`app/build.gradle.kts` (`OTA_*` `buildConfigField`s).
+`app/build.gradle.kts` (`OTA_*` `buildConfigField`s). `release` and `debug`
+are **separate CRM apps** — each with its own app id, Blowfish key and APK
+signature — so a build only self-updates from its own app; `debug` ships blank
+values and OTA self-disables (`OtaConfig.isConfigured()`) until its CRM app is
+registered.
 
 Full design, the manifest contract, the `build == versionCode` rule,
 dynamic channels, integrity/security, and the publish flow are documented

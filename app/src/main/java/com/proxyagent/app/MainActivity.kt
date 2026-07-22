@@ -194,7 +194,11 @@ class MainActivity : AppCompatActivity() {
         }
         refreshOtaWidget(force = true)
         // Periodic background update check (posts a notification when one lands).
-        try { OtaScheduler.schedule(this) } catch (_: Throwable) {}
+        // Skipped when OTA isn't wired for this build type (e.g. debug without
+        // a registered CRM app) — the widget hides itself too.
+        if (OtaConfig.isConfigured()) {
+            try { OtaScheduler.schedule(this) } catch (_: Throwable) {}
+        }
 
         val prefs = getSharedPreferences("cfg", 0)
 
@@ -354,6 +358,12 @@ class MainActivity : AppCompatActivity() {
     // label, and (throttled to once a minute unless forced) check the manifest
     // in the background. Never downloads — that only happens from UpdatesActivity.
     private fun refreshOtaWidget(force: Boolean) {
+        // No OTA for this build type (blank app id/key) → hide the widget.
+        if (!OtaConfig.isConfigured()) {
+            otaWidget.visibility = View.GONE
+            return
+        }
+        otaWidget.visibility = View.VISIBLE
         val channel = OtaConfig.channel(this)
         tvOtaChannel.text = "⟳ ${channel.id}"
 
@@ -373,6 +383,7 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Throwable) {
                 failed = true
             }
+            if (!failed) OtaConfig.recordCheck(this)
             val s = status
             runOnUiThread {
                 otaChecking = false

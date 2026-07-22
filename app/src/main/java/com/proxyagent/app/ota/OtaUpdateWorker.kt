@@ -18,9 +18,11 @@ class OtaUpdateWorker(
 
     override fun doWork(): Result {
         val ctx = applicationContext
+        if (!OtaConfig.isConfigured()) return Result.success()
         return try {
             val channel = OtaConfig.channel(ctx)
             val status = OtaManager.check(ctx, channel)
+            OtaConfig.recordCheck(ctx)
             val prefs = ctx.getSharedPreferences("cfg", 0)
             val lastNotified = prefs.getLong(KEY_NOTIFIED_BUILD, -1L)
             // Manual test runs force a notification even if already shown for this build.
