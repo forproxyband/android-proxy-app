@@ -19,6 +19,12 @@
          was "requestNetwork(Wi-Fi) failed: was not granted either of these
          permissions: CHANGE_NETWORK_STATE, WRITE_SETTINGS". -->
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <!-- Auto-reconnect after a device reboot. Lets BootReceiver run on
+         ACTION_BOOT_COMPLETED so a session that was live before the phone
+         powered off is resumed automatically (gated on the same "was_running"
+         flag PackageReplacedReceiver uses). Normal permission, auto-granted at
+         install, no runtime prompt. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -140,6 +146,41 @@
             android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Auto-restart the proxy service after a device reboot. Fires on
+             BOOT_COMPLETED (plus the OEM QUICKBOOT_POWERON "fast boot"
+             variant) once the user unlocks the device the first time after
+             boot. Gated on the same "was_running" flag PackageReplacedReceiver
+             uses, so a session the user had intentionally stopped before
+             powering down is NOT resurrected. Not exported — only the system
+             delivers these protected boot broadcasts. Runs in :main (default
+             process) since it only needs SharedPreferences +
+             startForegroundService. See BootReceiver.kt for the full
+             reasoning + OEM autostart caveats. -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Remote start/stop/toggle over `adb shell am broadcast`. Exported
+             so the shell UID can reach it (ProxyService is un-exported and
+             can't be targeted by `am` directly). Every command is gated on
+             the stored connection key passed as `--es key`, so being exported
+             doesn't let other apps flip the proxy. Runs in :main (default
+             process) — only needs SharedPreferences + startForegroundService.
+             See RemoteControlReceiver.kt for the full command reference. -->
+        <receiver
+            android:name=".RemoteControlReceiver"
+            android:exported="true"
+            tools:ignore="ExportedReceiver">
+            <intent-filter>
+                <action android:name="com.proxyagent.app.REMOTE_CONTROL" />
             </intent-filter>
         </receiver>
 

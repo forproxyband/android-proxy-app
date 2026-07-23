@@ -706,6 +706,31 @@ class ProxyService : Service() {
             .fromPrefValue(intent.getStringExtra("network_profile"))
         if (host.isEmpty()) { stopSelf(); return START_NOT_STICKY }
 
+        // Idempotency guard. A single reboot can deliver more than one start to
+        // the SAME live service instance:
+        //   • BootReceiver on ACTION_BOOT_COMPLETED (and QUICKBOOT_POWERON), and
+        //   • the Magisk root boot script ~10s later via RemoteControlReceiver, and
+        //   • START_REDELIVER_INTENT re-delivery after a transient kill.
+        // onStartCommand runs serialized on the main thread, so a prior start
+        // has already set runnerThread before the next delivery arrives. Without
+        // this guard the second delivery would spawn a duplicate AgentRunner +
+        // StatusUpdater, leak the previous wakelock (the field is overwritten
+        // without release), and open a second tunnel with the same agent id that
+        // the registrator may reject. If a session is already live, just
+        // re-satisfy the startForeground() contract for THIS delivery (the
+        // startForegroundService caller still requires it within ~5s) and bail.
+        if (runnerThread?.isAlive == true && !stopRequested) {
+            log("onStartCommand: session already active — ignoring duplicate " +
+                "start (action=${intent.action ?: "-"})")
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(1, buildNotification(statusText()),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(1, buildNotification(statusText()))
+            }
+            return START_REDELIVER_INTENT
+        }
+
         // Defensive bind reset. The :proxy process survives stops in
         // NATIVE/BINARY, so a previous Wi-Fi return session could have
         // left this process bound to cellular

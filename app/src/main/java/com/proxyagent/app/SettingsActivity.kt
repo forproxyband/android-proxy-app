@@ -73,6 +73,11 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var tvWifiReturnHint: TextView
     private lateinit var spNetworkProfile: Spinner
     private lateinit var tvNetworkProfileHint: TextView
+    private lateinit var tvAutostartLockWarn: TextView
+    private lateinit var tvAutostartStatus: TextView
+    private lateinit var btnBatteryOpt: Button
+    private lateinit var btnOemAutostart: Button
+    private lateinit var btnRootAutostart: Button
 
     private val retentionDays = intArrayOf(1, 7, 30)
     private val networkProfileKeys = arrayOf("LOW_100", "MID_500", "HIGH_1000")
@@ -132,6 +137,11 @@ class SettingsActivity : AppCompatActivity() {
         tvWifiReturnHint = findViewById(R.id.tvWifiReturnHint)
         spNetworkProfile = findViewById(R.id.spNetworkProfile)
         tvNetworkProfileHint = findViewById(R.id.tvNetworkProfileHint)
+        tvAutostartLockWarn = findViewById(R.id.tvAutostartLockWarn)
+        tvAutostartStatus = findViewById(R.id.tvAutostartStatus)
+        btnBatteryOpt = findViewById(R.id.btnBatteryOpt)
+        btnOemAutostart = findViewById(R.id.btnOemAutostart)
+        btnRootAutostart = findViewById(R.id.btnRootAutostart)
 
         run {
             val labels = arrayOf("Day (1)", "Week (7)", "Month (30)")
@@ -198,6 +208,165 @@ class SettingsActivity : AppCompatActivity() {
         }
         btnScanQr.setOnClickListener { showQrSourceChooser() }
         findViewById<Button>(R.id.btnSaveSettings).setOnClickListener { saveSettings() }
+
+        setupAutostartSection()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Battery / lock-screen state can change while the user is away in a
+        // system settings screen — re-read on return so the status reflects
+        // reality without the user having to leave and re-enter Settings.
+        refreshAutostartStatus()
+    }
+
+    // ── Auto-reconnect after reboot ─────────────────────────────────────────
+
+    private fun setupAutostartSection() {
+        btnBatteryOpt.setOnClickListener {
+            if (!AutostartManager.openBatteryWhitelist(this)) {
+                Toast.makeText(this, "Couldn't open battery settings", Toast.LENGTH_SHORT).show()
+            }
+        }
+        // Vendor autostart screens only exist on OEMs that ship one. On
+        // stock/Pixel the button would just bounce to app details — hide it to
+        // avoid confusion.
+        btnOemAutostart.visibility =
+            if (AutostartManager.hasOemAutostartManager()) View.VISIBLE else View.GONE
+        btnOemAutostart.setOnClickListener {
+            AutostartManager.openOemAutostartSettings(this)
+            Toast.makeText(
+                this,
+                "Find this app in the list and enable Autostart / allow background",
+                Toast.LENGTH_LONG,
+            ).show()
+        }
+        btnRootAutostart.setOnClickListener { onRootAutostartClicked() }
+        // Status (incl. the root su probe) is populated from onResume, which
+        // always fires right after onCreate — avoids a duplicate concurrent
+        // su probe that could trigger two Magisk root prompts.
+    }
+
+    // Root probe result, cached for the activity's lifetime. The su probe
+    // (isRootAvailable) can trigger a Magisk prompt, so it runs at most once —
+    // NOT on every onResume (returning from the battery / OEM deep-link screens
+    // would otherwise re-prompt repeatedly). Install-state is refreshed only
+    // after the user's own install/remove action.
+    private var rootProbed = false
+    private var rootAvailable = false
+    private var rootScriptInstalled = false
+
+    // Synchronous render from current (non-root) state + the cached root
+    // result. Safe to call repeatedly from the main thread.
+    private fun renderAutostartStatus() {
+        val battery = AutostartManager.isBatteryWhitelisted(this)
+        val secure = AutostartManager.isDeviceSecure(this)
+
+        // Lock-screen (Direct Boot) warning — the one case the app can't fix.
+        if (secure) {
+            tvAutostartLockWarn.visibility = View.VISIBLE
+            tvAutostartLockWarn.text =
+                "⚠ A screen lock (PIN/pattern/password) is set. After a reboot " +
+                "the proxy can only start once someone unlocks the phone the " +
+                "first time. For unattended reboots either remove the screen " +
+                "lock, or use the root autostart below (it starts the agent as " +
+                "soon as storage unlocks)."
+        } else {
+            tvAutostartLockWarn.visibility = View.GONE
+        }
+
+        val sb = StringBuilder()
+        sb.append(if (battery) "✓" else "✗").append(" Battery optimization: ")
+            .append(if (battery) "exempt" else "ACTIVE (may kill the service)").append('\n')
+        sb.append(if (secure) "✗" else "✓").append(" Screen lock: ")
+            .append(if (secure) "set (blocks start until unlock)" else "none (starts on boot)")
+            .append('\n')
+        if (AutostartManager.hasOemAutostartManager()) {
+            sb.append("• OEM (").append(android.os.Build.MANUFACTURER)
+                .append("): enable Autostart manually").append('\n')
+        }
+        sb.append(
+            when {
+                !rootProbed -> "… checking root"
+                !rootAvailable -> "✗ Root: not available (using non-root path)"
+                rootScriptInstalled -> "✓ Root autostart: INSTALLED (guaranteed)"
+                else -> "• Root: available — install autostart below"
+            }
+        )
+        tvAutostartStatus.text = sb.toString()
+
+        btnRootAutostart.visibility = if (rootProbed && rootAvailable) View.VISIBLE else View.GONE
+        btnRootAutostart.text =
+            if (rootScriptInstalled) "REMOVE ROOT AUTOSTART"
+            else "INSTALL ROOT AUTOSTART (GUARANTEED)"
+    }
+
+    private fun refreshAutostartStatus() {
+        renderAutostartStatus()
+        if (rootProbed) return
+        Thread {
+            val root = AutostartManager.isRootAvailable()
+            val installed = if (root) AutostartManager.isRootBootScriptInstalled() else false
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                rootProbed = true
+                rootAvailable = root
+                rootScriptInstalled = installed
+                renderAutostartStatus()
+            }
+        }.apply { isDaemon = true; name = "AutostartRootProbe"; start() }
+    }
+
+    private fun onRootAutostartClicked() {
+        val key = prefs.getString("k", "")?.trim().orEmpty()
+        // Reject a key the boot script's KEY='...' literal can't carry without
+        // desyncing auth — before touching root — so the user gets a clear
+        // message instead of a silently-non-starting script.
+        if (!rootScriptInstalled && key.isNotEmpty() &&
+            !AutostartManager.keyUsableInBootScript(key)) {
+            Toast.makeText(this,
+                "Connection key contains a quote — can't use it in the root script",
+                Toast.LENGTH_LONG).show()
+            return
+        }
+        btnRootAutostart.isEnabled = false
+        Thread {
+            val installed = AutostartManager.isRootBootScriptInstalled()
+            val result: String = if (installed) {
+                if (AutostartManager.removeRootBootScript()) "removed" else "remove_failed"
+            } else {
+                if (key.isEmpty()) "no_key"
+                else if (AutostartManager.installRootBootScript(this, key)) "installed"
+                else "install_failed"
+            }
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                btnRootAutostart.isEnabled = true
+                // Reflect the new state in the cache; no extra su probe needed.
+                rootProbed = true
+                rootAvailable = true
+                rootScriptInstalled = when (result) {
+                    "installed" -> true
+                    "removed" -> false
+                    else -> installed
+                }
+                when (result) {
+                    "installed" -> Toast.makeText(this,
+                        "Root autostart installed — the agent will start on every boot",
+                        Toast.LENGTH_LONG).show()
+                    "removed" -> Toast.makeText(this,
+                        "Root autostart removed", Toast.LENGTH_SHORT).show()
+                    "no_key" -> Toast.makeText(this,
+                        "Save the connection (host/port/key) first", Toast.LENGTH_LONG).show()
+                    "install_failed" -> Toast.makeText(this,
+                        "Install failed — root denied or /data/adb/service.d unavailable",
+                        Toast.LENGTH_LONG).show()
+                    "remove_failed" -> Toast.makeText(this,
+                        "Remove failed — root denied", Toast.LENGTH_LONG).show()
+                }
+                renderAutostartStatus()
+            }
+        }.apply { isDaemon = true; name = "AutostartRootOp"; start() }
     }
 
     // ── Form gating (same rules as the former dialog) ──────────────────────
