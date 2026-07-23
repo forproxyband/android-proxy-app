@@ -30,6 +30,11 @@ internal class SpliceShim {
     // Using a class with a single shared instance is simpler.
     external fun spliceLoop(fdSrc: Int, fdDst: Int, chunkSize: Int): Long
 
+    /** JNI: apply the aggressive TCP keepalive tuning (SO_KEEPALIVE +
+     *  TCP_KEEPIDLE=60/INTVL=15/CNT=4) to a raw fd. Returns 0 on success,
+     *  <0 on a bad fd. Used for sockets that never enter [spliceLoop]. */
+    external fun tuneKeepaliveFd(fd: Int): Int
+
     /** JNI-level fd extraction. Returns a packed jlong:
      *
      *   On success (>= 0):
@@ -83,6 +88,57 @@ internal class SpliceShim {
          *  calls this once per agent start with its own log sink. */
         fun setLogger(fn: Logger?) {
             logger = fn
+        }
+
+        // Separate one-shot load flag for the keepalive helper. It is
+        // deliberately NOT gated on API<30 like ensureLoaded(): the API<30
+        // gate exists because kernel-4.4 splice() *data transfer* misbehaves
+        // (see ensureLoaded doc), but a bare setsockopt() is harmless on
+        // every kernel, and API<30 is exactly where we most need the tuned
+        // keepalive (splice is off there, so the NIO fallback would otherwise
+        // keep the ~2h OS default idle). null=unprobed, true/false=result.
+        private val keepaliveLibLoaded = AtomicReference<Boolean?>(null)
+
+        private fun ensureLoadedForKeepalive(): Boolean {
+            keepaliveLibLoaded.get()?.let { return it }
+            val ok = try { System.loadLibrary("agentsplice"); true } catch (_: Throwable) { false }
+            keepaliveLibLoaded.compareAndSet(null, ok)
+            return keepaliveLibLoaded.get() ?: ok
+        }
+
+        /**
+         * Best-effort: apply the tuned keepalive (SO_KEEPALIVE +
+         * TCP_KEEPIDLE=60/INTVL=15/CNT=4, ~120s dead-peer reap) to a
+         * connected [channel]. This is the ONLY way to get sub-2h reaping on
+         * the NIO-fallback TCP path (API<30, or any device where splice is
+         * unavailable), because java.net.Socket/SocketChannel expose no
+         * TCP_KEEPIDLE knob — plain setKeepAlive only flips SO_KEEPALIVE and
+         * inherits the ~2h OS default idle. On the splice fast path
+         * spliceLoop already re-tunes, so this is a harmless no-op cost there.
+         *
+         * We reuse [extractFd] — a pure JNI field READ with no side effects
+         * (unlike ParcelFileDescriptor.fromSocket/detachFd, which shares and
+         * then invalidates the socket's own FileDescriptor and would leak or
+         * close the live socket). We never close or detach anything: the fd
+         * stays owned by the channel. Any failure (lib absent, hidden-API
+         * fully locked, unconnected) degrades silently to the caller's plain
+         * setKeepAlive — never worse than before. Returns true if applied.
+         *
+         * Only SocketChannel is supported: plain java.net.Socket has no
+         * read-only fd path here, so those sites keep bare SO_KEEPALIVE and
+         * rely on the stall watchdog for recovery.
+         */
+        fun applyKeepalive(channel: SocketChannel?): Boolean {
+            if (channel == null || !channel.isConnected) return false
+            if (!ensureLoadedForKeepalive()) return false
+            return try {
+                val packed = singleton.extractFd(channel)
+                if (packed < 0) return false
+                val fd = (packed and 0xFFFFFFFFL).toInt()
+                singleton.tuneKeepaliveFd(fd) == 0
+            } catch (_: Throwable) {
+                false
+            }
         }
 
         /**

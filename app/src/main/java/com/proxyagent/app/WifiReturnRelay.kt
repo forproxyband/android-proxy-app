@@ -293,6 +293,14 @@ class WifiReturnRelay(
                 }
                 sock.connect(InetSocketAddress(addr, upstreamPort), 10_000)
                 sock.tcpNoDelay = true
+                // Kernel keepalive on the cellular upstream. Without it a
+                // silently-dead peer (cellular NAT drop / handover) leaves
+                // the pipe() thread blocked in read forever, leaking this
+                // socket's fd — and since the relay shares the process with
+                // the native engine, those leaked fds count toward the same
+                // EMFILE ceiling. Keepalive lets the OS reap the dead conn
+                // so both pipe threads unblock and closeBoth() runs.
+                try { sock.keepAlive = true } catch (_: Throwable) {}
                 return sock
             } catch (e: Throwable) {
                 lastErr = e

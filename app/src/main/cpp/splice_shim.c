@@ -24,6 +24,61 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+
+// Kernel TCP keepalive tuning applied to both bridged sockets before we
+// hand them to splice(2). This is the ONLY thing that reclaims a tunnel
+// whose peer went silently dead (NAT drop, Wi-Fi↔cellular handover): the
+// splice source read blocks in the kernel with no userspace SO_TIMEOUT to
+// interrupt it, so without keepalive a dead tunnel pins its file
+// descriptors open indefinitely. With these probes the kernel tears the
+// socket down after ~KEEPIDLE + KEEPINTVL*KEEPCNT seconds of silence on a
+// peer that has actually vanished, the splice read returns an error, the
+// bridge unwinds, and the fds are freed — while a merely-idle-but-alive
+// peer keeps answering probes and stays connected.
+#define KA_IDLE_SECS   60   // start probing after 60s of silence
+#define KA_INTVL_SECS  15   // probe every 15s
+#define KA_PROBE_CNT    4   // 4 unanswered probes → dead (~120s total)
+
+static void tune_keepalive(int fd) {
+    int on = 1;
+    // Best-effort: a failure here just means we fall back to the OS
+    // default keepalive (2h idle) or none — the splice loop still runs.
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+#ifdef TCP_KEEPIDLE
+    int idle = KA_IDLE_SECS;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+#endif
+#ifdef TCP_KEEPINTVL
+    int intvl = KA_INTVL_SECS;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+#endif
+#ifdef TCP_KEEPCNT
+    int cnt = KA_PROBE_CNT;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+}
+
+// Exposed to Kotlin so the SAME aggressive keepalive tuning can be applied
+// to sockets that never enter the splice loop — the QUIC target socket, the
+// Wi-Fi-return cellular upstream, the warm data-pool connections, and the
+// NIO-fallback TCP path (splice is gated off on API<30 and skipped whenever
+// the .so/fd-extraction fails). Without this, every non-splice socket kept
+// only the OS-default ~2h keepalive idle, so a silently-dead peer pinned its
+// fd for hours instead of ~120s. The caller passes a raw POSIX fd it already
+// holds (e.g. via ParcelFileDescriptor); setsockopt on any dup of the socket
+// applies to the shared socket, so the caller may pass a short-lived dup.
+JNIEXPORT jint JNICALL
+Java_com_proxyagent_app_nativeagent_SpliceShim_tuneKeepaliveFd(
+    JNIEnv *env, jobject thiz, jint fd) {
+    (void)env;
+    (void)thiz;
+    if (fd < 0) return -1;
+    tune_keepalive((int)fd);
+    return 0;
+}
 
 // Per-iteration ceiling. splice() may return less (in practice
 // limited by pipe buffer capacity, ~64 KiB default, expandable to
@@ -47,6 +102,11 @@ Java_com_proxyagent_app_nativeagent_SpliceShim_spliceLoop(
         // Cannot even create a pipe — caller should fall back to NIO.
         return -1;
     }
+
+    // Arm kernel keepalive on both ends so a silently-dead peer can't pin
+    // these descriptors open forever behind an uninterruptible splice read.
+    tune_keepalive((int)fdSrc);
+    tune_keepalive((int)fdDst);
 
     size_t chunk = (chunkSize > 0) ? (size_t)chunkSize : (size_t)CHUNK_DEFAULT;
     jlong total = 0;

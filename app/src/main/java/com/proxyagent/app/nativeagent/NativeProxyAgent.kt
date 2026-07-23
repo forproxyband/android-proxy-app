@@ -16,12 +16,15 @@ import java.net.URL
 import java.nio.ByteBuffer
 import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingDeque
+import java.util.concurrent.Semaphore
 import java.util.concurrent.ThreadFactory
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.min
 import kotlin.math.pow
 import kotlin.random.Random
@@ -84,6 +87,25 @@ class NativeProxyAgent {
         val quicDialTimeoutMs: Int = 3000,
         // Per-stream warm pool size for TCP mode (matches Go SDK default).
         val tcpWarmPoolSize: Int = 8,
+        // Hard ceiling on simultaneously-bridged tunnels. This is the
+        // primary guard against file-descriptor exhaustion (EMFILE): on a
+        // device with the usual 1024 soft RLIMIT_NOFILE a runaway burst of
+        // parallel opens (heavy video streaming across a network handover)
+        // can wedge the whole agent — every subsequent socket() then fails
+        // and the proxy looks "offline" to the operator.
+        //
+        // FD budget per live TCP tunnel on the splice fast path (API>=30) is
+        // the worst case and it is NOT ~4: bridge() runs BOTH directions
+        // through splice_shim.spliceLoop, and each spliceLoop holds its own
+        // pipe (2 fds) for the tunnel's lifetime. So per tunnel ≈ 2 sockets
+        // (data + target) + 4 pipe fds + 2 relay sockets (accepted client +
+        // cellular upstream) ≈ 8 fds. Plus the warm data pool
+        // (tcpWarmPoolSize), control socket, QUIC UDP, DNS and JVM baseline.
+        // 96 × 8 ≈ 768 fds leaves ~250 headroom below 1024. Opens beyond the
+        // cap are rejected with OPEN_FAIL so the server retries elsewhere
+        // instead of the agent leaking descriptors. (Android exposes no
+        // portable setrlimit to raise RLIMIT_NOFILE, so we size under it.)
+        val maxConcurrentTunnels: Int = 96,
         // User-selected network optimization profile. Renders to two
         // independent tuning sets (TCP and QUIC) that gate socket
         // buffers, bridge buffer size, Brutal CC target, UDP buffer,
@@ -573,6 +595,46 @@ class NativeProxyAgent {
         internal const val POOL_DIAL_TIMEOUT_MS = 10_000L
         internal const val POOL_REFILL_IDLE_MS = 5_000L
 
+        // ── Self-heal thresholds ────────────────────────────────────────
+        // If this many tunnel opens fail back-to-back (no successful open
+        // in between), the data plane is assumed wedged — almost always
+        // descriptor exhaustion or a half-dead uplink that still holds the
+        // control channel open — and we tear the session down so the
+        // supervisor redials from scratch, dropping every leaked socket.
+        // A healthy agent resets the counter on the first successful open,
+        // so this only trips under a genuine sustained-failure storm.
+        internal const val OPEN_FAIL_STREAK_TEARDOWN = 40
+
+        // ── Stall watchdog ──────────────────────────────────────────────
+        // Second, transport-agnostic recovery path. The open-failure streak
+        // above only sees opens that got a permit and then failed to dial;
+        // it is BLIND to the "wedged at capacity" state — when every permit
+        // is held by a tunnel whose peer went silently dead, new opens are
+        // rejected (not dialed), so the streak never advances, and because
+        // the cap holds fds under the limit an EMFILE never fires either.
+        // The watchdog closes that gap: if the tunnel pool is fully
+        // saturated AND clients are still demanding tunnels (rejections
+        // climbing) AND not one tunnel has completed across several ticks,
+        // the data plane is wedged regardless of transport (QUIC / NIO /
+        // splice) or keepalive timing — tear down so the supervisor redials.
+        // Requiring active demand (rejections) avoids tearing down a set of
+        // legitimately long-lived idle connections that nobody is waiting
+        // behind.
+        internal const val STALL_WATCHDOG_TICK_MS = 60_000L
+        internal const val STALL_WATCHDOG_TRIP_CHECKS = 3
+        // Substring that identifies an EMFILE ("Too many open files") in a
+        // thrown exception message. A single one of these is enough to
+        // trigger an immediate teardown — by the time the kernel refuses a
+        // socket() we're already out of descriptors and every in-flight
+        // tunnel is doomed, so waiting for the streak counter just prolongs
+        // the outage.
+        internal const val EMFILE_MARKER = "Too many open files"
+
+        // Poll cadence for the bridge's shutdown-responsive await. Short
+        // enough that a self-heal teardown reclaims descriptors promptly,
+        // long enough not to spin.
+        internal const val BRIDGE_AWAIT_TICK_MS = 500L
+
         // Per-socket SO_RCVBUF / SO_SNDBUF hint AND userspace bridge
         // buffer size are now profile-scaled — see
         // com.proxyagent.app.nativeagent.quic.NetworkProfile and the
@@ -937,6 +999,36 @@ internal class Uplink(
     private val openExecutor = Executors.newCachedThreadPool(daemonFactory("uplink-open"))
     private val bridgeExecutor = Executors.newCachedThreadPool(daemonFactory("uplink-bridge"))
 
+    // Hard ceiling on concurrently-bridged tunnels — the descriptor-
+    // exhaustion guard (see Config.maxConcurrentTunnels). A permit is held
+    // for the entire lifetime of a tunnel and released the instant both
+    // directions finish (or the open fails). Opens that can't get a permit
+    // are rejected rather than allowed to pile fds up toward EMFILE.
+    private val tunnelPermits = Semaphore(cfg.maxConcurrentTunnels)
+
+    // Every socket/channel currently owned by a live bridge. shutdown()
+    // force-closes all of them so a self-heal teardown actually reclaims
+    // the descriptors — interrupting the daemon bridge threads is not
+    // enough, because a thread blocked in a kernel splice(2) or a blocking
+    // NIO read never observes the interrupt; closing the fd is what
+    // unblocks it. Keyed on identity; entries add on bridge start and
+    // remove on clean close.
+    private val liveConns = ConcurrentHashMap.newKeySet<java.io.Closeable>()
+
+    // Back-to-back tunnel-open failures with no success in between. Reset
+    // to 0 on any successful open. Crossing OPEN_FAIL_STREAK_TEARDOWN (or a
+    // single EMFILE) trips selfHeal().
+    private val openFailStreak = AtomicInteger(0)
+    // Ensures selfHeal() fires the teardown at most once per session.
+    private val selfHealFired = AtomicBoolean(false)
+
+    // Watchdog inputs. tunnelCompletions ticks once per tunnel that held a
+    // permit and then ended (success or failure); tunnelRejections ticks
+    // once per open refused because the cap was saturated.
+    private val tunnelCompletions = AtomicLong(0)
+    private val tunnelRejections = AtomicLong(0)
+    @Volatile private var watchdogThread: Thread? = null
+
     fun runOnce(creds: RegistratorCreds, info: SystemInfo): Throwable? {
         val endpoint = "${creds.host}:${creds.port}"
         val order = chooseTransportOrder()
@@ -976,6 +1068,8 @@ internal class Uplink(
                 dataPool = DataPool(this, cfg.tcpWarmPoolSize, creds, cfg, dns)
                 dataPool!!.start()
             }
+            watchdogThread = Thread({ runStallWatchdog() }, "uplink-stall-watchdog")
+                .apply { isDaemon = true; start() }
             runLoops(used)
             null
         } catch (t: Throwable) {
@@ -1032,8 +1126,21 @@ internal class Uplink(
      *  header (host/port), dial the target, pipe bytes. Mirrors
      *  internal/netagent/uplink.go handleQUICTunnelStream. */
     private fun handleQuicTunnelStream(stream: QuicTransport.Stream) {
+        // Same descriptor-exhaustion guard as the TCP path. QUIC streams
+        // share one UDP socket so a tunnel here costs one fd (the target
+        // socket), but a runaway burst still exhausts the process, so the
+        // cap applies uniformly. No control-channel token to OPEN_FAIL on
+        // this path — the server observes the stream reset instead.
+        if (!tunnelPermits.tryAcquire()) {
+            tunnelRejections.incrementAndGet()
+            agent.logWarn("tunnel rejected: at capacity",
+                "transport" to "quic", "limit" to cfg.maxConcurrentTunnels)
+            try { stream.close() } catch (_: Throwable) {}
+            return
+        }
         agent.incTunnels()
         var targetSock: Socket? = null
+        var opened = false
         try {
             // Read header byte-by-byte from the raw QUIC input. kwik
             // (and the Go SDK) buffer their stream internally so an
@@ -1067,25 +1174,44 @@ internal class Uplink(
             // quic tunnel" here which doesn't match the standard
             // matcher — we deliberately diverge for parity in the UI.
             agent.logInfo("opening tunnel", "target" to target, "transport" to "quic")
+            opened = true
             val sock = Socket()
             sock.tcpNoDelay = true
+            // Kernel keepalive so a silently-dead target (NAT drop, Wi-Fi↔
+            // cellular handover) is reaped by the OS instead of pinning
+            // this socket — and its fd — open forever behind a blocking
+            // read that no SO_TIMEOUT can interrupt.
+            try { sock.keepAlive = true } catch (_: Throwable) {}
             try { sock.receiveBufferSize = cfg.networkProfile.tuning().tcp.socketBufferBytes } catch (_: Throwable) {}
             try { sock.sendBufferSize = cfg.networkProfile.tuning().tcp.socketBufferBytes } catch (_: Throwable) {}
             sock.connect(InetSocketAddress(dns.resolve(host), port),
                 NativeProxyAgent.TARGET_DIAL_TIMEOUT_MS.toInt())
+            // NOTE: this is a plain java.net.Socket, so we can only set bare
+            // SO_KEEPALIVE (above) — no safe read-only fd path to tune the
+            // idle/interval like the SocketChannel sites do. A silently-dead
+            // QUIC target therefore relies on the ~2h OS-default keepalive OR,
+            // sooner, the stall watchdog tearing the session down once the
+            // cap saturates with no completions.
             targetSock = sock
+            // bridgeStreams() emits the single "tunnel closed" line for this
+            // tunnel on its normal exit — do NOT log another one here or the
+            // host's activeTunnels gauge double-decrements (nets -1 per QUIC
+            // tunnel and clamps to 0).
             bridgeStreams(streamIn, stream.output, sock)
-            // "tunnel closed" matches the standard parseAgentLine
-            // matcher; the "transport=quic" key keeps the QUIC origin
-            // visible for log readers.
-            agent.logInfo("tunnel closed", "target" to target, "transport" to "quic")
         } catch (t: Throwable) {
-            agent.logWarn("quic tunnel failed",
-                "error" to (t.message ?: t.javaClass.simpleName))
+            val msg = t.message ?: t.javaClass.simpleName
+            agent.logWarn("quic tunnel failed", "error" to msg)
             try { stream.close() } catch (_: Throwable) {}
             try { targetSock?.close() } catch (_: Throwable) {}
+            // Keep the host's activeTunnels parser balanced: it counts
+            // "tunnel closed", not "quic tunnel failed", so emit one here
+            // when we'd already logged "opening tunnel".
+            if (opened) agent.logInfo("tunnel closed", "transport" to "quic", "reason" to "failed")
+            noteOpenFailure(msg)
         } finally {
             agent.decTunnels()
+            tunnelPermits.release()
+            tunnelCompletions.incrementAndGet()
         }
     }
 
@@ -1182,8 +1308,29 @@ internal class Uplink(
         cleanupTransport()
         dataPool?.close()
         dataPool = null
+        // Force-close every socket still held by an in-flight bridge. A
+        // daemon-thread interrupt alone can't unblock a thread parked in a
+        // kernel splice(2) or a blocking NIO read; closing the underlying
+        // fd is what makes those calls return so the descriptors are freed
+        // before the supervisor redials.
+        closeLiveConns()
+        try { watchdogThread?.interrupt() } catch (_: Throwable) {}
+        watchdogThread = null
         openExecutor.shutdownNow()
         bridgeExecutor.shutdownNow()
+    }
+
+    private fun trackConn(c: java.io.Closeable) { liveConns.add(c) }
+    private fun untrackConn(c: java.io.Closeable) { liveConns.remove(c) }
+
+    private fun closeLiveConns() {
+        val snapshot = liveConns.toList()
+        liveConns.clear()
+        var n = 0
+        for (c in snapshot) {
+            try { c.close(); n++ } catch (_: Throwable) {}
+        }
+        if (n > 0) agent.logInfo("force-closed live tunnels on teardown", "count" to n)
     }
 
     // ── AUTH ────────────────────────────────────────────────────────────
@@ -1280,6 +1427,18 @@ internal class Uplink(
 
     private fun handleOpen(transport: String, token: String, host: String, port: Int) {
         val target = "$host:$port"
+        // Descriptor-exhaustion guard. Grab a permit BEFORE we log
+        // "opening tunnel" or dial anything, so a rejected open never
+        // touches a socket and never unbalances the activeTunnels line the
+        // host parses. If the whole pool is in use we're at the concurrency
+        // ceiling — refuse rather than push the process toward EMFILE.
+        if (!tunnelPermits.tryAcquire()) {
+            tunnelRejections.incrementAndGet()
+            agent.logWarn("tunnel rejected: at capacity",
+                "target" to target, "limit" to cfg.maxConcurrentTunnels)
+            reportOpenFail(token, "agent at capacity (${cfg.maxConcurrentTunnels} tunnels)")
+            return
+        }
         agent.logInfo("opening tunnel", "target" to target, "token" to shortToken(token))
         agent.incTunnels()
         try {
@@ -1292,11 +1451,89 @@ internal class Uplink(
                 handleOpenQuic(token, host, port)
             }
         } catch (t: Throwable) {
-            agent.logWarn("tunnel open failed", "target" to target,
-                "error" to (t.message ?: t.javaClass.simpleName))
-            reportOpenFail(token, t.message ?: t.javaClass.simpleName)
+            val msg = t.message ?: t.javaClass.simpleName
+            agent.logWarn("tunnel open failed", "target" to target, "error" to msg)
+            reportOpenFail(token, msg)
+            noteOpenFailure(msg)
+            // Balance the host's log-parsed activeTunnels gauge: we already
+            // emitted "opening tunnel" above, and the parser only decrements
+            // on "tunnel closed" — without this a failed open would leave
+            // the displayed tunnel count permanently inflated, which reads
+            // to an operator as a stuck/leaking agent.
+            agent.logInfo("tunnel closed", "target" to target, "reason" to "failed")
         } finally {
             agent.decTunnels()
+            tunnelPermits.release()
+            tunnelCompletions.incrementAndGet()
+        }
+    }
+
+    /** Record a failed tunnel open and self-heal if the data plane looks
+     *  wedged. An EMFILE is fatal on its own; otherwise we wait for a
+     *  sustained back-to-back streak so a few transient dial timeouts on a
+     *  flaky link don't needlessly bounce a working session. */
+    private fun noteOpenFailure(msg: String) {
+        if (shuttingDown.get()) return
+        val emfile = msg.contains(NativeProxyAgent.EMFILE_MARKER, ignoreCase = true)
+        val streak = openFailStreak.incrementAndGet()
+        if (emfile) {
+            selfHeal("descriptor exhaustion ($msg)")
+        } else if (streak >= NativeProxyAgent.OPEN_FAIL_STREAK_TEARDOWN) {
+            selfHeal("$streak consecutive tunnel-open failures")
+        }
+    }
+
+    /** Force the session down so the supervisor redials from scratch. This
+     *  drops the control channel, closes the data pool, and — via
+     *  shutdown() → closeLiveConns() — force-closes every socket still held
+     *  by an in-flight bridge, reclaiming any descriptors leaked by tunnels
+     *  whose peer went silently dead. Idempotent per session. */
+    private fun selfHeal(reason: String) {
+        if (!selfHealFired.compareAndSet(false, true)) return
+        agent.logWarn("self-heal: tearing down uplink to recover",
+            "reason" to reason)
+        // Run the teardown off the control/bridge thread that noticed the
+        // failure so we never deadlock waiting on ourselves.
+        Thread({ shutdown() }, "uplink-selfheal").apply { isDaemon = true }.start()
+    }
+
+    /** Transport-agnostic wedge detector — see STALL_WATCHDOG_* docs. Fires
+     *  selfHeal() when the tunnel pool stays fully saturated, clients keep
+     *  demanding tunnels (rejections climb), and zero tunnels complete
+     *  across STALL_WATCHDOG_TRIP_CHECKS consecutive ticks. */
+    private fun runStallWatchdog() {
+        var lastCompletions = tunnelCompletions.get()
+        var lastRejections = tunnelRejections.get()
+        var wedgedTicks = 0
+        while (!shuttingDown.get()) {
+            try {
+                Thread.sleep(NativeProxyAgent.STALL_WATCHDOG_TICK_MS)
+            } catch (_: InterruptedException) {
+                return
+            }
+            if (shuttingDown.get()) return
+            val completions = tunnelCompletions.get()
+            val rejections = tunnelRejections.get()
+            val saturated = tunnelPermits.availablePermits() == 0
+            val noCompletions = completions == lastCompletions
+            val demand = rejections > lastRejections
+            if (saturated && noCompletions && demand) {
+                wedgedTicks++
+                agent.logWarn("stall watchdog: data plane appears wedged",
+                    "saturated" to true,
+                    "rejections_delta" to (rejections - lastRejections),
+                    "ticks" to wedgedTicks)
+                if (wedgedTicks >= NativeProxyAgent.STALL_WATCHDOG_TRIP_CHECKS) {
+                    selfHeal("data plane wedged: cap saturated with active demand " +
+                        "and 0 tunnel completions for " +
+                        "~${NativeProxyAgent.STALL_WATCHDOG_TICK_MS * wedgedTicks / 1000}s")
+                    return
+                }
+            } else {
+                wedgedTicks = 0
+            }
+            lastCompletions = completions
+            lastRejections = rejections
         }
     }
 
@@ -1309,12 +1546,23 @@ internal class Uplink(
             val futureTarget = bridgeExecutor.submit<SocketChannel> {
                 val ch = SocketChannel.open()
                 ch.socket().tcpNoDelay = true
+                // Kernel keepalive so a silently-dead target is reaped by
+                // the OS. Under the splice fast path the read blocks in the
+                // kernel with no userspace SO_TIMEOUT reachable, so this is
+                // the only thing that guarantees the fd is eventually freed
+                // without waiting for a full self-heal teardown.
+                try { ch.socket().keepAlive = true } catch (_: Throwable) {}
                 try { ch.socket().receiveBufferSize = cfg.networkProfile.tuning().tcp.socketBufferBytes } catch (_: Throwable) {}
                 try { ch.socket().sendBufferSize = cfg.networkProfile.tuning().tcp.socketBufferBytes } catch (_: Throwable) {}
                 ch.socket().connect(
                     InetSocketAddress(dns.resolve(host), port),
                     NativeProxyAgent.TARGET_DIAL_TIMEOUT_MS.toInt(),
                 )
+                // Tune keepalive idle/interval/count on the raw fd. On the
+                // splice path spliceLoop re-tunes anyway, but on the NIO
+                // fallback (API<30 / splice unavailable) this is the only
+                // place the target socket gets sub-2h dead-peer reaping.
+                SpliceShim.applyKeepalive(ch)
                 ch
             }
             val futureData = bridgeExecutor.submit<SocketChannel> { pool.take() }
@@ -1322,7 +1570,15 @@ internal class Uplink(
             val target = try {
                 futureTarget.get(NativeProxyAgent.TARGET_DIAL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             } catch (t: Throwable) {
-                futureData.cancel(true)
+                // pool.take() almost always completes first (warm pool is an
+                // instant poll), so cancel(true) is a no-op on the already-
+                // done Future and would ORPHAN the live data channel it holds
+                // — a registrator-connection fd that survives even a self-heal
+                // teardown (it's neither in `available` nor tracked in
+                // liveConns). Reclaim it explicitly.
+                if (!futureData.cancel(true)) {
+                    try { futureData.get()?.close() } catch (_: Throwable) {}
+                }
                 throw IOException("target dial: ${t.message ?: t.javaClass.simpleName}", t)
             }
             targetCh = target
@@ -1365,6 +1621,7 @@ internal class Uplink(
         val stream = q.openStream()
         val targetSock = Socket().apply {
             tcpNoDelay = true
+            try { keepAlive = true } catch (_: Throwable) {}
             try { receiveBufferSize = cfg.networkProfile.tuning().tcp.socketBufferBytes } catch (_: Throwable) {}
             try { sendBufferSize = cfg.networkProfile.tuning().tcp.socketBufferBytes } catch (_: Throwable) {}
             connect(InetSocketAddress(dns.resolve(host), port),
@@ -1451,6 +1708,18 @@ internal class Uplink(
         // account every byte. The WifiReturnRelay counters at the relay
         // pipe always count, so the widget has a reliable Wi-Fi baseline
         // even when target counters under-report.
+        // A tunnel that reaches the bridge is a successful establishment —
+        // dial + data-conn + token all worked — so it clears the open-
+        // failure streak even if it then lives for minutes. Resetting here
+        // (rather than after the bridge returns) means a healthy long-lived
+        // download can't let concurrent short-lived failures trip a needless
+        // self-heal.
+        openFailStreak.set(0)
+        // Register both ends so a self-heal / stop teardown can force them
+        // shut even while a copier is parked in splice(2) or a blocking
+        // read. Unregistered in the finally below on the clean path.
+        trackConn(a)
+        trackConn(b)
         val done = java.util.concurrent.CountDownLatch(2)
         bridgeExecutor.execute {
             try {
@@ -1464,7 +1733,19 @@ internal class Uplink(
                 try { a.socket().shutdownOutput() } catch (_: Throwable) {}
             } catch (_: Throwable) {} finally { done.countDown() }
         }
-        try { done.await() } catch (_: InterruptedException) {}
+        try {
+            // Shutdown-responsive await: on teardown, closeLiveConns() has
+            // already closed a & b, which unblocks the copiers, so we stop
+            // waiting promptly instead of blocking a bridge thread forever
+            // on a half-dead tunnel.
+            while (!done.await(NativeProxyAgent.BRIDGE_AWAIT_TICK_MS, TimeUnit.MILLISECONDS)) {
+                if (shuttingDown.get()) break
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        untrackConn(a)
+        untrackConn(b)
         try { a.close() } catch (_: Throwable) {}
         try { b.close() } catch (_: Throwable) {}
         agent.logInfo("tunnel closed")
@@ -1554,7 +1835,14 @@ internal class Uplink(
         // all tunnels small.
         val downBytes = java.util.concurrent.atomic.AtomicLong(0)
         val upBytes = java.util.concurrent.atomic.AtomicLong(0)
+        // Successful establishment clears the open-failure streak (see the
+        // matching reset in bridge()).
+        openFailStreak.set(0)
         val done = java.util.concurrent.CountDownLatch(1)
+        // Track the target socket so a teardown force-closes it even if
+        // both directions are parked on a dead peer with no EOF either way
+        // (the CountDownLatch(1) below only fires when ONE side finishes).
+        trackConn(sock)
         bridgeExecutor.execute {
             try { copyStream(input, sock.getOutputStream(), upBytes) } catch (_: Throwable) {}
             finally { done.countDown() }
@@ -1563,7 +1851,14 @@ internal class Uplink(
             try { copyStream(sock.getInputStream(), output, downBytes) } catch (_: Throwable) {}
             finally { done.countDown() }
         }
-        try { done.await() } catch (_: InterruptedException) {}
+        try {
+            while (!done.await(NativeProxyAgent.BRIDGE_AWAIT_TICK_MS, TimeUnit.MILLISECONDS)) {
+                if (shuttingDown.get()) break
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        untrackConn(sock)
         try { sock.close() } catch (_: Throwable) {}
         try { output.close() } catch (_: Throwable) {}
         // Roll per-tunnel counts into the agent-wide totals (target dials,
@@ -1709,6 +2004,12 @@ internal class Uplink(
                 ch.socket().soTimeout = NativeProxyAgent.POOL_DIAL_TIMEOUT_MS.toInt()
                 while (hs.hasRemaining()) ch.write(hs)
                 ch.socket().soTimeout = 0
+                // Tune keepalive idle/interval/count (plain setKeepAlive above
+                // is only SO_KEEPALIVE / ~2h default). This connection loops
+                // back to the relay, but under wifi_return the relay's own
+                // cellular upstream can go dead on a handover, so we still
+                // want prompt reaping of a wedged pool conn.
+                SpliceShim.applyKeepalive(ch)
                 return ch
             } catch (t: Throwable) {
                 try { ch.close() } catch (_: Throwable) {}
