@@ -4,7 +4,7 @@ plugins {
 }
 
 val buildNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0
-val appVersionName = if (buildNumber > 0) "1.0.$buildNumber" else "1.0.0-dev"
+val appVersionName = if (buildNumber > 0) "2.0.$buildNumber" else "2.0.0-dev"
 val appVersionCode = if (buildNumber > 0) buildNumber else 1
 
 // E2E build switch: `-Pe2e=true` adds x86_64 to abiFilters so the APK
@@ -148,9 +148,9 @@ android {
             }
             // OTA coordinates for the RELEASE CRM app (release-signed builds).
             buildConfigField("String", "OTA_APP_ID",
-                "\"${System.getenv("OTA_APP_ID_RELEASE")?.takeUnless { it.isBlank() } ?: "6a5f3fc7a679645d83a1a08e"}\"")
+                "\"${System.getenv("OTA_APP_ID_RELEASE")?.takeUnless { it.isBlank() } ?: "6a61f3dd7ecbf88fa47b86fc"}\"")
             buildConfigField("String", "OTA_ENCRYPTION_KEY",
-                "\"${System.getenv("OTA_ENCRYPTION_KEY_RELEASE")?.takeUnless { it.isBlank() } ?: "fCZMilU141ibKg1NbxrXX3Hx"}\"")
+                "\"${System.getenv("OTA_ENCRYPTION_KEY_RELEASE")?.takeUnless { it.isBlank() } ?: "mMwt5QEbnmgKwPsEa6e9GrLv"}\"")
         }
         debug {
             // OTA coordinates for the DEBUG CRM app (debug-signed builds). Its
