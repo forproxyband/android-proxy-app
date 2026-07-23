@@ -9,6 +9,7 @@ import android.content.Intent
 import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import java.io.File
 
 // Auto-restarts ProxyService after a device reboot. A phone restart hard-kills
@@ -80,6 +81,17 @@ class BootReceiver : BroadcastReceiver() {
         val mode = prefs.getString("mode", "modem") ?: "modem"
         val networkProfile = prefs.getString("network_profile", "LOW_100") ?: "LOW_100"
 
+        // Clear the previous session's live-state files so a `status`/`toggle`
+        // query (RemoteControlReceiver reads raw proxy_state without a heartbeat
+        // check) landing in the brief window between boot and onStartCommand's
+        // state("starting") can't read a stale "running". Matches what the
+        // RemoteControlReceiver and MainActivity start paths do. agent.log is
+        // deliberately kept (unlike those paths) so a fleet post-mortem can see
+        // across the reboot boundary; onCreate stamps a fresh `=== app v… ===`
+        // marker that delimits the new session.
+        try { File(context.filesDir, "proxy_state").delete() } catch (_: Throwable) {}
+        try { File(context.filesDir, "conn_info").delete() } catch (_: Throwable) {}
+
         val svc = Intent(context, ProxyService::class.java).apply {
             putExtra("host", host); putExtra("port", port); putExtra("key", key)
             putExtra("id", id); putExtra("dns", dns)
@@ -93,6 +105,19 @@ class BootReceiver : BroadcastReceiver() {
                 context.startService(svc)
             }
             Log.i(TAG, "auto-restarted ProxyService after boot (engine=$engine mode=$mode)")
+            // Diagnostic: on API 33+ a headless device that was never opened to
+            // grant POST_NOTIFICATIONS will run the FGS but SUPPRESS its shade
+            // notification — the service works, yet the admin sees nothing. Log
+            // the state so this blind spot is greppable post-mortem. Fixes:
+            // open the app once (grants interactively) or install the root
+            // autostart (grants via `pm grant`). See ADMIN_GUIDE §7.9.
+            val notifsOn = try {
+                NotificationManagerCompat.from(context).areNotificationsEnabled()
+            } catch (_: Throwable) { true }
+            if (!notifsOn) {
+                Log.w(TAG, "notifications DISABLED — FGS status notification will be " +
+                    "hidden until POST_NOTIFICATIONS is granted (open app once, or root autostart)")
+            }
         } catch (t: Throwable) {
             // Most likely ForegroundServiceStartNotAllowedException if the boot
             // exemption ever stops applying. Don't rethrow — a receiver crash

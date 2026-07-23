@@ -476,6 +476,20 @@ class ProxyService : Service() {
             return
         }
         if (stopRequested) return
+        // Cross-process rotation guard: ignore this REBOOT if another rotation
+        // (a manual ↻ in :main, or one that just finished) still holds the lock
+        // or we're inside the post-rotation cooldown. User-toggleable in
+        // Settings; loadConfigFromFile reads the cross-process file that :main
+        // mirrors the SharedPreferences into.
+        val cfg = IpCycle.loadConfigFromFile(this)
+        val gate = IpCycle.checkRotationGate(this, cfg)
+        if (!gate.allowed) {
+            val detail = if (gate.reason == "cooldown")
+                "cooldown ${gate.remainingMs / 1000 + 1}s left"
+            else "another rotation in progress"
+            log("REBOOT ignored — rotation lock active ($detail) (reason=\"$reason\")")
+            return
+        }
         autoCycling = true
         cycleStage = "starting"
         writeConnInfo()   // push the new stage into UI within 1s of the trigger
@@ -491,11 +505,11 @@ class ProxyService : Service() {
                 val baseline = try {
                     File(filesDir, "nat_ip").readText().trim()
                 } catch (_: Throwable) { "" }
-                // Read cycle config from the cross-process file written by
-                // MainActivity on settings save. SharedPreferences won't work
-                // here: this service runs in the :proxy process and its prefs
-                // in-memory cache wouldn't see changes made in :main.
-                val cfg = IpCycle.loadConfigFromFile(this)
+                // cfg was loaded above (before the rotation-lock gate) from the
+                // cross-process file MainActivity mirrors settings into —
+                // SharedPreferences won't work here: this service runs in the
+                // :proxy process and its prefs in-memory cache wouldn't see
+                // changes made in :main.
                 val result = IpCycle.cycleAndVerify(
                     context = this,
                     knownIp = baseline,
@@ -670,9 +684,15 @@ class ProxyService : Service() {
     override fun onCreate() {
         super.onCreate()
         if (Build.VERSION.SDK_INT >= 26) {
-            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            val ch = NotificationChannel("proxy", "Proxy Agent", NotificationManager.IMPORTANCE_LOW)
-            nm.createNotificationChannel(ch)
+            // Null-safe cast: this runs at :proxy process-create, potentially
+            // very early after a reboot auto-start. An unchecked cast that threw
+            // here would crash the process before the first startForeground and
+            // leave no notification at all. NotificationManager is a core service
+            // so null is virtually impossible, but a missing channel would make
+            // startForeground silently no-op the notification — cheap to guard.
+            (getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager)
+                ?.createNotificationChannel(
+                    NotificationChannel("proxy", "Proxy Agent", NotificationManager.IMPORTANCE_LOW))
         }
         // Stamp the log with the running build at process-create time. Cheap
         // and one-shot per :proxy lifetime. The agent.log file is shared
@@ -682,6 +702,60 @@ class ProxyService : Service() {
         // to grep for ("=== app v") and clearly separates from regular log.
         log("=== app v${BuildConfig.VERSION_NAME} (build ${BuildConfig.VERSION_CODE}) " +
             "pid=${android.os.Process.myPid()} ===")
+    }
+
+    // Wraps startForeground with the correct FGS type for the SDK level and,
+    // crucially, does NOT let a throw escape. On an OEM that doesn't honor the
+    // BOOT_COMPLETED exemption for a specialUse FGS, or if Android tightens the
+    // rules, this call can throw ForegroundServiceStartNotAllowedException /
+    // MissingForegroundServiceType / ForegroundServiceDidNotStartInTimeException.
+    // BootReceiver's try/catch only covers startForegroundService(), not this
+    // downstream call — an unwrapped throw here would crash :proxy silently with
+    // no shade signal. Returns true on success. On failure posts a best-effort
+    // fallback notification so a headless reboot still leaves something visible.
+    private fun startForegroundSafe(): Boolean = try {
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(1, buildNotification(statusText()),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(1, buildNotification(statusText()))
+        }
+        // A prior boot-time auto-restart may have left an "auto-restart blocked"
+        // fallback (id 3) in the shade. Now that we're foreground, clear it so
+        // it doesn't sit misleadingly next to the live status notification.
+        try {
+            (getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager)?.cancel(3)
+        } catch (_: Throwable) {}
+        true
+    } catch (t: Throwable) {
+        log("startForeground failed: ${t.javaClass.simpleName}: ${t.message}")
+        postForegroundFailedNotification(t)
+        false
+    }
+
+    // Best-effort visible signal when startForeground itself fails (so the
+    // outage isn't completely silent). Mirrors BootReceiver's fallback and
+    // reuses notification id 3. Subject to POST_NOTIFICATIONS on API 33+ — if
+    // that's denied this is a no-op, which is the same blind spot the FGS
+    // notification has; see ADMIN_GUIDE on granting it for headless fleets.
+    private fun postForegroundFailedNotification(cause: Throwable) {
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+            val openApp = PendingIntent.getActivity(
+                this, 0,
+                Intent(this, MainActivity::class.java).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) },
+                PendingIntent.FLAG_IMMUTABLE,
+            )
+            val n = NotificationCompat.Builder(this, "proxy")
+                .setContentTitle("Proxy Agent — couldn't start foreground service")
+                .setContentText("Tap to open and press START. Reason: ${cause.javaClass.simpleName}")
+                .setSmallIcon(android.R.drawable.ic_menu_share)
+                .setContentIntent(openApp)
+                .setAutoCancel(true)
+                .setOngoing(false)
+                .build()
+            nm.notify(3, n)
+        } catch (_: Throwable) {}
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -722,12 +796,7 @@ class ProxyService : Service() {
         if (runnerThread?.isAlive == true && !stopRequested) {
             log("onStartCommand: session already active — ignoring duplicate " +
                 "start (action=${intent.action ?: "-"})")
-            if (Build.VERSION.SDK_INT >= 34) {
-                startForeground(1, buildNotification(statusText()),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-            } else {
-                startForeground(1, buildNotification(statusText()))
-            }
+            startForegroundSafe()
             return START_REDELIVER_INTENT
         }
 
@@ -753,12 +822,14 @@ class ProxyService : Service() {
         connStatus = ConnStatus.STARTING
         // Android 14+ ties FGS time-limits to the type. specialUse has no
         // 6h/24h dataSync cap, but the system silently treats absent type as
-        // "unknown" and time-limits it too. Pass type explicitly.
-        if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(1, buildNotification(statusText()),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
-            startForeground(1, buildNotification(statusText()))
+        // "unknown" and time-limits it too. startForegroundSafe passes the type
+        // explicitly and never throws — if the foreground transition fails
+        // (OEM blocks the boot exemption, FGS rules tightened) we can't run a
+        // proxy without an FGS, so bail cleanly rather than limp along killable.
+        if (!startForegroundSafe()) {
+            log("Aborting start — foreground transition failed")
+            stopSelf()
+            return START_NOT_STICKY
         }
         state("starting")
         writeConnInfo()
@@ -825,8 +896,12 @@ class ProxyService : Service() {
         // refreshes notification + conn_info file, and enforces battery /
         // no-internet auto-stops.
         Thread {
-            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            val bm = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+            // Null-safe: acquired at thread start which, on a reboot auto-start,
+            // is very early boot. An unchecked cast returning null would throw
+            // OUTSIDE the per-iteration try/catch below and kill the updater at
+            // startup — the notification would then freeze at "Starting…" forever.
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            val bm = getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
             var noInternetSince = 0L
             val noInternetGraceMs = 30_000L
             while (!stopRequested) {
@@ -845,13 +920,13 @@ class ProxyService : Service() {
                         wifiRelay != null -> if (wifiRelay!!.isUsingWifi()) "wifi" else "wifi_fallback"
                         else -> ""
                     }
-                    nm.notify(1, buildNotification(statusText()))
+                    nm?.notify(1, buildNotification(statusText()))
                     writeConnInfo()
                     analytics?.tick()
                     maybeRefreshNatIp()
 
                     val threshold = readBatteryThreshold()
-                    if (threshold > 0) {
+                    if (threshold > 0 && bm != null) {
                         val level = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
                         if (level in 0..threshold) {
                             log("Auto-stop: battery $level% <= threshold $threshold%")

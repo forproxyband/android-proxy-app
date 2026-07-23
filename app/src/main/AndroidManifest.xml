@@ -171,8 +171,9 @@
         <!-- Remote start/stop/toggle over `adb shell am broadcast`. Exported
              so the shell UID can reach it (ProxyService is un-exported and
              can't be targeted by `am` directly). Every command is gated on
-             the stored connection key passed as `--es key`, so being exported
-             doesn't let other apps flip the proxy. Runs in :main (default
+             the stored connection key passed as the `key` string extra, so
+             being exported doesn't let other apps flip the proxy. Runs in
+             :main (default
              process) — only needs SharedPreferences + startForegroundService.
              See RemoteControlReceiver.kt for the full command reference. -->
         <receiver

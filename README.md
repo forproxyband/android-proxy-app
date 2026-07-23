@@ -16,7 +16,10 @@ key can route proxy traffic out through this phone's cellular IP.
   network — so external clients see the phone's mobile exit IP.
 - **Rotates the cellular IP** on demand or on server-side trigger:
   airplane-mode toggle → RAT switch (LTE↔GSM) → optional APN swap
-  / IMEI rotation. Root makes this much more reliable.
+  / IMEI rotation. Root makes this much more reliable. A **rotation
+  guard** (on by default) ignores overlapping rotation requests while
+  one is running and for a configurable cooldown (default 10s) after —
+  toggle + cooldown live in Settings. See [ADMIN_GUIDE.md §4.4](ADMIN_GUIDE.md).
 - **Wi-Fi return** (optional): the agent↔registrator control link
   can ride Wi-Fi while target dials still go through cellular —
   saves mobile data without leaking the Wi-Fi IP to targets.
@@ -26,8 +29,14 @@ key can route proxy traffic out through this phone's cellular IP.
   to the link's expected ceiling — avoids the bufferbloat that
   comes from fat buffers + slow pacer at lower link rates.
   NATIVE engine only.
-- Auto-stops on low battery / no-internet, auto-restarts after app
-  updates (when OEM doesn't block the broadcast).
+- Auto-stops on low battery / no-internet, and **auto-reconnects
+  after an app update or a device reboot** if the session was live
+  (gated on a `was_running` flag, so a deliberate STOP stays stopped).
+  Non-root: in-app deep-links to the battery-whitelist and OEM
+  autostart screens. Rooted fleet: one-tap `INSTALL ROOT AUTOSTART`
+  drops a Magisk/KernelSU boot script that bypasses OEM autostart
+  blocking and Doze — the guaranteed path. A screen lock defers the
+  restart until first unlock (detected + warned in-app).
 
 ## Who needs this
 
@@ -64,7 +73,8 @@ Full write-up — **[ARCHITECTURE.md](ARCHITECTURE.md)**:
 - IP rotation algorithm + interrupted-cycle recovery
 - Wi-Fi return relay (split-routing, self-test, OEM caveats)
 - Auto-stop watchdog
-- Surviving an app update (heartbeat-staleness, auto-restart)
+- Surviving an app update or reboot (heartbeat-staleness,
+  auto-restart, Direct Boot / lock-screen, root autostart)
 
 Wire protocol + SDK runtime surface of the bundled BINARY —
 **[BINARIES.md](BINARIES.md)**.

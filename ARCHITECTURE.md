@@ -26,24 +26,31 @@ compatibility.
   principle be reconfigured in-place (`NativeProxyAgent.start(Config)`
   accepts a fresh config) but we keep the same contract so the UI
   layer doesn't have to fork per engine.
+- Three manifest-registered `BroadcastReceiver`s run in `:main` and
+  only dispatch a `startForegroundService`: `PackageReplacedReceiver`
+  (`MY_PACKAGE_REPLACED`), `BootReceiver` (`BOOT_COMPLETED` /
+  `QUICKBOOT_POWERON`), and the exported, key-authenticated
+  `RemoteControlReceiver` (`adb`/root `am broadcast` start/stop/toggle/
+  status). See [Surviving an app update or reboot](#surviving-an-app-update-or-reboot).
 
 ## State files in `filesDir`
 
 | File | Owner | Format | Purpose |
 | --- | --- | --- | --- |
-| `proxy_state` | service | text | One of `starting`/`running`/`stopped`/`auto_stopped`/`error`. Written on every transition. Terminal values (`stopped`/`auto_stopped`/`error`) are sticky across `conn_info` stale-detection — see [Surviving an app update](#surviving-an-app-update). |
+| `proxy_state` | service | text | One of `starting`/`running`/`stopped`/`auto_stopped`/`error`. Written on every transition. Terminal values (`stopped`/`auto_stopped`/`error`) are sticky across `conn_info` stale-detection — see [Surviving an app update or reboot](#surviving-an-app-update-or-reboot). |
 | `conn_info` | service | pipe-delimited | Connection state, traffic rates, current rotation stage, wall-clock heartbeat. Written every 1s + on transitions. Schema below. |
 | `stop_reason` | service | text | Human-readable reason; non-empty only when `proxy_state=auto_stopped`. |
 | `agent.log` | service | text | Timestamped tail of binary stdout. Rotated 30 → 25 MiB on overflow. Each new `:proxy` process stamps a `=== app vX.Y.Z (build N) pid=… ===` line on entry so post-mortem analysis can tell which app version produced which log segment after upgrades. |
 | `nat_ip` | service | text | Last-known public IP (best-effort, refreshed every 5 min and after successful rotation). |
 | `battery_threshold` | UI | int | Auto-stop threshold in percent (0 disables). |
 | `speed_units` | UI | text | `bits`/`bytes` for rate display. |
-| `cycle_cfg.json` | UI writes, both read | JSON | Cross-process mirror of the cycle settings (`apn_swap`, `imei_rotate`, `imei_method`, `imei_cmd`). SharedPreferences are per-process — the REBOOT auto-cycle in `:proxy` would otherwise miss toggle changes made in `:main`. Rewritten on every settings save and re-mirrored on app launch as a back-fill. |
+| `cycle_cfg.json` | UI writes, both read | JSON | Cross-process mirror of the cycle settings (`apn_swap`, `imei_rotate`, `imei_method`, `imei_cmd`, `wifi_return*`, plus the rotation-guard `rotation_lock` / `rotation_cooldown_s`). SharedPreferences are per-process — the REBOOT auto-cycle in `:proxy` would otherwise miss toggle changes made in `:main`. Rewritten on every settings save and re-mirrored on app launch as a back-fill. |
 | `analytics/cycle_events.jsonl` | both write | JSONL | One row per rotation attempt with old/new IP, success flag, attempts and duration. Read by the swipe-panel chart, the analytics screen, and the CSV export. Pruned by the same retention policy as bucket files. |
 | `analytics/<yyyy-MM-dd>.jsonl` | service writes | JSONL | One per-minute `AnalyticsBucket` row per active minute. Keys: `t` (start ms), `rx/tx` (UID-wide TrafficStats deltas — always present and correct regardless of wifi_return state), `op/cl/pk` (tunnel events), `reg/nat/tr` (last-known registrator / public IP / default transport). When Wi-Fi return is **opt-in active** (relay alive at tick time), four extra keys appear: `wrx/wtx` (relay's Wi-Fi-bound upstream bytes) and `crx/ctx` (native agent target-dial bytes + relay fallback bytes — both cellular by construction). The `wrx+wtx` sum across buckets ≈ "mobile data saved" for the period. When Wi-Fi return is **off**, those four keys stay zero (we don't have per-interface visibility without the relay's bind, and refuse to guess); `rx/tx` totals remain the source of truth. Optional keys are emitted only when non-zero; readers use `optLong("...", 0L)` for forward/backward compat. Pruned by retention policy at app launch. |
 | `wifi_info.json` | service | JSON | Latest Wi-Fi return split-routing self-test result + Wi-Fi link snapshot. Keys: `public_ip_wifi`, `public_ip_cell`, `public_ip_default` (process default route, used to detect target-dial leak), `link_speed_mbps`, `frequency_mhz`, `band` (`"2.4 GHz"`/`"5 GHz"`/`"6 GHz"`), `standard` (`"Wi-Fi 5 (802.11ac)"` etc.), `wifi_attached`, `test_result` (`SUCCESS`/`SAME_IP`/`LEAK_DETECTED`/`WIFI_PROBE_FAILED`/`CELL_PROBE_FAILED`/`BOTH_FAILED`), `test_detail`, `test_duration_ms`, `tested_at_ms`. Written by ProxyService after each self-test; read by MainActivity for the widget two-IP block and the log-export header. |
-| `was_running` | service | text (`"1"`) | Auto-restart breadcrumb. Written by `ProxyService.onStartCommand` after `startForeground` and **deleted by `doStop`**. Present-after-kill means the previous session ended unexpectedly (PACKAGE_REPLACED, low-memory kill); `PackageReplacedReceiver` gates auto-restart on this file so an intentional STOP doesn't get resurrected. See [Surviving an app update](#surviving-an-app-update). |
-| `ip_cycle_in_progress` | service | epoch ms (informational) | Crash-recovery breadcrumb for `IpCycle.cycleAndVerify`. Written on entry, deleted in `finally`. A leftover file at app launch means the rotation was killed mid-sequence and `recoverInterruptedCycle` should flip `airplane_mode_on` back to 0. See [IP rotation — interrupted-cycle recovery](#interrupted-cycle-recovery). |
+| `was_running` | service | text (`"1"`) | Auto-restart breadcrumb. Written by `ProxyService.onStartCommand` after `startForeground` and **deleted by `doStop`**. Present-after-kill means the previous session ended unexpectedly (PACKAGE_REPLACED, low-memory kill, **reboot**); `PackageReplacedReceiver` (update), `BootReceiver` (reboot) and the root boot script (`--ez boot_gate`) all gate auto-restart on this file so an intentional STOP doesn't get resurrected. See [Surviving an app update or reboot](#surviving-an-app-update-or-reboot). |
+| `ip_cycle_in_progress` | service | epoch ms | Dual purpose. (1) Crash-recovery breadcrumb for `IpCycle.cycleAndVerify` — written on entry, deleted in `finally`; a leftover at app launch means the rotation was killed mid-sequence and `recoverInterruptedCycle` flips `airplane_mode_on` back to 0. (2) The "in-progress" half of the cross-process rotation guard — `checkRotationGate` blocks a new rotation while a *fresh* marker (age ≤ `MAX_ROTATION_MS` = 6 min) exists; an older marker is treated as orphaned and doesn't block. See [IP rotation — interrupted-cycle recovery](#interrupted-cycle-recovery) and [Rotation guard](#rotation-guard). |
+| `ip_cycle_last_done` | service | epoch ms | Completion timestamp of the last `cycleAndVerify`, written in its `finally` (after the in-progress marker is deleted). The "cooldown" half of the rotation guard: `checkRotationGate` blocks new rotations until `rotation_cooldown_s` seconds after this stamp. Cross-process, so a cooldown started by a `:proxy` REBOOT is honoured by a `:main` manual ↻ and vice versa. See [Rotation guard](#rotation-guard). |
 | `ip_cycle_rat_saved` | service | int (RAT mode) | Holds the pre-rotation `preferred_network_mode` value across the GSM-only RAT switch. Written by `saveAndSetGsmOnly` before the put, deleted by `restoreRat`. Read by `recoverInterruptedCycle` to put the RAT back if we died between save and restore — otherwise the device stays pinned to 2G/3G until the user fixes it manually through system Settings. |
 
 ## `conn_info` schema
@@ -62,7 +69,7 @@ One pipe-delimited line written by `writeConnInfo`
 | 6 | `currentUplinkTransport` | string | One of: `QUIC` (both engines) / `TCP (splice)` (BINARY always, NATIVE when the kernel zero-copy shim activated) / `TCP (NIO)` (NATIVE when splice couldn't be used and the bridge fell back to NIO + DirectByteBuffer) / `TCP` (NATIVE momentary state between `uplink connected` and the first splice/fallback decision — usually invisible thanks to `SpliceShim.warmup()` resolving it before the supervisor dials) / `TCP+yamux` / `WebSocket` (legacy pre-2.0.14 SDKs). Added v2.0.14-quic; splice/NIO distinction added with the NATIVE engine. |
 | 7 | `cycleStage` | string | Non-empty only during REBOOT auto-cycle. UI shows `ROTATING · <stage>`. Added with `IpCycle.cycleAndVerify` rework. |
 | 8 | `wifiReturnStatus` | string | `""` (relay off) / `"wifi"` (uplink on Wi-Fi, split routing verified) / `"wifi_fallback"` (relay up, no Wi-Fi held — flowing through cellular) / `"leak_known"` (BINARY engine: relay running for uplink savings, but target dials leak Wi-Fi IP — expected on BINARY) / `"split_failed"` (sticky: self-test rejected the relay on an in-process engine, relay disabled). UI maps to cyan / amber / amber-warning / red respectively. Added with Wi-Fi return relay. |
-| 9 | `heartbeatMs` | long | Wall-clock epoch ms of the most recent `writeConnInfo` call. Refreshed by the 1Hz status updater + on every transition. `MainActivity.readLiveProxyFiles` treats the file as stale when `now - heartbeatMs > STALE_CONN_INFO_MS` (5 s) — the writer is dead and the file is wiped so the UI doesn't keep showing fake CONNECTED + accumulating uptime. See [Surviving an app update](#surviving-an-app-update). |
+| 9 | `heartbeatMs` | long | Wall-clock epoch ms of the most recent `writeConnInfo` call. Refreshed by the 1Hz status updater + on every transition. `MainActivity.readLiveProxyFiles` treats the file as stale when `now - heartbeatMs > STALE_CONN_INFO_MS` (5 s) — the writer is dead and the file is wiped so the UI doesn't keep showing fake CONNECTED + accumulating uptime. See [Surviving an app update or reboot](#surviving-an-app-update-or-reboot). |
 | 10 | `pid` | int | `android.os.Process.myPid()` of the writer. Debug aid: a pid in `conn_info` that doesn't match any live `ProxyService` process is direct proof the file is a leftover from a previous incarnation. Not currently consumed by code — readers gate on the heartbeat alone. |
 | 11 | `schemaVersion` | int | Layout version. v1 = + heartbeat/pid/schema (fields 9–11). v2 = + Wi-Fi return session byte counters (fields 12–17). Not gated on (readers use positional `getOrNull(N)` for forward/backward compat); recorded so future readers could branch on layout if/when fields get dropped or reordered. |
 | 12 | `wifiUpBytes` | long | Session-lifetime bytes sent through the relay's upstream socket **while bound to Wi-Fi** (the actual savings). Source: `WifiReturnRelay.wifiUpBytes()`. |
@@ -129,6 +136,8 @@ modal in `MainActivity`:
 | `imei_cmd` | string | — | Root shell command when `imei_method="custom"`. |
 | `wifi_return` | bool | false | Route the agent↔registrator uplink over Wi-Fi via a loopback relay; target dials still ride cellular. Modem mode only — auto-clamped to false on save when `mode="balancer"`. See "Wi-Fi return relay" below. |
 | `wifi_return_method` | string | `"local_relay"` | Slot for future methods (SO_MARK, VpnService split tunnel). No UI yet — only `local_relay` is implemented; anything else falls back to direct dial with a log line. |
+| `rotation_lock` | bool | true | Rotation guard on/off. When on, a new rotation request (remote REBOOT or manual ↻) is ignored while a rotation is running and during the cooldown after it. Mirrored into `cycle_cfg.json` so `:proxy` sees it. See [Rotation guard](#rotation-guard). |
+| `rotation_cooldown_s` | int | 10 | Quiet window (seconds) after a rotation completes before another is allowed. Clamped to `0…3600` on save; `0` = block only during the rotation itself. |
 | `network_profile` | string | `"LOW_100"` | Network optimization preset — `"LOW_100"` / `"MID_500"` / `"HIGH_1000"`. Scales TCP socket / bridge buffers AND QUIC Brutal CC target / UDP socket buffer / flow-control refresh cadence to match the expected link ceiling. Default `LOW_100` matches the common-case mobile/Wi-Fi link (≤100 Mbps) and bounds bufferbloat tighter; field tests show it still delivers full multi-flow throughput on gigabit links through parallel target dials. NATIVE engine only; BINARY ignores it (`libproxyagent.so` has no env hooks for these values — logged as a WARN at runBinaryEngine start). Applies on the next stop/start; changing it mid-session shows a Toast and waits for a manual restart. See [NetworkProfile-driven tuning](#networkprofile-driven-tuning). |
 | `ota_channel` | string | `stable` | OTA update channel the app tracks. See [OTA self-update](#ota-self-update). |
 | `ota_notified_build` | long | — | Dedup marker: last build number the background worker raised an "update available" notification for. |
@@ -1020,6 +1029,37 @@ attempts, totalMs, reason)` — `reason` is one of `ok` /
 `ok_no_baseline` / `ip_unchanged` / `no_toggle_method` /
 `interrupted`.
 
+### Rotation guard
+
+Two rotations must never run at once — both flip `airplane_mode`, and
+overlapping toggles corrupt radio state. There are two independent
+same-process guards (`ProxyService.autoCycling` in `:proxy`,
+`MainActivity.cyclingIp` in `:main`), but neither is visible to the
+other process, so a remote REBOOT and a manual ↻ could otherwise fire
+concurrently. `IpCycle.checkRotationGate(context, config)` closes that
+gap and adds a post-rotation cooldown. Both trigger points call it
+*before* starting a cycle and bail if it returns `!allowed`:
+
+- **In-progress** — a fresh `ip_cycle_in_progress` marker (age ≤
+  `MAX_ROTATION_MS`, 6 min) means a cycle is live → block
+  (`reason="in_progress"`). An older marker is treated as crash-orphaned
+  and ignored (recovery cleans it up on the next `:main` launch).
+- **Cooldown** — within `config.cooldownSeconds` of the
+  `ip_cycle_last_done` stamp → block (`reason="cooldown"`,
+  `remainingMs` set). `cooldownSeconds=0` disables the cooldown half.
+- **Disabled** — `config.rotationLock=false` → always `allowed`.
+
+The gate is **read-only**; `cycleAndVerify` owns the marker /
+timestamp lifecycle. It's best-effort, not an atomic lock: the two
+same-process flags already serialise same-process floods, so the only
+residual race is two *different* processes firing within the few-ms
+check-then-start window — acceptable given rotations are rare,
+operator-driven events. On block, `:proxy` logs `REBOOT ignored —
+rotation lock active (...)` and `:main` shows a Toast (`Rotation
+cooldown — wait Ns` / `Rotation already in progress`). Both the toggle
+and the cooldown length are user-configurable (`rotation_lock` /
+`rotation_cooldown_s`, mirrored into `cycle_cfg.json`).
+
 ### Algorithm
 
 Total budget 180s base; ~50s extra per enabled fallback.
@@ -1613,15 +1653,27 @@ Both stop reasons land in `stop_reason` (file) and switch
 `proxy_state` to `auto_stopped`. `MainActivity` surfaces the reason in
 the status badge.
 
-## Surviving an app update
+## Surviving an app update or reboot
 
 `PACKAGE_REPLACED` is a hard kill from the OS — both `:main` and
 `:proxy` are terminated before any `onDestroy` / `doStop` can run, so
 sockets, uplink, JNI splice fds, the WakeLock, and the FGS
-notification all disappear with the processes. There's no
-Android-supported way to keep a session alive across a package
-upgrade. What we **can** do is detect that we were killed and make
-sure the post-update world doesn't lie about it.
+notification all disappear with the processes. A **device reboot** is
+the same shape of kill. There's no Android-supported way to keep a
+session alive across either event. What we **can** do is detect that
+we were killed and make sure the post-event world doesn't lie about
+it, and bring the session back on its own.
+
+Two receivers share the same restart logic and the same `was_running`
+gate, differing only in trigger:
+
+| Trigger | Receiver | Broadcast |
+| --- | --- | --- |
+| App update | `PackageReplacedReceiver` | `MY_PACKAGE_REPLACED` |
+| Device reboot | `BootReceiver` | `BOOT_COMPLETED` (+ OEM `QUICKBOOT_POWERON`) |
+
+On a rooted device a third, OEM-proof path is available — see
+[Guaranteed autostart via root](#guaranteed-autostart-via-root).
 
 ### Three layers of defense
 
@@ -1646,10 +1698,11 @@ sure the post-update world doesn't lie about it.
    ladder strands the device with no cellular path or pinned to 2G.
 
 3. **Auto-restart of the proxy service** —
-   `PackageReplacedReceiver` registered on
-   `android.intent.action.MY_PACKAGE_REPLACED`
-   (`AndroidManifest.xml:103-117`). When the broadcast fires, the
-   receiver:
+   `PackageReplacedReceiver` (on `MY_PACKAGE_REPLACED`) and its reboot
+   twin `BootReceiver` (on `BOOT_COMPLETED` + `QUICKBOOT_POWERON`,
+   needs the `RECEIVE_BOOT_COMPLETED` permission). Both are registered
+   in `AndroidManifest.xml` and run identical logic. When the
+   broadcast fires, the receiver:
 
    - Checks for `filesDir/was_running`. The file is written by
      `ProxyService.onStartCommand` right after `startForeground` and
@@ -1687,22 +1740,130 @@ sure the post-update world doesn't lie about it.
    the old process and the new process attaching its FGS is
    unavoidable Android behaviour.
 
+### Idempotent `onStartCommand`
+
+A single reboot can deliver **more than one** start to the same live
+service instance: `BootReceiver` fires on `BOOT_COMPLETED`, the root
+boot script (if installed) fires a `RemoteControlReceiver` start ~10 s
+later, `QUICKBOOT_POWERON` can double the receiver, and
+`START_REDELIVER_INTENT` re-delivers after a transient kill.
+`onStartCommand` therefore guards on `runnerThread?.isAlive == true &&
+!stopRequested`: if a session is already live it re-satisfies the
+`startForeground` contract for that delivery and returns without
+spawning a second `AgentRunner`/`StatusUpdater`, re-acquiring (and
+leaking) the WakeLock, or opening a duplicate tunnel the registrator
+would reject. `onStartCommand` runs serialized on the main thread, so
+the first start has always set `runnerThread` before the next
+delivery is dispatched.
+
+### Reboot specifics — Direct Boot / lock screen
+
+`BOOT_COMPLETED` is delivered only **after the first user unlock**
+following boot, because the app is not `directBootAware` and its
+config (`SharedPreferences`) + runtime files live in
+credential-encrypted (CE) storage, which is locked until unlock. On a
+device with a secure lock screen the proxy therefore cannot start
+until someone unlocks once. `AutostartManager.isDeviceSecure()`
+(`KeyguardManager.isDeviceSecure`) detects this and the Settings
+screen warns about it. True pre-unlock start would require moving
+`ProxyService` + the native agent `workDir` off CE storage into
+device-protected storage and a `directBootAware` receiver — a broad
+change deliberately **not** done; production devices are expected to
+run without a lock screen, and the root path below covers the rest.
+
+### Guaranteed autostart via root
+
+For the rooted fleet, `AutostartManager` (helped by the settings
+"Auto-reconnect after reboot" section, §3.10 of `ADMIN_GUIDE.md`)
+installs a Magisk/KernelSU boot script at
+`/data/adb/service.d/proxyagent-autostart.sh` (chmod 700, `chown
+0:0`). Both Magisk and KernelSU execute executable `*.sh` there once,
+late in boot. The script:
+
+- waits for `sys.boot_completed`, then `dumpsys deviceidle whitelist
+  +<pkg>` and `cmd appops set <pkg> RUN_ANY_IN_BACKGROUND allow` to
+  exempt itself from Doze / background limits — bypassing OEM
+  autostart managers and battery restrictions entirely;
+- retries `am broadcast … RemoteControlReceiver … cmd start` until the
+  app's CE storage unlocks (the key-auth in `RemoteControlReceiver`
+  fails during the locked window, so the loop naturally waits for
+  unlock);
+- passes `--ez boot_gate true`, which makes `RemoteControlReceiver`
+  honor the same `was_running` gate — a deliberate STOP is not
+  resurrected (reply `skip: not was_running`);
+- runs a `cmd status` pre-check each iteration and exits if the agent
+  is already `running`/`starting`, so it doesn't race `BootReceiver`
+  into a duplicate start.
+
+The connection key is baked into the 0700 script; because
+`RemoteControlReceiver` re-quotes it (`"$KEY"`) there is no injection
+surface, and `AutostartManager.keyUsableInBootScript` refuses a key
+containing a single quote (which would otherwise desync auth
+silently). This is the same root trust boundary the IP-rotation
+features already assume.
+
+### OEM autostart-screen deep-links
+
+`AutostartManager.openOemAutostartSettings` tries a list of
+vendor-specific "Autostart"/"Startup manager" `ComponentName`s
+(`OEM_AUTOSTART_COMPONENTS`) in order, falling through to
+`ACTION_APPLICATION_DETAILS_SETTINGS` so the button never dead-ends.
+These components are undocumented and drift across ROM versions, so
+the fall-through design is load-bearing. `hasOemAutostartManager()`
+gates whether the button is shown at all, using a substring match over
+`Build.MANUFACTURER + Build.BRAND` (not an exact set) because several
+vendors report multi-word/parent strings — e.g. Transsion phones
+report `"TECNO MOBILE LIMITED"` / `"INFINIX MOBILITY LIMITED"`, HMD
+reports `"HMD Global"`.
+
+### Notification visibility after a headless start (POST_NOTIFICATIONS)
+
+The shade notification (id 1) is the primary way to *watch* live state
+(`STARTING → CONNECTING → CONNECTED · ↓X ↑Y`), rendered at 1 Hz from
+in-memory volatiles by the StatusUpdater — so a reboot never makes it
+show stale data. The gotcha is **visibility**, not correctness: on API
+33+ `POST_NOTIFICATIONS` is a runtime permission requested only from
+`MainActivity`. A device provisioned purely over adb/root that never
+opened the UI has it **denied**, so after `BOOT_COMPLETED` the FGS runs
+but the notification is **suppressed** — the proxy works, but there's
+no visible indicator. Mitigations: the root boot script and
+`installRootBootScript` run `pm grant … POST_NOTIFICATIONS` (guaranteed
+path); `BootReceiver` logs `areNotificationsEnabled()` so the blind
+state is greppable; `ADMIN_GUIDE §7.9` documents opening the app once
+on non-root devices. The `cmd status` remote query is
+notification-independent, so state is always machine-readable.
+
+`startForeground` itself is called through `startForegroundSafe()`,
+which wraps it in try/catch (a throw —
+`ForegroundServiceStartNotAllowedException` on an OEM that ignores the
+boot exemption for `specialUse`, `ForegroundServiceDidNotStartInTime`,
+etc. — would otherwise crash `:proxy` uncaught, since `BootReceiver`'s
+guard only covers `startForegroundService`). On success it also clears
+any stale id-3 fallback; on failure it posts a best-effort id-3
+notification and the caller `stopSelf()`s rather than limping along
+without an FGS. The core-service casts in `onCreate` (channel) and the
+StatusUpdater (`nm`/`bm`) are null-safe so an early-boot null can't
+crash the process or freeze the 1 Hz refresh.
+
 ### Notification IDs in the shade
 
 | ID | Source | Lifecycle |
 | --- | --- | --- |
 | 1 | `ProxyService.startForeground` / 1Hz refresh in the status updater | Sticky / ongoing while `:proxy` is alive. Removed by `stopForeground(STOP_FOREGROUND_REMOVE)` in `doStop`. Dies with the process on `PACKAGE_REPLACED` kill; OS removes it from the shade. |
 | 2 | `ProxyService.doStop` when `autoStopReason` is non-empty (battery / no-internet) | Non-sticky (`setOngoing(false)`, `setAutoCancel(true)`). Survives `PACKAGE_REPLACED` because it's not bound to the FGS lifecycle — the `PendingIntent` is immutable so the tap-into-MainActivity action still works after the update. |
-| 3 | `PackageReplacedReceiver.postAutoRestartFailedNotification` when `startForegroundService` throws | Non-sticky, auto-cancel. Posted **only** when auto-restart fails (OEM block, Android FGS-restriction tightening). Channel `"proxy"` is created here too — it would otherwise only exist if `:proxy.onCreate` had already run, which it hasn't if the start just failed. |
+| 3 | `PackageReplacedReceiver` / `BootReceiver` `postAutoRestartFailedNotification` when `startForegroundService` throws | Non-sticky, auto-cancel. Posted **only** when auto-restart (after update or reboot) fails (OEM block, Android FGS-restriction tightening). Shared ID across both receivers. Channel `"proxy"` is created here too — it would otherwise only exist if `:proxy.onCreate` had already run, which it hasn't if the start just failed. |
 
 ### Failure modes worth knowing about
 
 - **OEM auto-start blockers.** Xiaomi MIUI's "Autostart" toggle,
   Huawei EMUI's "Manage app launch", Samsung OneUI's "Sleeping
-  apps", OnePlus OxygenOS battery optimization — any of these can
-  drop our `MY_PACKAGE_REPLACED` broadcast. There's no
-  app-side workaround; the per-OEM whitelist procedure is documented
-  in `ADMIN_GUIDE.md`.
+  apps", OnePlus OxygenOS battery optimization, Transsion's
+  PhoneMaster — any of these can drop our `MY_PACKAGE_REPLACED`
+  **and** `BOOT_COMPLETED` broadcasts. Non-root mitigations:
+  `AutostartManager` deep-links the user into the vendor screen and
+  the battery-whitelist dialog; the per-OEM procedure is documented in
+  `ADMIN_GUIDE.md §7.7`. The only *guaranteed* fix is the root boot
+  script ([above](#guaranteed-autostart-via-root)).
 - **Android 14+ tightening.** `specialUse` FGS-type currently
   qualifies for the broadcast-receiver exemption that lets us call
   `startForegroundService` from `onReceive`. If Google revokes that

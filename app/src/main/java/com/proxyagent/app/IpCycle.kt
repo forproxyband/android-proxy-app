@@ -69,6 +69,24 @@ object IpCycle {
         // VpnService-based split tunnel) can be added without re-shaping the
         // JSON schema.
         val wifiReturnMethod: String = "local_relay",
+        // Rotation guard: when true (default) a new rotation request is ignored
+        // while one is already running AND for `cooldownSeconds` after it
+        // finishes. Enforced cross-process (see checkRotationGate) via the
+        // IN_PROGRESS_MARKER file (in-progress) and LAST_DONE_FILE timestamp
+        // (cooldown), so the manual ↻ button (:main) and the server REBOOT
+        // auto-cycle (:proxy) can't stomp on each other (both flip airplane
+        // mode). Toggle + cooldown length are user-configurable in Settings.
+        val rotationLock: Boolean = true,
+        val cooldownSeconds: Int = 10,
+    )
+
+    // Result of the pre-rotation guard check. `allowed` = caller may proceed.
+    // When false, `reason` is "in_progress" or "cooldown" and `remainingMs` is
+    // the milliseconds left on the cooldown (0 for in_progress).
+    data class RotationGate(
+        val allowed: Boolean,
+        val reason: String = "",
+        val remainingMs: Long = 0L,
     )
 
     // ── Cross-process config storage ────────────────────────────────────
@@ -101,6 +119,20 @@ object IpCycle {
     // until the user manually flips it through Settings.
     private const val RAT_SAVED_FILE = "ip_cycle_rat_saved"
 
+    // Epoch-millis timestamp of the last COMPLETED cycleAndVerify. Written in
+    // the finally of every cycle and read by checkRotationGate to enforce the
+    // post-rotation cooldown. It's just a file, so a cooldown started by a
+    // :proxy REBOOT rotation is honoured by a :main manual ↻ press and vice
+    // versa.
+    private const val LAST_DONE_FILE = "ip_cycle_last_done"
+
+    // Upper bound on how long one rotation can legitimately run: base 180s
+    // budget + APN-swap (~50s) + IMEI-rotation (~50s) fallbacks, with headroom.
+    // An IN_PROGRESS_MARKER older than this is treated as orphaned by a crash
+    // and no longer blocks a new rotation (recoverInterruptedCycle cleans it up
+    // on the next :main launch).
+    private const val MAX_ROTATION_MS = 360_000L
+
     fun loadConfigFromFile(context: Context): CycleConfig {
         return try {
             val f = File(context.filesDir, CFG_FILE_NAME)
@@ -114,6 +146,8 @@ object IpCycle {
                 wifiReturn = o.optBoolean("wifi_return", false),
                 wifiReturnMethod = o.optString("wifi_return_method", "local_relay")
                     .ifEmpty { "local_relay" },
+                rotationLock = o.optBoolean("rotation_lock", true),
+                cooldownSeconds = o.optInt("rotation_cooldown_s", 10),
             )
         } catch (_: Throwable) { CycleConfig() }
     }
@@ -127,6 +161,8 @@ object IpCycle {
             o.put("imei_cmd", config.imeiCustomCmd)
             o.put("wifi_return", config.wifiReturn)
             o.put("wifi_return_method", config.wifiReturnMethod)
+            o.put("rotation_lock", config.rotationLock)
+            o.put("rotation_cooldown_s", config.cooldownSeconds)
             File(context.filesDir, CFG_FILE_NAME).writeText(o.toString())
         } catch (_: Throwable) {}
     }
@@ -172,7 +208,55 @@ object IpCycle {
             return cycleAndVerifyInner(context, knownIp, log, config)
         } finally {
             try { marker.delete() } catch (_: Throwable) {}
+            // Stamp completion time so checkRotationGate can enforce the
+            // post-rotation cooldown across both processes.
+            try {
+                File(context.filesDir, LAST_DONE_FILE)
+                    .writeText(System.currentTimeMillis().toString())
+            } catch (_: Throwable) {}
         }
+    }
+
+    // Cross-process rotation guard. Every rotation trigger (manual ↻ button in
+    // :main, server REBOOT auto-cycle in :proxy) calls this BEFORE starting a
+    // cycle and bails if it returns !allowed. Blocks while a cycle is in flight
+    // (a fresh IN_PROGRESS_MARKER exists) and for `cooldownSeconds` after the
+    // last one finished (LAST_DONE_FILE). Read-only — cycleAndVerify owns the
+    // marker/timestamp lifecycle. When config.rotationLock is off, always allows.
+    //
+    // Note: this is a best-effort check, not an atomic lock. Each process also
+    // has its own in-memory guard (ProxyService.autoCycling / MainActivity
+    // .cyclingIp) that serialises same-process requests; this file-based gate
+    // adds the cross-process case + the cooldown. The tiny check-then-start
+    // window between two DIFFERENT processes firing within milliseconds is
+    // acceptable given rotations are rare, operator-driven events.
+    fun checkRotationGate(context: Context, config: CycleConfig): RotationGate {
+        if (!config.rotationLock) return RotationGate(true)
+        val now = System.currentTimeMillis()
+
+        val marker = File(context.filesDir, IN_PROGRESS_MARKER)
+        if (marker.exists()) {
+            val startedAt = try { marker.readText().trim().toLong() } catch (_: Throwable) { 0L }
+            val age = now - startedAt
+            // Fresh marker → a cycle is genuinely running. Stale (or unparseable
+            // timestamp) → orphaned by a crash; don't let it wedge rotations.
+            if (startedAt > 0L && age in 0..MAX_ROTATION_MS) {
+                return RotationGate(false, "in_progress", 0L)
+            }
+        }
+
+        val cooldownMs = config.cooldownSeconds.coerceAtLeast(0) * 1000L
+        if (cooldownMs > 0L) {
+            val done = File(context.filesDir, LAST_DONE_FILE)
+            if (done.exists()) {
+                val doneAt = try { done.readText().trim().toLong() } catch (_: Throwable) { 0L }
+                val remaining = doneAt + cooldownMs - now
+                if (doneAt > 0L && remaining in 1..cooldownMs) {
+                    return RotationGate(false, "cooldown", remaining)
+                }
+            }
+        }
+        return RotationGate(true)
     }
 
     private fun cycleAndVerifyInner(

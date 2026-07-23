@@ -195,6 +195,8 @@ class MainActivity : AppCompatActivity() {
                 wifiReturn = prefs.getBoolean("wifi_return", false),
                 wifiReturnMethod = prefs.getString("wifi_return_method", "local_relay")
                     ?: "local_relay",
+                rotationLock = prefs.getBoolean("rotation_lock", true),
+                cooldownSeconds = prefs.getInt("rotation_cooldown_s", 10),
             ),
         )
 
@@ -457,6 +459,20 @@ class MainActivity : AppCompatActivity() {
             else
                 "Disable WiFi to cycle mobile IP"
             Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            return
+        }
+
+        // Cross-process rotation guard: skip if a rotation is already running
+        // (e.g. a server REBOOT auto-cycle in :proxy) or we're still inside the
+        // post-rotation cooldown. Same gate the REBOOT path uses, so a manual
+        // press and a remote request can never run two concurrent cycles.
+        // Toggle + cooldown length live in Settings.
+        val gate = IpCycle.checkRotationGate(this, IpCycle.loadConfigFromFile(this))
+        if (!gate.allowed) {
+            val gateMsg = if (gate.reason == "cooldown")
+                "Rotation cooldown — wait ${gate.remainingMs / 1000 + 1}s"
+            else "Rotation already in progress"
+            Toast.makeText(this, gateMsg, Toast.LENGTH_SHORT).show()
             return
         }
 

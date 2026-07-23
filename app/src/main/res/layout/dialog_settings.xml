@@ -256,6 +256,62 @@
     <TextView
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
+        android:text="IP rotation guard:"
+        android:textSize="11sp"
+        android:textStyle="bold"
+        android:textColor="#888888"
+        android:layout_marginBottom="4dp" />
+
+    <CheckBox
+        android:id="@+id/cbRotationLock"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Block overlapping rotation requests"
+        android:textSize="12sp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="While a rotation is running, and for the cooldown below after it finishes, any new rotation request (remote REBOOT or the manual ↻ button) is ignored. Prevents two rotations from fighting over the radio. On by default."
+        android:textSize="10sp"
+        android:textColor="#666666"
+        android:layout_marginBottom="8dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Cooldown after rotation (seconds):"
+        android:textSize="11sp"
+        android:textColor="#888888"
+        android:layout_marginBottom="2dp" />
+
+    <EditText
+        android:id="@+id/etRotationCooldown"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:hint="10"
+        android:inputType="number"
+        android:textSize="13sp"
+        android:layout_marginBottom="4dp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Extra quiet window after a rotation completes before another is allowed. Default 10s. Set to 0 to only block during the rotation itself."
+        android:textSize="10sp"
+        android:textColor="#666666"
+        android:layout_marginBottom="6dp" />
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:layout_marginTop="14dp"
+        android:layout_marginBottom="10dp"
+        android:background="#33888888" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
         android:text="IP rotation fallbacks (root required):"
         android:textSize="11sp"
         android:textStyle="bold"

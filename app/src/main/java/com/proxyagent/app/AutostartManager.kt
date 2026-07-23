@@ -219,6 +219,11 @@ object AutostartManager {
                 "chmod 700 $BOOT_SCRIPT_PATH && " +
                 "chown 0:0 $BOOT_SCRIPT_PATH"
             )
+            // Grant POST_NOTIFICATIONS now too, so the shade notification is
+            // visible immediately (not only after the next reboot when the
+            // script re-grants it). Best-effort — ignore the result.
+            IpCycle.runRoot(
+                "pm grant ${context.packageName} android.permission.POST_NOTIFICATIONS")
             Log.i(TAG, "installRootBootScript: ${if (ok) "ok" else "failed"}")
             ok
         } catch (t: Throwable) {
@@ -270,6 +275,10 @@ object AutostartManager {
             append("# Exempt from Doze / background limits so the FGS survives.\n")
             append("dumpsys deviceidle whitelist +\$PKG 2>/dev/null\n")
             append("cmd appops set \$PKG RUN_ANY_IN_BACKGROUND allow 2>/dev/null\n")
+            append("# Grant POST_NOTIFICATIONS (API 33+) so the FGS status\n")
+            append("# notification is actually VISIBLE on a headless device that\n")
+            append("# was never opened to grant it interactively.\n")
+            append("pm grant \$PKG android.permission.POST_NOTIFICATIONS 2>/dev/null\n")
             append("# Retry until CE storage is unlocked and the key authenticates.\n")
             append("i=0\n")
             append("while [ \$i -lt 30 ]; do\n")

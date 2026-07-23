@@ -71,6 +71,8 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var etImeiCustomCmd: EditText
     private lateinit var cbWifiReturn: CheckBox
     private lateinit var tvWifiReturnHint: TextView
+    private lateinit var cbRotationLock: CheckBox
+    private lateinit var etRotationCooldown: EditText
     private lateinit var spNetworkProfile: Spinner
     private lateinit var tvNetworkProfileHint: TextView
     private lateinit var tvAutostartLockWarn: TextView
@@ -135,6 +137,8 @@ class SettingsActivity : AppCompatActivity() {
         etImeiCustomCmd = findViewById(R.id.etImeiCustomCmd)
         cbWifiReturn = findViewById(R.id.cbWifiReturn)
         tvWifiReturnHint = findViewById(R.id.tvWifiReturnHint)
+        cbRotationLock = findViewById(R.id.cbRotationLock)
+        etRotationCooldown = findViewById(R.id.etRotationCooldown)
         spNetworkProfile = findViewById(R.id.spNetworkProfile)
         tvNetworkProfileHint = findViewById(R.id.tvNetworkProfileHint)
         tvAutostartLockWarn = findViewById(R.id.tvAutostartLockWarn)
@@ -440,6 +444,8 @@ class SettingsActivity : AppCompatActivity() {
         applyImeiVisibility()
         cbWifiReturn.isChecked = prefs.getBoolean("wifi_return", false)
         refreshWifiReturnGate()
+        cbRotationLock.isChecked = prefs.getBoolean("rotation_lock", true)
+        etRotationCooldown.setText(prefs.getInt("rotation_cooldown_s", 10).toString())
     }
 
     private fun saveSettings() {
@@ -468,6 +474,11 @@ class SettingsActivity : AppCompatActivity() {
         val modeChanged = prefs.getString("mode", "modem") != newMode
         val newNetworkProfile = networkProfileKeys[
             spNetworkProfile.selectedItemPosition.coerceIn(0, networkProfileKeys.size - 1)]
+        val rotationLock = cbRotationLock.isChecked
+        // Cooldown is free-form; clamp to a sane range and fall back to the 10s
+        // default on empty / non-numeric input.
+        val cooldownSeconds = etRotationCooldown.text.toString().trim()
+            .toIntOrNull()?.coerceIn(0, 3600) ?: 10
         prefs.edit()
             .putString("h", h).putString("p", p).putString("k", k)
             .putString("id", id).putString("dns", d)
@@ -481,6 +492,8 @@ class SettingsActivity : AppCompatActivity() {
             .putString("imei_cmd", etImeiCustomCmd.text.toString().trim())
             .putBoolean("wifi_return", effectiveWifiReturn)
             .putString("network_profile", newNetworkProfile)
+            .putBoolean("rotation_lock", rotationLock)
+            .putInt("rotation_cooldown_s", cooldownSeconds)
             .apply()
         IpCycle.saveConfigToFile(
             this,
@@ -491,6 +504,8 @@ class SettingsActivity : AppCompatActivity() {
                 imeiCustomCmd = etImeiCustomCmd.text.toString().trim(),
                 wifiReturn = effectiveWifiReturn,
                 wifiReturnMethod = prefs.getString("wifi_return_method", "local_relay") ?: "local_relay",
+                rotationLock = rotationLock,
+                cooldownSeconds = cooldownSeconds,
             ),
         )
         if (retentionChanged) {
