@@ -58,9 +58,20 @@ COPY app ./app
 # Debug build: it compiles every source set the release build does, but
 # skips signing and the OTA release coordinates, so it needs no secrets.
 # assembleDebugUnitTest is added so app/src/test is type-checked too.
-RUN ./gradlew --no-daemon --stacktrace \
-      :app:assembleDebug \
-      :app:assembleDebugUnitTest \
+#
+# Output handling matters here: the platform surfaces only the LAST ~40
+# lines of a failed build, and Gradle's own failure epilogue (or worse,
+# --stacktrace) fills exactly those lines with framework frames while the
+# actual `e: file.kt:12 Unresolved reference` scrolls away. So capture
+# everything and re-print the compile errors LAST, where they survive
+# truncation.
+RUN ./gradlew --no-daemon :app:assembleDebug :app:assembleDebugUnitTest \
+      > /tmp/build.log 2>&1 \
+ || { echo "=== tail of gradle output ==="; tail -15 /tmp/build.log; \
+      echo "=== COMPILE ERRORS ==="; \
+      grep -E "^e: |^w: .*error|error:|Unresolved reference|None of the following|Type mismatch|Cannot access" /tmp/build.log \
+        | head -40; \
+      exit 1; } \
  && mkdir -p /out \
  && cp app/build/outputs/apk/debug/*.apk /out/
 
