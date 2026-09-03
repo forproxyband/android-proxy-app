@@ -1994,11 +1994,10 @@ class ProxyService : Service() {
                 try { agentProcess?.destroy() } catch (_: Throwable) {}
                 runnerThread?.interrupt()
             }
-            Engine.NATIVE -> {
-                // The native supervisor's dial loop re-resolves and
-                // re-dials each iteration. Stopping the current uplink
-                // wakes the loop without tearing down the supervisor,
-                // so it reconnects on the new interface.
+            Engine.NATIVE, Engine.SDK -> {
+                // Both in-process supervisors re-resolve and re-dial each
+                // loop iteration. Stopping the current uplink wakes the
+                // loop, so it reconnects on the new interface.
                 try { nativeAgent?.stop() } catch (_: Throwable) {}
                 runnerThread?.interrupt()
             }
@@ -2042,11 +2041,11 @@ class ProxyService : Service() {
                     } catch (_: InterruptedException) { p.destroyForcibly() }
                 }
             } catch (t: Throwable) { log("Stop error: ${t.message}") }
-            Engine.NATIVE -> try {
-                log("Stopping native agent")
+            Engine.NATIVE, Engine.SDK -> try {
+                log("Stopping ${engine.name} agent")
                 nativeAgent?.stop(timeoutMs = 3_000L)
                 nativeAgent = null
-            } catch (t: Throwable) { log("Native stop error: ${t.message}") }
+            } catch (t: Throwable) { log("${engine.name} stop error: ${t.message}") }
         }
         agentProcess = null
         connStatus = ConnStatus.STOPPED
