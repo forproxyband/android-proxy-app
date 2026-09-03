@@ -15,6 +15,16 @@ val appVersionCode = if (buildNumber > 0) buildNumber else 1
 // CMake and compiles for any ABI in the filter list.
 val isE2eBuild = (findProperty("e2e") as? String)?.equals("true", ignoreCase = true) == true
 
+// SDK engine availability. Must agree with the includeBuild condition in
+// settings.gradle.kts — same directory probe, so the dependency and the
+// source set are only wired when Gradle actually has the SDK build.
+//
+// The SDK-typed code lives in its own source set behind an interface
+// declared in `main` (com.proxyagent.app.engine). Exactly one of the two
+// source sets below is compiled, so `main` never references
+// com.proxyagent.sdk.* and the app still builds with the SDK absent.
+val sdkEngineAvailable = rootProject.file("../proxy-agent-sdk-go/android").isDirectory
+
 android {
     namespace = "com.proxyagent.app"
     compileSdk = 35
@@ -55,6 +65,10 @@ android {
             "\"${System.getenv("OTA_BASE_URL")?.takeUnless { it.isBlank() } ?: "https://cdn.home-stash.house"}\"")
         buildConfigField("String", "OTA_PLATFORM", "\"android\"")
         buildConfigField("String", "OTA_DEFAULT_CHANNEL", "\"stable\"")
+
+        // Read at runtime to show/hide the SDK engine option. Without it
+        // a user could select an engine that isn't in the APK.
+        buildConfigField("boolean", "SDK_ENGINE_AVAILABLE", "$sdkEngineAvailable")
 
         // ABI filter for native libs. Matches the pre-built
         // libproxyagent.so under app/src/main/jniLibs/<abi>/ so our
@@ -116,6 +130,13 @@ android {
     buildFeatures {
         buildConfig = true
     }
+
+    // Exactly one of these is added, never both — they declare the same
+    // class (com.proxyagent.app.engine.SdkEngineProvider), so compiling
+    // both would be a duplicate-class error rather than a silent pick.
+    sourceSets["main"].java.srcDir(
+        if (sdkEngineAvailable) "src/sdkEngine/java" else "src/noSdkEngine/java"
+    )
 
     signingConfigs {
         create("release") {
@@ -245,6 +266,15 @@ tasks.configureEach {
 }
 
 dependencies {
+    // Proxy Agent SDK — the extracted Kotlin engine, consumed as a real
+    // AAR through the composite build wired in settings.gradle.kts. No
+    // version: Gradle substitutes the included build's project, so the
+    // app always compiles against the SDK source sitting next to it
+    // rather than a snapshot that can silently go stale.
+    if (sdkEngineAvailable) {
+        implementation("com.proxyagent:proxy-agent-android")
+    }
+
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")

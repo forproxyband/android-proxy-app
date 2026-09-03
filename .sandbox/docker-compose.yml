@@ -1,0 +1,19 @@
+# Build harness for the Android app. Paths are relative to this
+# directory; the build context is the repo root.
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: .sandbox/Dockerfile
+    labels:
+      se.stand.80: apk
+    ports:
+      - "80"
+    healthcheck:
+      # busybox wget — nginx:alpine has no curl.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped

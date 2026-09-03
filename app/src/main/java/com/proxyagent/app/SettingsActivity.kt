@@ -58,6 +58,8 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var rgEngine: RadioGroup
     private lateinit var rbEngineNative: RadioButton
     private lateinit var rbEngineBinary: RadioButton
+    private lateinit var rbEngineSdk: RadioButton
+    private lateinit var tvEngineSdkHint: TextView
     private lateinit var rgMode: RadioGroup
     private lateinit var rbModeModem: RadioButton
     private lateinit var rbModeBalancer: RadioButton
@@ -124,6 +126,15 @@ class SettingsActivity : AppCompatActivity() {
         rgEngine = findViewById(R.id.rgEngine)
         rbEngineNative = findViewById(R.id.rbEngineNative)
         rbEngineBinary = findViewById(R.id.rbEngineBinary)
+        rbEngineSdk = findViewById(R.id.rbEngineSdk)
+        tvEngineSdkHint = findViewById(R.id.tvEngineSdkHint)
+        // The SDK engine only exists when the app was built with the
+        // proxy-agent-sdk-go repo checked out beside it. Offering an
+        // engine that isn't in the APK would just produce a confusing
+        // failure at START, so hide it outright.
+        val sdkVisible = if (BuildConfig.SDK_ENGINE_AVAILABLE) View.VISIBLE else View.GONE
+        rbEngineSdk.visibility = sdkVisible
+        tvEngineSdkHint.visibility = sdkVisible
         rgMode = findViewById(R.id.rgMode)
         rbModeModem = findViewById(R.id.rbModeModem)
         rbModeBalancer = findViewById(R.id.rbModeBalancer)
@@ -181,7 +192,7 @@ class SettingsActivity : AppCompatActivity() {
         }
         rgEngine.setOnCheckedChangeListener { _, _ ->
             refreshWifiReturnGate()
-            applyNetworkProfileEnabled(rgEngine.checkedRadioButtonId == R.id.rbEngineNative)
+            applyNetworkProfileEnabled(isKotlinEngineSelected())
         }
         cbWifiReturn.setOnCheckedChangeListener { _, isChecked ->
             if (!isChecked || !cbWifiReturn.isEnabled) return@setOnCheckedChangeListener
@@ -382,18 +393,25 @@ class SettingsActivity : AppCompatActivity() {
         cbWifiReturn.text = when {
             allowed -> "Return traffic to client over Wi-Fi"
             !modemMode && !nativeEngine ->
-                "Return traffic to client over Wi-Fi  (Modem + NATIVE engine only)"
+                "Return traffic to client over Wi-Fi  (Modem + Native/SDK engine only)"
             !modemMode -> "Return traffic to client over Wi-Fi  (Modem mode only)"
-            else -> "Return traffic to client over Wi-Fi  (NATIVE engine only)"
+            else -> "Return traffic to client over Wi-Fi  (Native/SDK engine only)"
         }
     }
 
     private fun refreshWifiReturnGate() {
         applyWifiReturnEnabled(
             modemMode = rgMode.checkedRadioButtonId == R.id.rbModeModem,
-            nativeEngine = rgEngine.checkedRadioButtonId == R.id.rbEngineNative,
+            nativeEngine = isKotlinEngineSelected(),
         )
     }
+
+    /** True for both in-process Kotlin engines (in-tree NATIVE and the
+     *  external SDK). They share the feature set — network profile and
+     *  Wi-Fi return both work — and differ only in where the agent code
+     *  is loaded from. Only the BINARY subprocess is the odd one out. */
+    private fun isKotlinEngineSelected(): Boolean =
+        rgEngine.checkedRadioButtonId != R.id.rbEngineBinary
 
     private fun applyNetworkProfileEnabled(nativeEngine: Boolean) {
         spNetworkProfile.isEnabled = nativeEngine
@@ -425,6 +443,11 @@ class SettingsActivity : AppCompatActivity() {
         spRetention.setSelection(retentionDays.indexOf(savedRet).let { if (it < 0) 2 else it })
         when (prefs.getString("engine", "native")) {
             "binary" -> rbEngineBinary.isChecked = true
+            // A saved "sdk" can outlive the build that offered it (OTA to
+            // an APK without the SDK). Fall back to native rather than
+            // leaving the group with nothing selected.
+            "sdk" -> if (BuildConfig.SDK_ENGINE_AVAILABLE) rbEngineSdk.isChecked = true
+                     else rbEngineNative.isChecked = true
             else -> rbEngineNative.isChecked = true
         }
         val savedProfile = prefs.getString("network_profile", "LOW_100") ?: "LOW_100"
@@ -432,7 +455,7 @@ class SettingsActivity : AppCompatActivity() {
             networkProfileKeys.indexOf(savedProfile)
                 .let { if (it < 0) networkProfileKeys.indexOf("LOW_100") else it }
         )
-        applyNetworkProfileEnabled(rgEngine.checkedRadioButtonId == R.id.rbEngineNative)
+        applyNetworkProfileEnabled(isKotlinEngineSelected())
         val modemMode = prefs.getString("mode", "modem") == "modem"
         if (modemMode) rbModeModem.isChecked = true else rbModeBalancer.isChecked = true
         applyModeVisibility(modemMode)
@@ -463,13 +486,18 @@ class SettingsActivity : AppCompatActivity() {
         val retentionChanged = prefs.getInt("analytics_retention_days", 30) != newRetention
         val newEngine = when (rgEngine.checkedRadioButtonId) {
             R.id.rbEngineBinary -> "binary"
+            R.id.rbEngineSdk -> "sdk"
             else -> "native"
         }
         val newMode = if (rgMode.checkedRadioButtonId == R.id.rbModeBalancer) "balancer" else "modem"
         val imeiMethodKey = imeiMethodKeys[spImeiMethod.selectedItemPosition.coerceIn(0, imeiMethodKeys.size - 1)]
-        // Wi-Fi return only persists true when both gates (modem + native) pass —
-        // defence in depth against stale UI / racey radio events.
-        val effectiveWifiReturn = cbWifiReturn.isChecked && newMode == "modem" && newEngine == "native"
+        // Wi-Fi return only persists true when both gates (modem + an
+        // in-process Kotlin engine) pass — defence in depth against stale
+        // UI / racey radio events. "sdk" qualifies: it wires the same
+        // process-bind and QUIC socket binder as "native", and
+        // ProxyService.maybeStartWifiRelay gates on `!= BINARY`.
+        val effectiveWifiReturn =
+            cbWifiReturn.isChecked && newMode == "modem" && newEngine != "binary"
         val engineChanged = prefs.getString("engine", "native") != newEngine
         val modeChanged = prefs.getString("mode", "modem") != newMode
         val newNetworkProfile = networkProfileKeys[

@@ -33,7 +33,19 @@ class ProxyService : Service() {
     enum class ConnStatus { STARTING, CONNECTING, CONNECTED, RECONNECTING, ERROR, STOPPED }
     // NATIVE: pure-Kotlin port of the Go SDK, runs in-process. Default for
     // new installs. BINARY: ProcessBuilder fork of libproxyagent.so (legacy).
-    enum class Engine { NATIVE, BINARY }
+    // SDK: the same Kotlin engine, but consumed as an external AAR from
+    // the proxy-agent-sdk-go repo instead of this app's in-tree copy —
+    // the two run identical code, so any behavioural difference between
+    // NATIVE and SDK is a packaging problem, which is exactly what this
+    // engine exists to expose. Only present when the SDK build is
+    // available (BuildConfig.SDK_ENGINE_AVAILABLE).
+    enum class Engine { NATIVE, BINARY, SDK }
+
+    // True for both in-process Kotlin engines. Most engine-conditional
+    // logic cares about "in-process Kotlin agent vs forked Go binary",
+    // not about which of the two Kotlin ones it is.
+    private val Engine.isInProcessKotlin: Boolean get() = this != Engine.BINARY
+
     enum class Mode { MODEM, BALANCER }
 
     private var wakeLock: PowerManager.WakeLock? = null
@@ -41,8 +53,10 @@ class ProxyService : Service() {
     @Volatile private var agentProcess: Process? = null
     @Volatile private var runnerThread: Thread? = null
     @Volatile private var engine: Engine = Engine.NATIVE
-    // Live native agent — only set when engine=NATIVE.
-    @Volatile private var nativeAgent: com.proxyagent.app.nativeagent.NativeProxyAgent? = null
+    // Live in-process agent — set for engine=NATIVE and engine=SDK. Held
+    // behind AgentHandle so the byte-counter and stop() call sites below
+    // don't care which of the two produced it.
+    @Volatile private var nativeAgent: com.proxyagent.app.engine.AgentHandle? = null
     @Volatile private var mode: Mode = Mode.MODEM
     // QUIC implementation choice ("kwik" | "native"), passed via the
     // start intent (NOT SharedPreferences — the :proxy process caches
@@ -362,11 +376,11 @@ class ProxyService : Service() {
                             // BEFORE this "uplink connected" line.
                             // Without this guard we'd overwrite the
                             // accurate badge with a bare "TCP".
-                            engine == Engine.NATIVE &&
+                            engine.isInProcessKotlin &&
                                 (currentUplinkTransport == "TCP (splice)" ||
                                  currentUplinkTransport == "TCP (NIO)") ->
                                     currentUplinkTransport
-                            engine == Engine.NATIVE -> "TCP"
+                            engine.isInProcessKotlin -> "TCP"
                             else -> "TCP (splice)"
                         }
                         null -> "TCP+yamux"
@@ -460,10 +474,10 @@ class ProxyService : Service() {
             // we're defensive in case future Android versions cause
             // partial breakage).
             line.contains("splice: kernel zero-copy active") -> {
-                if (engine == Engine.NATIVE) currentUplinkTransport = "TCP (splice)"
+                if (engine.isInProcessKotlin) currentUplinkTransport = "TCP (splice)"
             }
             line.contains("splice: NIO fallback engaged") -> {
-                if (engine == Engine.NATIVE && currentUplinkTransport != "TCP (splice)") {
+                if (engine.isInProcessKotlin && currentUplinkTransport != "TCP (splice)") {
                     currentUplinkTransport = "TCP (NIO)"
                 }
             }
@@ -772,6 +786,14 @@ class ProxyService : Service() {
         val dns = dnsRaw.ifEmpty { "1.1.1.1,8.8.8.8" }
         engine = when (intent.getStringExtra("engine")) {
             "binary" -> Engine.BINARY
+            // A stale "sdk" pref can outlive an APK that had the SDK
+            // compiled in (e.g. after an OTA of a build without it), so
+            // gate on the build flag rather than trusting the pref.
+            "sdk" -> if (BuildConfig.SDK_ENGINE_AVAILABLE) Engine.SDK else {
+                log("Engine: 'sdk' requested but not compiled into this build — " +
+                    "falling back to NATIVE (${com.proxyagent.app.engine.SdkEngineProvider.describe()})")
+                Engine.NATIVE
+            }
             else -> Engine.NATIVE   // "native" or unset → default to native
         }
         mode = if (intent.getStringExtra("mode") == "balancer") Mode.BALANCER else Mode.MODEM
@@ -969,6 +991,7 @@ class ProxyService : Service() {
         val runner = when (engine) {
             Engine.NATIVE -> Thread { runNativeEngine(host, port, key, agentId, dns) }
             Engine.BINARY -> Thread { runBinaryEngine(host, port, key, agentId, dns) }
+            Engine.SDK -> Thread { runSdkEngine(host, port, key, agentId, dns) }
         }
         runner.name = "AgentRunner"
         runner.isDaemon = true
@@ -1192,13 +1215,13 @@ class ProxyService : Service() {
                 try { agentProcess?.destroy() } catch (_: Throwable) {}
                 runnerThread?.interrupt()
             }
-            Engine.NATIVE -> {
-                // The native agent reads effectiveHost/Port on every dial
-                // loop iteration via NativeProxyAgent.Config, so we just
-                // stop the current agent and let the runner respawn with
-                // the rolled-back (host, port). No subprocess to kill —
-                // stop the in-process supervisor instead.
-                log("wifi_return: rolling back NATIVE engine to direct dial " +
+            Engine.NATIVE, Engine.SDK -> {
+                // Both in-process engines read effectiveHost/Port on every
+                // dial loop iteration when building their config, so we
+                // just stop the current agent and let the runner respawn
+                // with the rolled-back (host, port). No subprocess to
+                // kill — stop the in-process supervisor instead.
+                log("wifi_return: rolling back ${engine.name} engine to direct dial " +
                     "($originalHost:$originalPort)")
                 effectiveHost = originalHost
                 effectivePort = originalPort
@@ -1548,7 +1571,7 @@ class ProxyService : Service() {
                 }
 
                 val agent = com.proxyagent.app.nativeagent.NativeProxyAgent()
-                nativeAgent = agent
+                nativeAgent = com.proxyagent.app.engine.NativeAgentHandle(agent)
 
                 // Bridge native log lines into parseAgentLine() so the UI
                 // (currentRegistrator, transport badge, tunnel counter,
@@ -1668,6 +1691,131 @@ class ProxyService : Service() {
         } catch (e: Throwable) {
             val sw = StringWriter(); e.printStackTrace(PrintWriter(sw))
             log("Native engine error: $sw")
+            connStatus = ConnStatus.ERROR
+            state("error"); writeConnInfo()
+        }
+    }
+
+    // Same engine as NATIVE, reached through the external Proxy Agent
+    // SDK (com.proxyagent:proxy-agent-android) instead of this app's
+    // in-tree copy of it. The two run identical agent code, so this
+    // engine is not here to behave differently — it is here to prove the
+    // SDK works when consumed the way a third-party app would consume
+    // it, across a real AAR boundary. A discrepancy between NATIVE and
+    // SDK is therefore a packaging bug, and this is how we'd see one.
+    //
+    // The structure below intentionally mirrors runNativeEngine line for
+    // line (same Wi-Fi relay wiring, same outer respawn loop, same log
+    // bridging into parseAgentLine) so the comparison is like-for-like.
+    // What differs is confined to the SdkEngineProvider call.
+    private fun runSdkEngine(host: String, port: String, key: String, agentId: String, dns: String) {
+        val provider = com.proxyagent.app.engine.SdkEngineProvider
+        if (!provider.available) {
+            log("SDK engine unavailable: ${provider.describe()}")
+            connStatus = ConnStatus.ERROR
+            state("error"); writeConnInfo()
+            return
+        }
+        try {
+            originalHost = host
+            originalPort = port
+            val initialEffective = maybeStartWifiRelay(host, port)
+            effectiveHost = initialEffective.first
+            effectivePort = initialEffective.second
+            val relayActive = effectiveHost != host
+            val hostLog = if (relayActive) "$effectiveHost:$effectivePort→$host:$port" else host
+            log("SDK engine: host=$hostLog port=$port key=${mask(key)} " +
+                "id=${if (agentId.isEmpty()) "<empty>" else mask(agentId)} dns=$dns")
+            // Where the SDK classes actually came from. If the composite
+            // build ever resolves to something unexpected, this line is
+            // the difference between a five-minute diagnosis and an hour.
+            log("SDK engine: linked against ${provider.describe()}")
+            if (wifiRelay != null) scheduleWifiReturnSelfTest()
+
+            var outerBackoffMs = 1_000L
+            while (!stopRequested) {
+                val effHost = effectiveHost
+                val effPort = effectivePort
+                val portInt = effPort.toIntOrNull()
+                if (portInt == null || portInt !in 1..65535) {
+                    log("SDK engine: invalid port \"$effPort\"")
+                    connStatus = ConnStatus.ERROR; state("error"); writeConnInfo()
+                    return
+                }
+
+                val service = this@ProxyService
+                val params = com.proxyagent.app.engine.SdkAgentParams(
+                    registratorHost = if (mode == Mode.MODEM) effHost else null,
+                    registratorPort = if (mode == Mode.MODEM) portInt else 0,
+                    balancerHost = if (mode == Mode.BALANCER) host else null,
+                    balancerPort = if (mode == Mode.BALANCER) port.toIntOrNull() ?: 0 else 0,
+                    fallbackFileUrl = if (mode == Mode.BALANCER)
+                        "https://s3.eu-central-1.amazonaws.com/cactusneedles/registrators.json"
+                    else null,
+                    agentKey = key,
+                    agentUuid = agentId.ifBlank { null },
+                    dnsServers = dns,
+                    workDir = filesDir,
+                    // Crosses as a String — the app and the SDK each have
+                    // their own NetworkProfile enum; the adapter maps it.
+                    networkProfileName = networkProfile.name,
+                    quicSocketBinder = { sock ->
+                        service.wifiRelay?.currentWifiNetwork()?.bindSocket(sock)
+                    },
+                )
+
+                connStatus = ConnStatus.CONNECTING
+                val handle = provider.start(params) { level, msg, fields ->
+                    // Identical formatting to the NATIVE engine so
+                    // parseAgentLine — and therefore the status badge,
+                    // tunnel counter and REBOOT auto-cycle — behaves the
+                    // same on both. The "[sdk]" tag is only for the
+                    // human reading agent.log.
+                    val sb = StringBuilder()
+                    sb.append("level=").append(level).append(" msg=\"").append(msg).append('"')
+                    for ((k, v) in fields) {
+                        if (v == null) continue
+                        sb.append(' ').append(k).append('=').append(v.toString())
+                    }
+                    val line = sb.toString()
+                    parseAgentLine(line)
+                    log("[sdk] $line")
+                }
+                if (handle == null) {
+                    log("SDK engine: agent failed to start")
+                    connStatus = ConnStatus.ERROR
+                    state("error"); writeConnInfo()
+                    return
+                }
+                nativeAgent = handle
+                state("running")
+
+                while (!stopRequested && handle.isRunning()) {
+                    try { Thread.sleep(500) }
+                    catch (_: InterruptedException) { break }
+                }
+                nativeAgent = null
+                try { handle.stop(timeoutMs = 2_000L) } catch (_: Throwable) {}
+                if (stopRequested) break
+
+                connStatus = ConnStatus.RECONNECTING
+                currentRegistrator = ""
+                activeTunnels = 0
+                connectedSinceMs = 0L
+                currentUplinkTransport = ""
+                log("SDK engine: respawning in ${outerBackoffMs}ms")
+                try { Thread.sleep(outerBackoffMs) }
+                catch (_: InterruptedException) {
+                    log("SDK engine: respawn backoff interrupted; retrying now")
+                    outerBackoffMs = 1_000L
+                    continue
+                }
+                outerBackoffMs = (outerBackoffMs * 2).coerceAtMost(30_000L)
+            }
+            log("SDK runner loop exited")
+        } catch (e: Throwable) {
+            val sw = StringWriter(); e.printStackTrace(PrintWriter(sw))
+            log("SDK engine error: $sw")
             connStatus = ConnStatus.ERROR
             state("error"); writeConnInfo()
         }

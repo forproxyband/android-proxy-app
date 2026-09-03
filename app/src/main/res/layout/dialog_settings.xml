@@ -204,7 +204,29 @@
             android:layout_height="wrap_content"
             android:text="Binary subprocess"
             android:textSize="13sp" />
+        <!-- Hidden unless BuildConfig.SDK_ENGINE_AVAILABLE — the SDK is
+             an optional composite-build dependency, so an APK built
+             without the SDK repo present must not offer it. Visibility
+             is set in SettingsActivity, not here. -->
+        <RadioButton
+            android:id="@+id/rbEngineSdk"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Proxy Agent SDK (external AAR)"
+            android:textSize="13sp"
+            android:visibility="gone" />
     </RadioGroup>
+
+    <TextView
+        android:id="@+id/tvEngineSdkHint"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="SDK runs the same Kotlin agent as Native, but loaded from the external proxy-agent-android library instead of this app's built-in copy. Use it to verify the SDK; behaviour should be identical."
+        android:textSize="10sp"
+        android:textColor="#888888"
+        android:layout_marginTop="2dp"
+        android:layout_marginBottom="4dp"
+        android:visibility="gone" />
 
     <!-- QUIC implementation picker was here. Removed from UI: the
          in-house QUIC stack is now the only path users can select.
