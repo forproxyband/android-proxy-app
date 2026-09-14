@@ -121,6 +121,12 @@ object E2EConfig {
         quicTransportFactory = quicFactory,
         quicDialTimeoutMs = 15000,
         tcpWarmPoolSize = tcpWarmPool,
+        // The testserver, and every tunnel target it drives, lives on the
+        // emulator's host-loopback alias — an RFC1918 address, which the
+        // device-side target policy refuses by default and is right to: on a
+        // real handset that range is the owner's home network. The exception
+        // belongs here, in the harness that needs it, and nowhere else.
+        targetPolicyAllowCidrs = listOf(testserverHost),
     )
 
     /** Single-line per-tunnel summary for embedding in assertion failures.
