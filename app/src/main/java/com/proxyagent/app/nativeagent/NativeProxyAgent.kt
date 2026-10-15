@@ -72,7 +72,7 @@ class NativeProxyAgent {
         // Auth
         val agentKey: String,
         val agentUuid: String? = null,
-        // Build identity for AUTH (hash moderation). apkPath is the file
+        // Build identity for AUTH. apkPath is the file
         // the app runs from — on Android pass
         // context.applicationInfo.sourceDir. The agent hashes it itself,
         // once per process and off the caller's thread, and sends
@@ -686,14 +686,12 @@ internal data class SystemInfo(
 )
 
 // ────────────────────────────────────────────────────────────────────────
-// Build identity — mirrors internal/apphash (apk-sha256) in the Go SDK
+// Build identity — the Go SDK's apk-sha256
 // ────────────────────────────────────────────────────────────────────────
 
 /**
  * What AUTH says about the build. "buildId" names the exact APK the app
- * runs from, so the registrator can hold it against the builds that were
- * reviewed (proxy-server-go-sdk/buildid, kind apk-sha256); "sdkBuild"
- * names the app version for people reading the logs.
+ * runs from (kind apk-sha256); "sdkBuild" names the app version.
  *
  * The APK is the installed base.apk (ApplicationInfo.sourceDir). For an
  * app installed from a downloaded APK it is that file byte for byte, so
@@ -1460,8 +1458,7 @@ internal class Uplink(
     internal companion object {
         /** The AUTH control line. "buildId" (the configured APK's
          *  apk-sha256, measured once per process) and "sdkBuild" are left
-         *  out when there is nothing to send — under buildCheck enforce
-         *  the registrator denies tunnels to a device without a buildId. */
+         *  out when there is nothing to send. */
         fun authJson(cfg: NativeProxyAgent.Config, key: String, info: SystemInfo): String {
             val uuid = (cfg.agentUuid?.trim()?.ifEmpty { null }) ?: key
             val buildId = BuildIdentity.buildIdFor(cfg.apkPath)

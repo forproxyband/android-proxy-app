@@ -7,10 +7,9 @@ import org.junit.Test
 import java.io.File
 import java.security.MessageDigest
 
-// The AUTH line the agent writes: with a configured APK the registrator gets
+// The AUTH line the agent writes: with a configured APK it carries
 // "buildId":"apk-sha256:<hex of that file>" and the "sdkBuild" as configured;
-// without them both fields are left out, not sent empty. Under buildCheck
-// enforce a device whose AUTH lacks the buildId is denied tunnels.
+// without them both fields are left out, not sent empty.
 class AuthFrameTest {
 
     private val workDir = File(System.getProperty("java.io.tmpdir") ?: ".")

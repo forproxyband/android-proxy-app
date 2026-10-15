@@ -11,8 +11,7 @@ import java.io.InputStream
 import java.security.MessageDigest
 
 // The AUTH build identity: "apk-sha256:<64 lowercase hex>" of the APK file,
-// the same string the registrator's buildid package and the CRM build cards
-// use, and "<versionName>(<versionCode>)" for sdkBuild.
+// the format the Go SDK sends, and "<versionName>(<versionCode>)" for sdkBuild.
 class BuildIdentityTest {
 
     private fun sha256Hex(bytes: ByteArray): String =
