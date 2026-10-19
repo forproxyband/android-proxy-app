@@ -16,6 +16,7 @@ import java.net.URL
 import java.nio.ByteBuffer
 import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingDeque
@@ -71,6 +72,15 @@ class NativeProxyAgent {
         // Auth
         val agentKey: String,
         val agentUuid: String? = null,
+        // Build identity for AUTH. apkPath is the file
+        // the app runs from — on Android pass
+        // context.applicationInfo.sourceDir. The agent hashes it itself,
+        // once per process and off the caller's thread, and sends
+        // "buildId":"apk-sha256:<hex>". sdkBuild is sent as given
+        // ([BuildIdentity.sdkBuild] makes "<versionName>(<versionCode>)").
+        // Null, blank or unreadable → the field is left out of AUTH.
+        val apkPath: String? = null,
+        val sdkBuild: String? = null,
         // DNS override (CSV: "8.8.8.8,1.1.1.1"). Empty → system resolver.
         val dnsServers: String = "",
         // Working directory for sticky-state files (transport cache, etc.).
@@ -332,6 +342,18 @@ class NativeProxyAgent {
                 "quic_window_headroom_ratio" to tuning.quic.windowUpdateHeadroomRatio,
                 "quic_send_buf_max" to tuning.quic.sendBufferMaxBytes,
             )
+        }
+        // Build identity: hashed here, on the supervisor thread and before
+        // the first dial, so AUTH never waits on it; cached per process,
+        // so restarts and reconnects reuse the first answer.
+        cfg.apkPath?.trim()?.ifEmpty { null }?.let { path ->
+            val buildId = BuildIdentity.apkBuildId(path)
+            if (buildId != null) {
+                logInfo("apk measured", "path" to path, "build_id" to buildId,
+                    "sdk_build" to cfg.sdkBuild)
+            } else {
+                logWarn("apk not measured; AUTH goes without buildId", "path" to path)
+            }
         }
         try {
             val backoff = ExponentialJitterBackoff(
@@ -662,6 +684,79 @@ internal data class SystemInfo(
     val hostname: String,
     val ips: List<String>,
 )
+
+// ────────────────────────────────────────────────────────────────────────
+// Build identity — the Go SDK's apk-sha256
+// ────────────────────────────────────────────────────────────────────────
+
+/**
+ * What AUTH says about the build. "buildId" names the exact APK the app
+ * runs from (kind apk-sha256); "sdkBuild" names the app version.
+ *
+ * The APK is the installed base.apk (ApplicationInfo.sourceDir). For an
+ * app installed from a downloaded APK it is that file byte for byte, so
+ * its hash equals the hash of the download.
+ */
+internal object BuildIdentity {
+    const val KIND_APK_SHA256 = "apk-sha256"
+
+    private const val BUFFER_BYTES = 64 * 1024
+    private const val HEX = "0123456789abcdef"
+
+    /** Lowercase hex SHA-256 of everything [input] yields, read in
+     *  [BUFFER_BYTES] chunks — an APK is tens of megabytes, so it is
+     *  never held in memory whole. */
+    fun sha256Hex(input: InputStream): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        val buf = ByteArray(BUFFER_BYTES)
+        while (true) {
+            val n = input.read(buf)
+            if (n < 0) break
+            md.update(buf, 0, n)
+        }
+        val sb = StringBuilder(64)
+        for (b in md.digest()) {
+            val v = b.toInt() and 0xff
+            sb.append(HEX[v ushr 4]).append(HEX[v and 0x0f])
+        }
+        return sb.toString()
+    }
+
+    /** "apk-sha256:<hex>" of the file at [path], or null when it cannot
+     *  be read. Not cached; [apkBuildId] is. */
+    fun measure(path: String): String? = try {
+        File(path).inputStream().use { "$KIND_APK_SHA256:${sha256Hex(it)}" }
+    } catch (_: IOException) {
+        null
+    } catch (_: SecurityException) {
+        null
+    }
+
+    /** "<versionName>(<versionCode>)", or null without a version name. */
+    fun sdkBuild(versionName: String?, versionCode: Long): String? =
+        versionName?.trim()?.ifEmpty { null }?.let { "$it($versionCode)" }
+
+    /** [apkBuildId] for a configured path; null when none is set. */
+    fun buildIdFor(apkPath: String?): String? =
+        apkPath?.trim()?.ifEmpty { null }?.let { apkBuildId(it) }
+
+    /** [measure] once per process and path, failure included: the
+     *  installed APK does not change under a running process (an update
+     *  restarts the app), and hashing it on every reconnect would be
+     *  wasted work. */
+    fun apkBuildId(path: String): String? {
+        cached?.let { (p, id) -> if (p == path) return id }
+        synchronized(this) {
+            cached?.let { (p, id) -> if (p == path) return id }
+            val id = measure(path)
+            cached = path to id
+            return id
+        }
+    }
+
+    @Volatile
+    private var cached: Pair<String, String?>? = null
+}
 
 // ────────────────────────────────────────────────────────────────────────
 // Exponential jitter backoff — mirrors internal/backoff/backoff.go
@@ -1340,28 +1435,7 @@ internal class Uplink(
         if (key.isEmpty()) {
             agent.logWarn("uplink missing apiKey; server will reject AUTH")
         }
-        val uuid = (cfg.agentUuid?.trim()?.ifEmpty { null }) ?: key
-        val json = buildString {
-            append('{')
-            append("\"command\":\"AUTH\",")
-            append("\"key\":"); MiniJson.appendString(this, key); append(',')
-            append("\"uuid\":"); MiniJson.appendString(this, uuid)
-            if (info.hostname.isNotEmpty()) {
-                append(',')
-                append("\"host\":"); MiniJson.appendString(this, info.hostname)
-            }
-            if (info.ips.isNotEmpty()) {
-                append(',')
-                append("\"sourceIPList\":[")
-                for ((i, ip) in info.ips.withIndex()) {
-                    if (i > 0) append(',')
-                    MiniJson.appendString(this, ip)
-                }
-                append(']')
-            }
-            append('}')
-        }
-        writeControlLine(json)
+        writeControlLine(authJson(cfg, key, info))
         val originalTimeout = controlSocket?.soTimeout ?: 0
         controlSocket?.soTimeout = NativeProxyAgent.AUTH_HANDSHAKE_TIMEOUT_MS.toInt()
         try {
@@ -1378,6 +1452,45 @@ internal class Uplink(
             }
         } finally {
             controlSocket?.soTimeout = originalTimeout
+        }
+    }
+
+    internal companion object {
+        /** The AUTH control line. "buildId" (the configured APK's
+         *  apk-sha256, measured once per process) and "sdkBuild" are left
+         *  out when there is nothing to send. */
+        fun authJson(cfg: NativeProxyAgent.Config, key: String, info: SystemInfo): String {
+            val uuid = (cfg.agentUuid?.trim()?.ifEmpty { null }) ?: key
+            val buildId = BuildIdentity.buildIdFor(cfg.apkPath)
+            val sdkBuild = cfg.sdkBuild?.trim()?.ifEmpty { null }
+            return buildString {
+                append('{')
+                append("\"command\":\"AUTH\",")
+                append("\"key\":"); MiniJson.appendString(this, key); append(',')
+                append("\"uuid\":"); MiniJson.appendString(this, uuid)
+                if (info.hostname.isNotEmpty()) {
+                    append(',')
+                    append("\"host\":"); MiniJson.appendString(this, info.hostname)
+                }
+                if (info.ips.isNotEmpty()) {
+                    append(',')
+                    append("\"sourceIPList\":[")
+                    for ((i, ip) in info.ips.withIndex()) {
+                        if (i > 0) append(',')
+                        MiniJson.appendString(this, ip)
+                    }
+                    append(']')
+                }
+                if (buildId != null) {
+                    append(',')
+                    append("\"buildId\":"); MiniJson.appendString(this, buildId)
+                }
+                if (sdkBuild != null) {
+                    append(',')
+                    append("\"sdkBuild\":"); MiniJson.appendString(this, sdkBuild)
+                }
+                append('}')
+            }
         }
     }
 

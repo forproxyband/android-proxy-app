@@ -1590,6 +1590,11 @@ class ProxyService : Service() {
                     else null,
                     agentKey = key,
                     agentUuid = agentId.ifBlank { null },
+                    // AUTH buildId/sdkBuild: the agent hashes the APK this
+                    // app runs from (once per process, on its own thread).
+                    apkPath = applicationInfo.sourceDir,
+                    sdkBuild = com.proxyagent.app.nativeagent.BuildIdentity.sdkBuild(
+                        BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE.toLong()),
                     dnsServers = dns,
                     workDir = filesDir,
                     httpTimeoutMs = 5000,
